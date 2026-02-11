@@ -28,11 +28,6 @@ pub struct MiningSolution {
 
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
-    Hashes {
-        backend: &'static str,
-        epoch: u64,
-        count: u64,
-    },
     Solution(MiningSolution),
     Error {
         backend: &'static str,
@@ -52,6 +47,12 @@ pub trait PowBackend: Send {
     fn stop(&mut self);
 
     fn set_work(&self, work: MiningWork) -> Result<()>;
+
+    /// Return and reset hashes completed for the provided epoch.
+    /// Implementations should never report hashes from stale epochs.
+    fn take_hashes(&self, _epoch: u64) -> u64 {
+        0
+    }
 
     fn kernel_bench(&self, _seconds: u64, _shutdown: &AtomicBool) -> Result<u64> {
         bail!(

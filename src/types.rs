@@ -7,6 +7,8 @@ pub struct BlockTemplateResponse {
     pub block: Value,
     pub target: String,
     pub header_base: String,
+    #[serde(default)]
+    pub template_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

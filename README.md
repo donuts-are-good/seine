@@ -5,7 +5,7 @@ External Blocknet miner with a pluggable backend architecture.
 Current status:
 - CPU backend: implemented (Argon2id, consensus-compatible params).
 - NVIDIA backend: scaffolded interface only (not implemented yet).
-- Runtime architecture: supports multiple backends in one process with persistent workers, event-driven backend reporting, and nonce progression that advances by observed hash work to avoid nonce-space reuse.
+- Runtime architecture: supports multiple backends in one process with persistent workers, event-driven solution/error reporting, and polled per-backend hash counters for low-overhead throughput accounting.
 
 ## Test
 
@@ -53,7 +53,7 @@ Select multiple backends (comma-separated or repeated flag). Unavailable backend
 
 - Each CPU thread needs roughly 2GB RAM due to Argon2id parameters.
 - By default, bnminer refuses to start if configured CPU lanes exceed detected system RAM. Override with `--allow-oversubscribe` if needed.
-- The miner fetches block templates from `/api/mining/blocktemplate` and submits solved blocks to `/api/mining/submitblock`.
+- The miner fetches block templates from `/api/mining/blocktemplate` and submits solved blocks to `/api/mining/submitblock` using compact `{template_id, nonce}` payloads when available.
 - The miner listens to `/api/events` and refreshes work immediately on `new_block` events (disable with `--disable-sse`).
 - This miner is intentionally external so consensus-critical validation remains in the daemon.
 

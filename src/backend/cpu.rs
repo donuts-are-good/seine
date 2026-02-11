@@ -13,13 +13,14 @@ use crate::types::hash_meets_target;
 
 const IDLE_SLEEP: Duration = Duration::from_millis(2);
 const STALE_SLEEP: Duration = Duration::from_millis(1);
-const HASH_EVENT_BATCH: u64 = 64;
 
 struct Shared {
     started: AtomicBool,
     shutdown: AtomicBool,
     current_epoch: AtomicU64,
     solved_epoch: AtomicU64,
+    hashes_epoch: AtomicU64,
+    hashes_count: AtomicU64,
     work: RwLock<Option<Arc<MiningWork>>>,
     event_sink: RwLock<Option<Sender<BackendEvent>>>,
 }
@@ -39,6 +40,8 @@ impl CpuBackend {
                 shutdown: AtomicBool::new(false),
                 current_epoch: AtomicU64::new(0),
                 solved_epoch: AtomicU64::new(0),
+                hashes_epoch: AtomicU64::new(0),
+                hashes_count: AtomicU64::new(0),
                 work: RwLock::new(None),
                 event_sink: RwLock::new(None),
             }),
@@ -70,6 +73,8 @@ impl PowBackend for CpuBackend {
         self.shared.shutdown.store(false, Ordering::SeqCst);
         self.shared.current_epoch.store(0, Ordering::SeqCst);
         self.shared.solved_epoch.store(0, Ordering::SeqCst);
+        self.shared.hashes_epoch.store(0, Ordering::SeqCst);
+        self.shared.hashes_count.store(0, Ordering::SeqCst);
 
         if let Ok(mut work) = self.shared.work.write() {
             *work = None;
@@ -101,6 +106,8 @@ impl PowBackend for CpuBackend {
 
         self.shared.current_epoch.store(0, Ordering::SeqCst);
         self.shared.solved_epoch.store(0, Ordering::SeqCst);
+        self.shared.hashes_epoch.store(0, Ordering::SeqCst);
+        self.shared.hashes_count.store(0, Ordering::SeqCst);
     }
 
     fn set_work(&self, work: MiningWork) -> Result<()> {
@@ -110,6 +117,8 @@ impl PowBackend for CpuBackend {
 
         self.shared.solved_epoch.store(0, Ordering::SeqCst);
         let epoch = work.epoch;
+        self.shared.hashes_count.store(0, Ordering::SeqCst);
+        self.shared.hashes_epoch.store(epoch, Ordering::SeqCst);
         let shared_work = Arc::new(work);
         {
             let mut slot = self
@@ -121,6 +130,13 @@ impl PowBackend for CpuBackend {
         }
         self.shared.current_epoch.store(epoch, Ordering::SeqCst);
         Ok(())
+    }
+
+    fn take_hashes(&self, epoch: u64) -> u64 {
+        if self.shared.hashes_epoch.load(Ordering::Acquire) != epoch {
+            return 0;
+        }
+        self.shared.hashes_count.swap(0, Ordering::AcqRel)
     }
 
     fn kernel_bench(&self, seconds: u64, shutdown: &AtomicBool) -> Result<u64> {
@@ -187,23 +203,19 @@ fn cpu_worker_loop(shared: Arc<Shared>, thread_idx: usize) {
     let mut local_epoch = 0u64;
     let mut local_work: Option<Arc<MiningWork>> = None;
     let mut nonce = 0u64;
-    let mut hash_batch = 0u64;
 
     loop {
         if shared.shutdown.load(Ordering::Relaxed) {
-            flush_hash_batch(&shared, local_epoch, &mut hash_batch);
             break;
         }
 
         let current_epoch = shared.current_epoch.load(Ordering::Acquire);
         if current_epoch == 0 {
-            flush_hash_batch(&shared, local_epoch, &mut hash_batch);
             thread::sleep(IDLE_SLEEP);
             continue;
         }
 
         if current_epoch != local_epoch {
-            flush_hash_batch(&shared, local_epoch, &mut hash_batch);
             let next_work = match shared.work.read() {
                 Ok(slot) => slot.clone(),
                 Err(_) => {
@@ -241,7 +253,6 @@ fn cpu_worker_loop(shared: Arc<Shared>, thread_idx: usize) {
         if shared.solved_epoch.load(Ordering::Relaxed) == local_epoch
             || Instant::now() >= work.stop_at
         {
-            flush_hash_batch(&shared, local_epoch, &mut hash_batch);
             thread::sleep(STALE_SLEEP);
             continue;
         }
@@ -259,9 +270,8 @@ fn cpu_worker_loop(shared: Arc<Shared>, thread_idx: usize) {
             break;
         }
 
-        hash_batch = hash_batch.saturating_add(1);
-        if hash_batch >= HASH_EVENT_BATCH {
-            flush_hash_batch(&shared, local_epoch, &mut hash_batch);
+        if shared.hashes_epoch.load(Ordering::Acquire) == local_epoch {
+            shared.hashes_count.fetch_add(1, Ordering::Relaxed);
         }
 
         if hash_meets_target(&output, &work.target)
@@ -270,7 +280,6 @@ fn cpu_worker_loop(shared: Arc<Shared>, thread_idx: usize) {
                 .compare_exchange(0, local_epoch, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         {
-            flush_hash_batch(&shared, local_epoch, &mut hash_batch);
             emit_event(
                 &shared,
                 BackendEvent::Solution(MiningSolution {
@@ -283,22 +292,6 @@ fn cpu_worker_loop(shared: Arc<Shared>, thread_idx: usize) {
 
         nonce = nonce.wrapping_add(work.global_stride.max(1));
     }
-}
-
-fn flush_hash_batch(shared: &Shared, epoch: u64, hash_batch: &mut u64) {
-    if epoch == 0 || *hash_batch == 0 {
-        return;
-    }
-    let count = *hash_batch;
-    *hash_batch = 0;
-    emit_event(
-        shared,
-        BackendEvent::Hashes {
-            backend: "cpu",
-            epoch,
-            count,
-        },
-    );
 }
 
 fn emit_error(shared: &Shared, message: String) {

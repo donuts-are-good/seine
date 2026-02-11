@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::types::{BlockTemplateResponse, SubmitBlockResponse};
 
@@ -55,12 +55,25 @@ impl ApiClient {
         decode_json_response(resp, "blocktemplate")
     }
 
-    pub fn submit_block(&self, block: &Value) -> Result<SubmitBlockResponse> {
+    pub fn submit_block(
+        &self,
+        block: &Value,
+        template_id: Option<&str>,
+        nonce: u64,
+    ) -> Result<SubmitBlockResponse> {
         let url = format!("{}/api/mining/submitblock", self.base_url);
+        let payload = if let Some(template_id) = template_id {
+            json!({
+                "template_id": template_id,
+                "nonce": nonce,
+            })
+        } else {
+            block.clone()
+        };
         let resp = self
             .json_client
             .post(url)
-            .json(block)
+            .json(&payload)
             .send()
             .context("request to submitblock endpoint failed")?;
 
@@ -149,9 +162,33 @@ mod tests {
 
         let client = test_client(&server);
         let err = client
-            .submit_block(&json!({"header": {"nonce": 1}}))
+            .submit_block(&json!({"header": {"nonce": 1}}), None, 1)
             .expect_err("submit should fail");
         assert!(format!("{err:#}").contains("invalid_pow"));
+        mock.assert();
+    }
+
+    #[test]
+    fn submit_block_compact_payload() {
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/mining/submitblock")
+                .header("authorization", "Bearer testtoken")
+                .json_body(json!({"template_id": "tmpl-1", "nonce": 7}));
+            then.status(200).json_body(json!({
+                "accepted": true,
+                "hash": "abcd",
+                "height": 1
+            }));
+        });
+
+        let client = test_client(&server);
+        let resp = client
+            .submit_block(&json!({"header": {"nonce": 999}}), Some("tmpl-1"), 7)
+            .expect("compact submit should succeed");
+        assert!(resp.accepted);
         mock.assert();
     }
 }
