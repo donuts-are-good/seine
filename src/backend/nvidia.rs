@@ -1,8 +1,9 @@
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{bail, Result};
+use crossbeam_channel::Sender;
 
-use crate::backend::{MiningSolution, MiningWork, PowBackend};
+use crate::backend::{BackendEvent, MiningWork, PowBackend};
 
 pub struct NvidiaBackend;
 
@@ -21,6 +22,8 @@ impl PowBackend for NvidiaBackend {
         1
     }
 
+    fn set_event_sink(&mut self, _sink: Sender<BackendEvent>) {}
+
     fn start(&mut self) -> Result<()> {
         bail!("NVIDIA backend is scaffolded but not implemented yet")
     }
@@ -29,14 +32,6 @@ impl PowBackend for NvidiaBackend {
 
     fn set_work(&self, _work: MiningWork) -> Result<()> {
         Ok(())
-    }
-
-    fn try_recv_solution(&self) -> Option<MiningSolution> {
-        None
-    }
-
-    fn drain_hashes(&self) -> u64 {
-        0
     }
 
     fn kernel_bench(&self, _seconds: u64, _shutdown: &AtomicBool) -> Result<u64> {

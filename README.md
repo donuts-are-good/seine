@@ -5,7 +5,7 @@ External Blocknet miner with a pluggable backend architecture.
 Current status:
 - CPU backend: implemented (Argon2id, consensus-compatible params).
 - NVIDIA backend: scaffolded interface only (not implemented yet).
-- Runtime architecture: supports multiple backends in one process with persistent workers and per-template work updates.
+- Runtime architecture: supports multiple backends in one process with persistent workers, event-driven backend reporting, and nonce progression that advances by observed hash work to avoid nonce-space reuse.
 
 ## Test
 

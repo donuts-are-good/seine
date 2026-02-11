@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Result};
+use crossbeam_channel::Sender;
 
 pub mod cpu;
 pub mod nvidia;
@@ -25,24 +26,32 @@ pub struct MiningSolution {
     pub backend: String,
 }
 
+#[derive(Debug, Clone)]
+pub enum BackendEvent {
+    Hashes {
+        backend: &'static str,
+        epoch: u64,
+        count: u64,
+    },
+    Solution(MiningSolution),
+    Error {
+        backend: &'static str,
+        message: String,
+    },
+}
+
 pub trait PowBackend: Send {
     fn name(&self) -> &'static str;
 
     fn lanes(&self) -> usize;
+
+    fn set_event_sink(&mut self, sink: Sender<BackendEvent>);
 
     fn start(&mut self) -> Result<()>;
 
     fn stop(&mut self);
 
     fn set_work(&self, work: MiningWork) -> Result<()>;
-
-    fn try_recv_solution(&self) -> Option<MiningSolution>;
-
-    fn drain_hashes(&self) -> u64;
-
-    fn drain_errors(&self) -> u64 {
-        0
-    }
 
     fn kernel_bench(&self, _seconds: u64, _shutdown: &AtomicBool) -> Result<u64> {
         bail!(

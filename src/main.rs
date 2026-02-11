@@ -5,19 +5,19 @@ mod types;
 
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use blocknet_pow_spec::POW_HEADER_BASE_LEN;
+use crossbeam_channel::{after, unbounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 
 use api::ApiClient;
 use backend::cpu::CpuBackend;
 use backend::nvidia::NvidiaBackend;
-use backend::{MiningSolution, MiningWork, PowBackend};
+use backend::{BackendEvent, MiningSolution, MiningWork, PowBackend};
 use config::{BackendKind, BenchKind, Config};
 use types::{
     decode_hex, parse_target, set_block_nonce, template_difficulty, template_height,
@@ -26,8 +26,7 @@ use types::{
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TEMPLATE_RETRY_DELAY: Duration = Duration::from_secs(2);
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
-const NONCE_BUMP_MULTIPLIER: u64 = 4096;
+const MIN_EVENT_WAIT: Duration = Duration::from_millis(1);
 
 struct Stats {
     started_at: Instant,
@@ -107,7 +106,7 @@ fn run() -> Result<()> {
     let client = ApiClient::new(cfg.api_url.clone(), token, REQUEST_TIMEOUT)?;
 
     let backend_instances = build_backend_instances(&cfg);
-    let mut backends = activate_backends(backend_instances)?;
+    let (mut backends, backend_events) = activate_backends(backend_instances)?;
     let total_lanes = total_lanes(&backends);
 
     println!(
@@ -120,13 +119,20 @@ fn run() -> Result<()> {
         if cfg.sse_enabled { "on" } else { "off" }
     );
 
-    let event_rx = if cfg.sse_enabled {
+    let tip_events = if cfg.sse_enabled {
         Some(spawn_tip_listener(client.clone(), Arc::clone(&shutdown)))
     } else {
         None
     };
 
-    let result = run_mining_loop(&cfg, &client, &shutdown, &mut backends, event_rx);
+    let result = run_mining_loop(
+        &cfg,
+        &client,
+        &shutdown,
+        &mut backends,
+        &backend_events,
+        tip_events.as_ref(),
+    );
 
     stop_backend_slots(&mut backends);
     result
@@ -137,7 +143,8 @@ fn run_mining_loop(
     client: &ApiClient,
     shutdown: &AtomicBool,
     backends: &mut [BackendSlot],
-    event_rx: Option<mpsc::Receiver<TipEvent>>,
+    backend_events: &Receiver<BackendEvent>,
+    tip_events: Option<&Receiver<TipEvent>>,
 ) -> Result<()> {
     let stats = Stats::new();
     let mut nonce_cursor = cfg.start_nonce;
@@ -209,29 +216,66 @@ fn run_mining_loop(
         let round_start = Instant::now();
         let mut solved: Option<MiningSolution> = None;
         let mut stale_tip_event = false;
+        let mut round_hashes = 0u64;
 
-        while !shutdown.load(Ordering::Relaxed) && Instant::now() < stop_at {
-            collect_backend_counters(backends, &stats)?;
-
-            if consume_tip_events(event_rx.as_ref()) {
-                stale_tip_event = true;
-                break;
-            }
-
-            solved = try_find_solution(backends, epoch);
-            if solved.is_some() {
-                break;
-            }
-
+        while !shutdown.load(Ordering::Relaxed)
+            && Instant::now() < stop_at
+            && solved.is_none()
+            && !stale_tip_event
+        {
             if last_stats_print.elapsed() >= cfg.stats_interval {
                 stats.print();
                 last_stats_print = Instant::now();
             }
 
-            thread::sleep(POLL_INTERVAL);
+            let wait_for = next_event_wait(stop_at, last_stats_print, cfg.stats_interval);
+
+            if let Some(tip_rx) = tip_events {
+                crossbeam_channel::select! {
+                    recv(backend_events) -> event => {
+                        let event = event.map_err(|_| anyhow!("backend event channel closed"))?;
+                        handle_mining_backend_event(
+                            event,
+                            epoch,
+                            &stats,
+                            &mut round_hashes,
+                            &mut solved,
+                        )?;
+                    }
+                    recv(tip_rx) -> tip => {
+                        if tip.is_ok() {
+                            stale_tip_event = true;
+                        }
+                    }
+                    recv(after(wait_for)) -> _ => {}
+                }
+            } else {
+                crossbeam_channel::select! {
+                    recv(backend_events) -> event => {
+                        let event = event.map_err(|_| anyhow!("backend event channel closed"))?;
+                        handle_mining_backend_event(
+                            event,
+                            epoch,
+                            &stats,
+                            &mut round_hashes,
+                            &mut solved,
+                        )?;
+                    }
+                    recv(after(wait_for)) -> _ => {}
+                }
+            }
         }
 
-        collect_backend_counters(backends, &stats)?;
+        drain_mining_backend_events(
+            backend_events,
+            epoch,
+            &stats,
+            &mut round_hashes,
+            &mut solved,
+        )?;
+        if consume_tip_events(tip_events) {
+            stale_tip_event = true;
+        }
 
         if let Some(solution) = solved {
             println!(
@@ -244,8 +288,7 @@ fn run_mining_loop(
             let mut solved_block = template.block;
             if let Err(err) = set_block_nonce(&mut solved_block, solution.nonce) {
                 eprintln!("failed to set nonce on solved block: {err:#}");
-                nonce_cursor =
-                    nonce_cursor.wrapping_add(total_lanes.saturating_mul(NONCE_BUMP_MULTIPLIER));
+                nonce_cursor = advance_nonce_cursor(nonce_cursor, total_lanes, round_hashes);
                 continue;
             }
 
@@ -276,7 +319,7 @@ fn run_mining_loop(
             println!("[template] no solution before refresh or shutdown");
         }
 
-        nonce_cursor = nonce_cursor.wrapping_add(total_lanes.saturating_mul(NONCE_BUMP_MULTIPLIER));
+        nonce_cursor = advance_nonce_cursor(nonce_cursor, total_lanes, round_hashes);
 
         if last_stats_print.elapsed() >= cfg.stats_interval {
             stats.print();
@@ -395,7 +438,7 @@ fn run_worker_benchmark(
     instances: Vec<Box<dyn PowBackend>>,
     restart_each_round: bool,
 ) -> Result<()> {
-    let mut backends = activate_backends(instances)?;
+    let (mut backends, backend_events) = activate_backends(instances)?;
     let bench_kind = if restart_each_round {
         "end_to_end"
     } else {
@@ -415,7 +458,13 @@ fn run_worker_benchmark(
         stop_backend_slots(&mut backends);
     }
 
-    let result = run_worker_benchmark_inner(cfg, shutdown, &mut backends, restart_each_round);
+    let result = run_worker_benchmark_inner(
+        cfg,
+        shutdown,
+        &mut backends,
+        &backend_events,
+        restart_each_round,
+    );
     stop_backend_slots(&mut backends);
     result
 }
@@ -424,11 +473,13 @@ fn run_worker_benchmark_inner(
     cfg: &Config,
     shutdown: &AtomicBool,
     backends: &mut [BackendSlot],
+    backend_events: &Receiver<BackendEvent>,
     restart_each_round: bool,
 ) -> Result<()> {
     let impossible_target = [0u8; 32];
     let mut runs = Vec::with_capacity(cfg.bench_rounds as usize);
     let mut epoch = 0u64;
+    let mut nonce_cursor = cfg.start_nonce;
 
     for round in 0..cfg.bench_rounds {
         if shutdown.load(Ordering::Relaxed) {
@@ -443,9 +494,7 @@ fn run_worker_benchmark_inner(
         let round_start = Instant::now();
         let stop_at = round_start + Duration::from_secs(cfg.bench_secs);
         let header_base = benchmark_header_base(round);
-        let nonce_seed = cfg.start_nonce.wrapping_add(
-            (round as u64).saturating_mul(total_lanes(backends).saturating_mul(10_000)),
-        );
+        let nonce_seed = nonce_cursor;
 
         distribute_work(
             backends,
@@ -458,21 +507,20 @@ fn run_worker_benchmark_inner(
 
         let mut round_hashes = 0u64;
         while Instant::now() < stop_at && !shutdown.load(Ordering::Relaxed) {
-            round_hashes = round_hashes.saturating_add(drain_hashes(backends));
-            ensure_no_backend_errors(backends)?;
+            let wait_for = stop_at
+                .saturating_duration_since(Instant::now())
+                .max(MIN_EVENT_WAIT);
 
-            if let Some(solution) = try_find_solution(backends, epoch) {
-                println!(
-                    "[bench] unexpected solution found by {} at nonce={}",
-                    solution.backend, solution.nonce
-                );
+            crossbeam_channel::select! {
+                recv(backend_events) -> event => {
+                    let event = event.map_err(|_| anyhow!("backend event channel closed"))?;
+                    handle_benchmark_backend_event(event, epoch, &mut round_hashes)?;
+                }
+                recv(after(wait_for)) -> _ => {}
             }
-
-            thread::sleep(POLL_INTERVAL);
         }
 
-        round_hashes = round_hashes.saturating_add(drain_hashes(backends));
-        ensure_no_backend_errors(backends)?;
+        drain_benchmark_backend_events(backend_events, epoch, &mut round_hashes)?;
 
         let elapsed = round_start.elapsed().as_secs_f64().max(0.001);
         let hps = round_hashes as f64 / elapsed;
@@ -492,6 +540,8 @@ fn run_worker_benchmark_inner(
             elapsed_secs: elapsed,
             hps,
         });
+
+        nonce_cursor = advance_nonce_cursor(nonce_cursor, total_lanes(backends), round_hashes);
 
         if restart_each_round {
             stop_backend_slots(backends);
@@ -589,11 +639,15 @@ fn build_backend_instances(cfg: &Config) -> Vec<Box<dyn PowBackend>> {
         .collect()
 }
 
-fn activate_backends(mut backends: Vec<Box<dyn PowBackend>>) -> Result<Vec<BackendSlot>> {
+fn activate_backends(
+    mut backends: Vec<Box<dyn PowBackend>>,
+) -> Result<(Vec<BackendSlot>, Receiver<BackendEvent>)> {
     let mut active = Vec::new();
+    let (event_tx, event_rx) = unbounded::<BackendEvent>();
 
     for mut backend in backends.drain(..) {
         let backend_name = backend.name();
+        backend.set_event_sink(event_tx.clone());
         match backend.start() {
             Ok(()) => {
                 let lanes = backend.lanes() as u64;
@@ -624,7 +678,7 @@ fn activate_backends(mut backends: Vec<Box<dyn PowBackend>>) -> Result<Vec<Backe
         lane_offset = lane_offset.wrapping_add(slot.lanes);
     }
 
-    Ok(active)
+    Ok((active, event_rx))
 }
 
 fn start_backend_slots(backends: &mut [BackendSlot]) -> Result<()> {
@@ -668,47 +722,108 @@ fn distribute_work(
     Ok(())
 }
 
-fn collect_backend_counters(backends: &[BackendSlot], stats: &Stats) -> Result<()> {
-    let hashes = drain_hashes(backends);
-    if hashes > 0 {
-        stats.hashes.fetch_add(hashes, Ordering::Relaxed);
-    }
-    ensure_no_backend_errors(backends)
+fn next_event_wait(
+    stop_at: Instant,
+    last_stats_print: Instant,
+    stats_interval: Duration,
+) -> Duration {
+    let now = Instant::now();
+    let until_stop = stop_at.saturating_duration_since(now);
+    let next_stats_at = last_stats_print + stats_interval;
+    let until_stats = next_stats_at.saturating_duration_since(now);
+    until_stop.min(until_stats).max(MIN_EVENT_WAIT)
 }
 
-fn drain_hashes(backends: &[BackendSlot]) -> u64 {
-    backends
-        .iter()
-        .map(|slot| slot.backend.drain_hashes())
-        .sum::<u64>()
+fn advance_nonce_cursor(nonce_cursor: u64, lanes: u64, observed_hashes: u64) -> u64 {
+    let safe_hashes = observed_hashes.max(1);
+    let stride = lanes.max(1);
+    nonce_cursor.wrapping_add(stride.saturating_mul(safe_hashes))
 }
 
-fn ensure_no_backend_errors(backends: &[BackendSlot]) -> Result<()> {
-    for slot in backends {
-        let errors = slot.backend.drain_errors();
-        if errors > 0 {
-            bail!(
-                "backend '{}' reported {} worker error(s)",
-                slot.backend.name(),
-                errors
-            );
+fn handle_mining_backend_event(
+    event: BackendEvent,
+    epoch: u64,
+    stats: &Stats,
+    round_hashes: &mut u64,
+    solved: &mut Option<MiningSolution>,
+) -> Result<()> {
+    match event {
+        BackendEvent::Hashes { count, .. } => {
+            stats.hashes.fetch_add(count, Ordering::Relaxed);
+            *round_hashes = round_hashes.saturating_add(count);
+        }
+        BackendEvent::Solution(solution) => {
+            if solution.epoch == epoch {
+                *solved = Some(solution);
+            }
+        }
+        BackendEvent::Error { backend, message } => {
+            bail!("backend '{backend}' reported error: {message}");
         }
     }
     Ok(())
 }
 
-fn try_find_solution(backends: &[BackendSlot], epoch: u64) -> Option<MiningSolution> {
-    for slot in backends {
-        while let Some(solution) = slot.backend.try_recv_solution() {
-            if solution.epoch == epoch {
-                return Some(solution);
-            }
-        }
+fn drain_mining_backend_events(
+    backend_events: &Receiver<BackendEvent>,
+    epoch: u64,
+    stats: &Stats,
+    round_hashes: &mut u64,
+    solved: &mut Option<MiningSolution>,
+) -> Result<()> {
+    while let Ok(event) = backend_events.try_recv() {
+        handle_mining_backend_event(event, epoch, stats, round_hashes, solved)?;
     }
-    None
+    Ok(())
 }
 
-fn consume_tip_events(event_rx: Option<&mpsc::Receiver<TipEvent>>) -> bool {
+fn handle_benchmark_backend_event(
+    event: BackendEvent,
+    epoch: u64,
+    round_hashes: &mut u64,
+) -> Result<()> {
+    match event {
+        BackendEvent::Hashes {
+            backend,
+            epoch: event_epoch,
+            count,
+        } => {
+            if event_epoch == epoch {
+                *round_hashes = round_hashes.saturating_add(count);
+            } else {
+                println!(
+                    "[bench] ignored stale hash event from backend={} event_epoch={} round_epoch={} count={}",
+                    backend, event_epoch, epoch, count
+                );
+            }
+        }
+        BackendEvent::Solution(solution) => {
+            if solution.epoch == epoch {
+                println!(
+                    "[bench] unexpected solution found by {} at nonce={}",
+                    solution.backend, solution.nonce
+                );
+            }
+        }
+        BackendEvent::Error { backend, message } => {
+            bail!("backend '{backend}' reported error: {message}");
+        }
+    }
+    Ok(())
+}
+
+fn drain_benchmark_backend_events(
+    backend_events: &Receiver<BackendEvent>,
+    epoch: u64,
+    round_hashes: &mut u64,
+) -> Result<()> {
+    while let Ok(event) = backend_events.try_recv() {
+        handle_benchmark_backend_event(event, epoch, round_hashes)?;
+    }
+    Ok(())
+}
+
+fn consume_tip_events(event_rx: Option<&Receiver<TipEvent>>) -> bool {
     let Some(event_rx) = event_rx else {
         return false;
     };
@@ -722,8 +837,8 @@ fn consume_tip_events(event_rx: Option<&mpsc::Receiver<TipEvent>>) -> bool {
     stale
 }
 
-fn spawn_tip_listener(client: ApiClient, shutdown: Arc<AtomicBool>) -> mpsc::Receiver<TipEvent> {
-    let (tx, rx) = mpsc::channel();
+fn spawn_tip_listener(client: ApiClient, shutdown: Arc<AtomicBool>) -> Receiver<TipEvent> {
+    let (tx, rx) = unbounded();
 
     thread::spawn(move || {
         while !shutdown.load(Ordering::Relaxed) {
@@ -753,7 +868,7 @@ fn spawn_tip_listener(client: ApiClient, shutdown: Arc<AtomicBool>) -> mpsc::Rec
 
 fn stream_tip_events(
     resp: reqwest::blocking::Response,
-    tx: &mpsc::Sender<TipEvent>,
+    tx: &Sender<TipEvent>,
     shutdown: &AtomicBool,
 ) -> Result<()> {
     let mut event_name = String::new();
@@ -844,6 +959,7 @@ fn median(sorted: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn median_handles_even_and_odd() {
@@ -858,5 +974,83 @@ mod tests {
         assert_eq!(format_hashrate(5.0), "5.000 H/s");
         assert_eq!(format_hashrate(5_000.0), "5.000 KH/s");
         assert_eq!(format_hashrate(5_000_000.0), "5.000 MH/s");
+    }
+
+    #[test]
+    fn advance_nonce_cursor_uses_stride_and_hash_count() {
+        let seed = 100u64;
+        let next = advance_nonce_cursor(seed, 8, 50);
+        assert_eq!(next, 500);
+    }
+
+    #[test]
+    fn advance_nonce_cursor_prevents_overlap_for_unbalanced_lanes() {
+        let lanes = 4u64;
+        let seed = 17u64;
+        let lane_iters = [9u64, 2, 5, 7];
+        let total_hashes = lane_iters.iter().sum::<u64>();
+
+        let mut searched = HashSet::new();
+        for (lane, iters) in lane_iters.iter().enumerate() {
+            for i in 0..*iters {
+                let nonce = seed
+                    .wrapping_add(lane as u64)
+                    .wrapping_add(i.saturating_mul(lanes));
+                searched.insert(nonce);
+            }
+        }
+
+        let next_seed = advance_nonce_cursor(seed, lanes, total_hashes);
+        for lane in 0..lanes {
+            for i in 0..lane_iters.iter().copied().max().unwrap_or(0) {
+                let nonce = next_seed
+                    .wrapping_add(lane)
+                    .wrapping_add(i.saturating_mul(lanes));
+                assert!(
+                    !searched.contains(&nonce),
+                    "nonce {nonce} should not overlap with previously searched space"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stale_solution_is_ignored_for_current_epoch() {
+        let stats = Stats::new();
+        let mut round_hashes = 0u64;
+        let mut solved = None;
+
+        handle_mining_backend_event(
+            BackendEvent::Solution(MiningSolution {
+                epoch: 41,
+                nonce: 9,
+                backend: "cpu".to_string(),
+            }),
+            42,
+            &stats,
+            &mut round_hashes,
+            &mut solved,
+        )
+        .expect("stale solution handling should succeed");
+
+        assert!(solved.is_none());
+        assert_eq!(round_hashes, 0);
+    }
+
+    #[test]
+    fn benchmark_ignores_stale_hash_events() {
+        let mut round_hashes = 0u64;
+        handle_benchmark_backend_event(
+            BackendEvent::Hashes {
+                backend: "cpu",
+                epoch: 99,
+                count: 1_000,
+            },
+            100,
+            &mut round_hashes,
+        )
+        .expect("stale benchmark hash event should be ignored");
+
+        assert_eq!(round_hashes, 0);
     }
 }
