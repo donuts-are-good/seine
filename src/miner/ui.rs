@@ -108,10 +108,6 @@ pub(super) fn set_tui_state(state: TuiState) {
     let _ = TUI_STATE.set(state);
 }
 
-pub(super) fn active_tui_state() -> Option<&'static TuiState> {
-    TUI_STATE.get()
-}
-
 fn level_to_tui(level: Level) -> LogLevel {
     match level {
         Level::Info => LogLevel::Info,
@@ -132,8 +128,8 @@ fn log(level: Level, tag: &str, message: &str) {
         };
         if let Ok(mut state) = tui_state.lock() {
             state.push_log(entry);
+            return;
         }
-        return;
     }
 
     let colors = use_color();

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use blocknet_pow_spec::POW_HEADER_BASE_LEN;
-use crossbeam_channel::{after, Receiver};
+use crossbeam_channel::Receiver;
 use serde_json::Value;
 
 use crate::api::{is_no_wallet_loaded_error, is_wallet_already_loaded_error, ApiClient};
@@ -23,7 +23,7 @@ use crate::types::{
 use super::scheduler::NonceScheduler;
 use super::stats::{format_hashrate, Stats};
 use super::tui::{TuiRenderer, TuiState};
-use super::ui::{active_tui_state, error, info, mined, success, warn};
+use super::ui::{error, info, mined, set_tui_state, success, warn};
 use super::{
     collect_backend_hashes, distribute_work, format_round_backend_hashrate, next_event_wait,
     next_work_id, quiesce_backend_slots, total_lanes, BackendSlot, RuntimeBackendEventAction,
@@ -163,48 +163,46 @@ struct TuiDisplay {
     last_state_label: String,
 }
 
+struct RoundUiView<'a> {
+    backends: &'a [BackendSlot],
+    round_backend_hashes: &'a BTreeMap<u64, u64>,
+    round_hashes: u64,
+    round_start: Instant,
+    height: &'a str,
+    difficulty: &'a str,
+    epoch: u64,
+    state_label: &'a str,
+}
+
 impl TuiDisplay {
-    fn new() -> Result<Self> {
-        let tui_state = active_tui_state()
-            .ok_or_else(|| anyhow!("TUI state not initialized"))?;
-        let renderer = TuiRenderer::new()
-            .map_err(|err| anyhow!("TUI renderer init failed: {err}"))?;
+    fn new(tui_state: TuiState) -> Result<Self> {
+        let renderer =
+            TuiRenderer::new().map_err(|err| anyhow!("TUI renderer init failed: {err}"))?;
         Ok(Self {
             renderer,
-            state: Arc::clone(tui_state),
+            state: tui_state,
             last_render: Instant::now() - TUI_RENDER_INTERVAL,
             last_state_label: String::new(),
         })
     }
 
-    fn update(
-        &mut self,
-        stats: &Stats,
-        backends: &[BackendSlot],
-        round_backend_hashes: &BTreeMap<u64, u64>,
-        round_hashes: u64,
-        round_start: Instant,
-        height: &str,
-        difficulty: &str,
-        epoch: u64,
-        state_label: &str,
-    ) {
-        let state_changed = self.last_state_label != state_label;
+    fn update(&mut self, stats: &Stats, view: RoundUiView<'_>) {
+        let state_changed = self.last_state_label != view.state_label;
         if !state_changed && self.last_render.elapsed() < TUI_RENDER_INTERVAL {
             return;
         }
 
         let snapshot = stats.snapshot();
-        let round_elapsed = round_start.elapsed().as_secs_f64().max(0.001);
-        let round_rate = format_hashrate(round_hashes as f64 / round_elapsed);
+        let round_elapsed = view.round_start.elapsed().as_secs_f64().max(0.001);
+        let round_rate = format_hashrate(view.round_hashes as f64 / round_elapsed);
         let backend_rate =
-            format_round_backend_hashrate(backends, round_backend_hashes, round_elapsed);
+            format_round_backend_hashrate(view.backends, view.round_backend_hashes, round_elapsed);
 
         if let Ok(mut s) = self.state.lock() {
-            s.height = height.to_string();
-            s.difficulty = difficulty.to_string();
-            s.epoch = epoch;
-            s.state = state_label.to_string();
+            s.height = view.height.to_string();
+            s.difficulty = view.difficulty.to_string();
+            s.epoch = view.epoch;
+            s.state = view.state_label.to_string();
             s.round_hashrate = round_rate;
             s.avg_hashrate = format_hashrate(snapshot.hps);
             s.total_hashes = snapshot.hashes;
@@ -218,11 +216,41 @@ impl TuiDisplay {
             let _ = self.renderer.render(&locked);
         }
         self.last_render = Instant::now();
-        self.last_state_label = state_label.to_string();
+        self.last_state_label = view.state_label.to_string();
     }
 
     fn poll_quit(&self) -> bool {
         self.renderer.poll_quit()
+    }
+
+    fn mark_block_found(&mut self) {
+        if let Ok(mut s) = self.state.lock() {
+            let elapsed = s.started_at.elapsed().as_secs();
+            s.block_found_ticks.push(elapsed);
+        }
+    }
+}
+
+fn init_tui_display(tui_state: Option<TuiState>) -> Option<TuiDisplay> {
+    let state = tui_state?;
+    match TuiDisplay::new(Arc::clone(&state)) {
+        Ok(display) => {
+            set_tui_state(state);
+            Some(display)
+        }
+        Err(err) => {
+            warn(
+                "TUI",
+                format!("disabled after init failure; continuing in plain mode ({err:#})"),
+            );
+            None
+        }
+    }
+}
+
+fn update_tui(tui: &mut Option<TuiDisplay>, stats: &Stats, view: RoundUiView<'_>) {
+    if let Some(display) = tui.as_mut() {
+        display.update(stats, view);
     }
 }
 
@@ -232,6 +260,7 @@ pub(super) fn run_mining_loop(
     shutdown: Arc<AtomicBool>,
     backends: &mut Vec<BackendSlot>,
     backend_events: &Receiver<BackendEvent>,
+    tui_state: Option<TuiState>,
     tip_signal: Option<&TipSignal>,
 ) -> Result<()> {
     let stats = Stats::new();
@@ -240,7 +269,7 @@ pub(super) fn run_mining_loop(
     let mut epoch = 0u64;
     let mut last_stats_print = Instant::now();
     let mut prefetch: Option<TemplatePrefetch> = None;
-    let mut tui = TuiDisplay::new()?;
+    let mut tui = init_tui_display(tui_state);
 
     let mut template = match fetch_template_with_retry(client, cfg, shutdown.as_ref()) {
         Some(t) => t,
@@ -356,16 +385,19 @@ pub(super) fn run_mining_loop(
         let mut round_backend_hashes = BTreeMap::new();
         let mut topology_changed = false;
         let mut next_hash_poll_at = Instant::now();
-        tui.update(
+        update_tui(
+            &mut tui,
             &stats,
-            backends,
-            &round_backend_hashes,
-            round_hashes,
-            round_start,
-            &height,
-            &difficulty,
-            epoch,
-            "working",
+            RoundUiView {
+                backends,
+                round_backend_hashes: &round_backend_hashes,
+                round_hashes,
+                round_start,
+                height: &height,
+                difficulty: &difficulty,
+                epoch,
+                state_label: "working",
+            },
         );
 
         while !shutdown.load(Ordering::Relaxed)
@@ -382,39 +414,43 @@ pub(super) fn run_mining_loop(
                     Some(&mut round_backend_hashes),
                 );
                 next_hash_poll_at = now + cfg.hash_poll_interval;
-                tui.update(
+                update_tui(
+                    &mut tui,
                     &stats,
-                    backends,
-                    &round_backend_hashes,
-                    round_hashes,
-                    round_start,
-                    &height,
-                    &difficulty,
-                    epoch,
-                    "working",
+                    RoundUiView {
+                        backends,
+                        round_backend_hashes: &round_backend_hashes,
+                        round_hashes,
+                        round_start,
+                        height: &height,
+                        difficulty: &difficulty,
+                        epoch,
+                        state_label: "working",
+                    },
                 );
-                if tui.poll_quit() {
+                if tui.as_ref().is_some_and(TuiDisplay::poll_quit) {
                     shutdown.store(true, Ordering::SeqCst);
                     break;
                 }
             }
 
-            if last_stats_print.elapsed() >= cfg.stats_interval {
-                last_stats_print = Instant::now();
-            }
+            maybe_print_stats(&stats, &mut last_stats_print, cfg.stats_interval);
 
             if tip_signal.is_some_and(TipSignal::take_stale) {
                 stale_tip_event = true;
-                tui.update(
+                update_tui(
+                    &mut tui,
                     &stats,
-                    backends,
-                    &round_backend_hashes,
-                    round_hashes,
-                    round_start,
-                    &height,
-                    &difficulty,
-                    epoch,
-                    "stale-tip",
+                    RoundUiView {
+                        backends,
+                        round_backend_hashes: &round_backend_hashes,
+                        round_hashes,
+                        round_start,
+                        height: &height,
+                        difficulty: &difficulty,
+                        epoch,
+                        state_label: "stale-tip",
+                    },
                 );
                 continue;
             }
@@ -435,7 +471,7 @@ pub(super) fn run_mining_loop(
                         topology_changed = true;
                     }
                 }
-                recv(after(wait_for)) -> _ => {}
+                default(wait_for) => {}
             }
 
             if topology_changed
@@ -466,16 +502,19 @@ pub(super) fn run_mining_loop(
                 )?;
                 next_hash_poll_at = Instant::now();
                 topology_changed = false;
-                tui.update(
+                update_tui(
+                    &mut tui,
                     &stats,
-                    backends,
-                    &round_backend_hashes,
-                    round_hashes,
-                    round_start,
-                    &height,
-                    &difficulty,
-                    epoch,
-                    "rebalanced",
+                    RoundUiView {
+                        backends,
+                        round_backend_hashes: &round_backend_hashes,
+                        round_hashes,
+                        round_start,
+                        height: &height,
+                        difficulty: &difficulty,
+                        epoch,
+                        state_label: "rebalanced",
+                    },
                 );
             }
         }
@@ -493,16 +532,19 @@ pub(super) fn run_mining_loop(
         stale_tip_event |= tip_signal.is_some_and(TipSignal::take_stale);
 
         if let Some(solution) = solved {
-            tui.update(
+            update_tui(
+                &mut tui,
                 &stats,
-                backends,
-                &round_backend_hashes,
-                round_hashes,
-                round_start,
-                &height,
-                &difficulty,
-                epoch,
-                "solved",
+                RoundUiView {
+                    backends,
+                    round_backend_hashes: &round_backend_hashes,
+                    round_hashes,
+                    round_start,
+                    height: &height,
+                    difficulty: &difficulty,
+                    epoch,
+                    state_label: "solved",
+                },
             );
             mined(
                 "SOLVE",
@@ -524,11 +566,8 @@ pub(super) fn run_mining_loop(
                 Ok(resp) => {
                     if resp.accepted {
                         stats.bump_accepted();
-                        if let Some(tui_st) = active_tui_state() {
-                            if let Ok(mut s) = tui_st.lock() {
-                                let elapsed = s.started_at.elapsed().as_secs();
-                                s.block_found_ticks.push(elapsed);
-                            }
+                        if let Some(display) = tui.as_mut() {
+                            display.mark_block_found();
                         }
                         let height = resp
                             .height
@@ -546,34 +585,38 @@ pub(super) fn run_mining_loop(
                 }
             }
         } else if stale_tip_event {
-            tui.update(
+            update_tui(
+                &mut tui,
                 &stats,
-                backends,
-                &round_backend_hashes,
-                round_hashes,
-                round_start,
-                &height,
-                &difficulty,
-                epoch,
-                "stale-refresh",
+                RoundUiView {
+                    backends,
+                    round_backend_hashes: &round_backend_hashes,
+                    round_hashes,
+                    round_start,
+                    height: &height,
+                    difficulty: &difficulty,
+                    epoch,
+                    state_label: "stale-refresh",
+                },
             );
         } else {
-            tui.update(
+            update_tui(
+                &mut tui,
                 &stats,
-                backends,
-                &round_backend_hashes,
-                round_hashes,
-                round_start,
-                &height,
-                &difficulty,
-                epoch,
-                "refresh",
+                RoundUiView {
+                    backends,
+                    round_backend_hashes: &round_backend_hashes,
+                    round_hashes,
+                    round_start,
+                    height: &height,
+                    difficulty: &difficulty,
+                    epoch,
+                    state_label: "refresh",
+                },
             );
         }
 
-        if last_stats_print.elapsed() >= cfg.stats_interval {
-            last_stats_print = Instant::now();
-        }
+        maybe_print_stats(&stats, &mut last_stats_print, cfg.stats_interval);
 
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -594,7 +637,6 @@ pub(super) fn run_mining_loop(
     info("MINER", "stopped");
     Ok(())
 }
-
 
 struct TemplatePrefetch {
     handle: JoinHandle<Option<BlockTemplateResponse>>,
@@ -818,6 +860,13 @@ fn fetch_template_with_retry(
     }
 
     None
+}
+
+fn maybe_print_stats(stats: &Stats, last_stats_print: &mut Instant, stats_interval: Duration) {
+    if last_stats_print.elapsed() >= stats_interval {
+        stats.print();
+        *last_stats_print = Instant::now();
+    }
 }
 
 fn sleep_with_shutdown(shutdown: &AtomicBool, duration: Duration) -> bool {

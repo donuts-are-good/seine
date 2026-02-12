@@ -6,16 +6,18 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use argon2::{Algorithm, Argon2, Block, Version};
 use blocknet_pow_spec::{pow_params, POW_OUTPUT_LEN};
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Sender, TrySendError};
 
 use crate::backend::{
-    BackendEvent, BackendInstanceId, MiningSolution, PowBackend, WorkAssignment, WORK_ID_MAX,
+    BackendEvent, BackendInstanceId, BenchBackend, MiningSolution, PowBackend, WorkAssignment,
+    WORK_ID_MAX,
 };
 use crate::config::CpuAffinityMode;
 use crate::types::hash_meets_target;
 
 const HASH_BATCH_SIZE: u64 = 64;
 const HASH_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+const SOLUTION_SEND_TIMEOUT: Duration = Duration::from_millis(10);
 const SOLVED_MASK: u64 = 1u64 << 63;
 
 struct ControlState {
@@ -209,6 +211,12 @@ impl PowBackend for CpuBackend {
             .sum()
     }
 
+    fn bench_backend(&self) -> Option<&dyn BenchBackend> {
+        Some(self)
+    }
+}
+
+impl BenchBackend for CpuBackend {
     fn kernel_bench(&self, seconds: u64, shutdown: &AtomicBool) -> Result<u64> {
         let lanes = self.threads.max(1);
         let stop_at = Instant::now() + Duration::from_secs(seconds.max(1));
@@ -529,7 +537,14 @@ fn emit_event(shared: &Shared, event: BackendEvent) {
     if let Some(tx) = tx {
         match event {
             BackendEvent::Solution(solution) => {
-                let _ = tx.send(BackendEvent::Solution(solution));
+                let event = BackendEvent::Solution(solution);
+                match tx.try_send(event) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(event)) => {
+                        let _ = tx.send_timeout(event, SOLUTION_SEND_TIMEOUT);
+                    }
+                    Err(TrySendError::Disconnected(_)) => {}
+                }
             }
             BackendEvent::Error {
                 backend_id,

@@ -57,6 +57,12 @@ Select multiple backends (comma-separated or repeated flag). Unavailable backend
 ./target/release/seine --backend cpu,nvidia --threads 1
 ```
 
+Run headless/plain logs (no fullscreen TUI):
+
+```bash
+./target/release/seine --ui plain --backend cpu --threads 1
+```
+
 ## Notes
 
 - Each CPU thread needs roughly 2GB RAM due to Argon2id parameters.
@@ -68,7 +74,9 @@ Select multiple backends (comma-separated or repeated flag). Unavailable backend
 - Runtime tuning knobs for performance iteration:
   - `--backend-event-capacity` (default `1024`) controls bounded backend event queue size.
   - `--hash-poll-ms` (default `200`) controls backend hash counter polling cadence.
+  - `--stats-secs` (default `10`) controls periodic stats log emission cadence.
   - `--cpu-affinity` (`auto` or `off`) controls CPU worker pinning policy for better repeatability on NUMA/SMT hosts.
+  - `--ui` (`auto`, `tui`, `plain`) controls rendering mode. `auto` enables TUI only when stdout/stderr are terminals.
   - `--relaxed-accounting` disables per-round quiesce barriers (higher throughput, less exact round accounting).
 - A backend runtime fault quarantines only that backend; mining continues on remaining active backends when possible.
 - This miner is intentionally external so consensus-critical validation remains in the daemon.

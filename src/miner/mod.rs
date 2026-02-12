@@ -6,6 +6,7 @@ mod tui;
 mod ui;
 
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,11 +22,11 @@ use crate::backend::{
     BackendEvent, BackendInstanceId, NonceLease, PowBackend, WorkAssignment, WorkTemplate,
     WORK_ID_MAX,
 };
-use crate::config::{BackendKind, Config};
+use crate::config::{BackendKind, Config, UiMode};
 use scheduler::NonceReservation;
 use stats::{format_hashrate, Stats};
-use tui::new_tui_state;
-use ui::{error, info, set_tui_state, warn};
+use tui::{new_tui_state, TuiState};
+use ui::{error, info, warn};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TEMPLATE_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -57,26 +58,11 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
     let cpu_ram_gib =
         (cpu_lanes as f64 * CPU_LANE_MEMORY_BYTES as f64) / (1024.0 * 1024.0 * 1024.0);
 
-    let tui_state = new_tui_state();
-    if let Ok(mut s) = tui_state.lock() {
-        s.api_url = cfg.api_url.clone();
-        s.threads = cfg.threads;
-        s.refresh_secs = cfg.refresh_interval.as_secs();
-        s.sse_enabled = cfg.sse_enabled;
-        s.backends_desc = format!(
-            "{} ({} lanes, ~{:.1} GiB RAM)",
-            backend_names(&backends),
-            total_lanes,
-            cpu_ram_gib
-        );
-        s.accounting = if cfg.strict_round_accounting {
-            "strict".to_string()
-        } else {
-            "relaxed".to_string()
-        };
-        s.version = format!("v{}", env!("CARGO_PKG_VERSION"));
-    }
-    set_tui_state(tui_state);
+    let tui_state = if should_enable_tui(cfg) {
+        Some(build_tui_state(cfg, &backends, total_lanes, cpu_ram_gib))
+    } else {
+        None
+    };
 
     info(
         "MINER",
@@ -103,6 +89,7 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
         Arc::clone(&shutdown),
         &mut backends,
         &backend_events,
+        tui_state,
         tip_listener.as_ref().map(mining::TipListener::signal),
     );
 
@@ -112,6 +99,42 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
         listener.join();
     }
     result
+}
+
+fn should_enable_tui(cfg: &Config) -> bool {
+    match cfg.ui_mode {
+        UiMode::Plain => false,
+        UiMode::Tui => true,
+        UiMode::Auto => std::io::stdout().is_terminal() && std::io::stderr().is_terminal(),
+    }
+}
+
+fn build_tui_state(
+    cfg: &Config,
+    backends: &[BackendSlot],
+    total_lanes: u64,
+    cpu_ram_gib: f64,
+) -> TuiState {
+    let tui_state = new_tui_state();
+    if let Ok(mut s) = tui_state.lock() {
+        s.api_url = cfg.api_url.clone();
+        s.threads = cfg.threads;
+        s.refresh_secs = cfg.refresh_interval.as_secs();
+        s.sse_enabled = cfg.sse_enabled;
+        s.backends_desc = format!(
+            "{} ({} lanes, ~{:.1} GiB RAM)",
+            backend_names(backends),
+            total_lanes,
+            cpu_ram_gib
+        );
+        s.accounting = if cfg.strict_round_accounting {
+            "strict".to_string()
+        } else {
+            "relaxed".to_string()
+        };
+        s.version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    }
+    tui_state
 }
 
 fn build_backend_instances(cfg: &Config) -> Vec<Box<dyn PowBackend>> {

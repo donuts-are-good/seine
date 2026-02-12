@@ -2,7 +2,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use crossbeam_channel::Sender;
 
 pub mod cpu;
@@ -52,6 +52,10 @@ pub enum BackendEvent {
     },
 }
 
+pub trait BenchBackend: Send {
+    fn kernel_bench(&self, seconds: u64, shutdown: &AtomicBool) -> Result<u64>;
+}
+
 pub trait PowBackend: Send {
     fn name(&self) -> &'static str;
 
@@ -87,10 +91,7 @@ pub trait PowBackend: Send {
         0
     }
 
-    fn kernel_bench(&self, _seconds: u64, _shutdown: &AtomicBool) -> Result<u64> {
-        bail!(
-            "kernel benchmark is not implemented for backend '{}'",
-            self.name()
-        )
+    fn bench_backend(&self) -> Option<&dyn BenchBackend> {
+        None
     }
 }

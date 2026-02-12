@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{bail, Result};
 use crossbeam_channel::Sender;
 
-use crate::backend::{BackendEvent, BackendInstanceId, PowBackend, WorkAssignment};
+use crate::backend::{BackendEvent, BackendInstanceId, BenchBackend, PowBackend, WorkAssignment};
 
 pub struct NvidiaBackend {
     _instance_id: BackendInstanceId,
@@ -48,6 +48,12 @@ impl PowBackend for NvidiaBackend {
         Ok(())
     }
 
+    fn bench_backend(&self) -> Option<&dyn BenchBackend> {
+        Some(self)
+    }
+}
+
+impl BenchBackend for NvidiaBackend {
     fn kernel_bench(&self, _seconds: u64, _shutdown: &AtomicBool) -> Result<u64> {
         bail!("kernel benchmark is not implemented for nvidia backend")
     }

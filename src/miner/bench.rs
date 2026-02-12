@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use blocknet_pow_spec::POW_HEADER_BASE_LEN;
-use crossbeam_channel::{after, Receiver};
+use crossbeam_channel::Receiver;
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
 
@@ -116,13 +116,16 @@ fn run_kernel_benchmark(
 
     let mut runs = Vec::with_capacity(cfg.bench_rounds as usize);
     let environment = benchmark_environment();
+    let bench_backend = backend
+        .bench_backend()
+        .ok_or_else(|| anyhow!("kernel benchmark is not implemented for {}", backend.name()))?;
     for round in 0..cfg.bench_rounds {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
 
         let round_start = Instant::now();
-        let hashes = backend.kernel_bench(cfg.bench_secs, shutdown)?;
+        let hashes = bench_backend.kernel_bench(cfg.bench_secs, shutdown)?;
         let elapsed = round_start.elapsed().as_secs_f64().max(0.001);
         let hps = hashes as f64 / elapsed;
 
@@ -292,7 +295,7 @@ fn run_worker_benchmark_inner(
                         topology_changed = true;
                     }
                 }
-                recv(after(wait_for)) -> _ => {}
+                default(wait_for) => {}
             }
 
             if topology_changed

@@ -26,6 +26,13 @@ pub enum CpuAffinityMode {
     Auto,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum UiMode {
+    Auto,
+    Tui,
+    Plain,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "seine", version, about = "Seine net miner for Blocknet")]
 struct Cli {
@@ -107,6 +114,10 @@ struct Cli {
     #[arg(long, action = ArgAction::SetTrue)]
     disable_sse: bool,
 
+    /// UI mode: auto (TTY-detected), tui (force full-screen TUI), plain (stdout logs only).
+    #[arg(long, value_enum, default_value_t = UiMode::Auto)]
+    ui: UiMode,
+
     /// Run local performance benchmark instead of mining over API.
     #[arg(long, default_value_t = false)]
     bench: bool,
@@ -149,6 +160,7 @@ pub struct Config {
     pub start_nonce: u64,
     pub nonce_iters_per_lane: u64,
     pub sse_enabled: bool,
+    pub ui_mode: UiMode,
     pub bench: bool,
     pub bench_kind: BenchKind,
     pub bench_secs: u64,
@@ -203,6 +215,7 @@ impl Config {
             start_nonce: cli.start_nonce.unwrap_or_else(default_nonce_seed),
             nonce_iters_per_lane: cli.nonce_iters_per_lane,
             sse_enabled: !cli.disable_sse,
+            ui_mode: cli.ui,
             bench: cli.bench,
             bench_kind: cli.bench_kind,
             bench_secs: cli.bench_secs.max(1),
@@ -383,6 +396,7 @@ mod tests {
             start_nonce: None,
             nonce_iters_per_lane: 1u64 << 36,
             disable_sse: false,
+            ui: UiMode::Auto,
             bench: false,
             bench_kind: BenchKind::Backend,
             bench_secs: 20,
