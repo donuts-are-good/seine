@@ -896,17 +896,16 @@ impl<'a> RoundRuntime<'a> {
                 && Instant::now() < input.stop_at
                 && !self.backends.is_empty()
             {
-                if has_append_assignment_semantics(self.backends) {
-                    if cancel_backend_slots(
+                if has_append_assignment_semantics(self.backends)
+                    && cancel_backend_slots(
                         self.backends,
                         RuntimeMode::Mining,
                         self.cfg.backend_control_timeout,
                     )? == BackendEventAction::TopologyChanged
-                    {
-                        topology_changed = true;
-                        if self.backends.is_empty() {
-                            continue;
-                        }
+                {
+                    topology_changed = true;
+                    if self.backends.is_empty() {
+                        continue;
                     }
                 }
                 let reservation = self.nonce_scheduler.reserve(total_lanes(self.backends));

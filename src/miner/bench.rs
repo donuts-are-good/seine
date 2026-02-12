@@ -12,7 +12,7 @@ use crossbeam_channel::Receiver;
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
 
-use crate::backend::{BackendEvent, BackendInstanceId, PowBackend};
+use crate::backend::{BackendEvent, BackendInstanceId, DeadlineSupport, PowBackend};
 use crate::config::{BenchBaselinePolicy, BenchKind, Config, CpuAffinityMode, WorkAllocation};
 
 use super::scheduler::NonceScheduler;
@@ -164,6 +164,15 @@ fn run_kernel_benchmark(
         bail!("kernel benchmark requires exactly one backend");
     }
 
+    if !cfg.allow_best_effort_deadlines
+        && backend.capabilities().deadline_support == DeadlineSupport::BestEffort
+    {
+        bail!(
+            "backend {} reports best-effort deadlines; pass --allow-best-effort-deadlines to run kernel benchmark anyway",
+            backend.name()
+        );
+    }
+
     let lines = vec![
         ("Mode", "benchmark".to_string()),
         ("Kind", "kernel".to_string()),
@@ -260,7 +269,7 @@ fn run_worker_benchmark(
     restart_each_round: bool,
 ) -> Result<()> {
     let (mut backends, backend_events) = activate_backends(instances, cfg.backend_event_capacity)?;
-    super::enforce_deadline_policy(&backends, cfg.allow_best_effort_deadlines)?;
+    super::enforce_deadline_policy(&mut backends, cfg.allow_best_effort_deadlines)?;
     let bench_kind = if restart_each_round {
         "end_to_end"
     } else {

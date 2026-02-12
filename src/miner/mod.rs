@@ -86,7 +86,7 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
     let backend_instances = build_backend_instances(cfg);
     let (mut backends, backend_events) =
         activate_backends(backend_instances, cfg.backend_event_capacity)?;
-    enforce_deadline_policy(&backends, cfg.allow_best_effort_deadlines)?;
+    enforce_deadline_policy(&mut backends, cfg.allow_best_effort_deadlines)?;
     let total_lanes = total_lanes(&backends);
     let cpu_lanes = cpu_lane_count(&backends);
     let cpu_ram_gib =
@@ -551,32 +551,48 @@ enum RuntimeBackendEventAction {
 }
 
 fn enforce_deadline_policy(
-    backends: &[BackendSlot],
+    backends: &mut Vec<BackendSlot>,
     allow_best_effort_deadlines: bool,
 ) -> Result<()> {
     if allow_best_effort_deadlines {
         return Ok(());
     }
 
-    let best_effort: Vec<String> = backends
-        .iter()
-        .filter_map(|slot| {
-            let capabilities = backend_capabilities(slot);
-            if capabilities.deadline_support == DeadlineSupport::BestEffort {
-                Some(format!("{}#{}", slot.backend.name(), slot.id))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let mut best_effort = Vec::new();
+    let mut survivors = Vec::with_capacity(backends.len());
+    for slot in std::mem::take(backends) {
+        let capabilities = backend_capabilities(&slot);
+        if capabilities.deadline_support == DeadlineSupport::BestEffort {
+            best_effort.push(slot);
+        } else {
+            survivors.push(slot);
+        }
+    }
+    *backends = survivors;
+
     if best_effort.is_empty() {
         return Ok(());
     }
 
-    bail!(
-        "best-effort deadline backends are disabled by default: {}. pass --allow-best-effort-deadlines to continue",
-        best_effort.join(", ")
-    );
+    for slot in best_effort {
+        let backend_name = slot.backend.name();
+        let backend_id = slot.id;
+        backend_executor::quarantine_backend(Arc::clone(&slot.backend));
+        backend_executor::remove_backend_worker(backend_id);
+        warn(
+            "BACKEND",
+            format!(
+                "quarantined {backend_name}#{backend_id}: best-effort deadlines disabled (pass --allow-best-effort-deadlines to allow)"
+            ),
+        );
+    }
+    backend_executor::prune_backend_workers(backends);
+    if backends.is_empty() {
+        bail!(
+            "all active backends report best-effort deadlines; pass --allow-best-effort-deadlines to continue"
+        );
+    }
+    Ok(())
 }
 
 fn handle_runtime_backend_event(
@@ -1410,7 +1426,7 @@ mod tests {
     #[test]
     fn deadline_policy_rejects_best_effort_when_not_allowed() {
         let state = Arc::new(MockState::default());
-        let backends = vec![slot(
+        let mut backends = vec![slot(
             1,
             1,
             Arc::new(
@@ -1419,9 +1435,44 @@ mod tests {
             ),
         )];
 
-        let err = enforce_deadline_policy(&backends, false)
+        let err = enforce_deadline_policy(&mut backends, false)
             .expect_err("best-effort backend should be rejected by default");
         assert!(format!("{err:#}").contains("--allow-best-effort-deadlines"));
+    }
+
+    #[test]
+    fn deadline_policy_quarantines_best_effort_and_keeps_cooperative_backends() {
+        let best_effort_state = Arc::new(MockState::default());
+        let cooperative_state = Arc::new(MockState::default());
+        let mut backends = vec![
+            slot(
+                1,
+                1,
+                Arc::new(
+                    MockBackend::new("nvidia", 1, Arc::clone(&best_effort_state))
+                        .with_deadline_support(crate::backend::DeadlineSupport::BestEffort),
+                ),
+            ),
+            slot(
+                2,
+                1,
+                Arc::new(
+                    MockBackend::new("cpu", 1, Arc::clone(&cooperative_state))
+                        .with_deadline_support(crate::backend::DeadlineSupport::Cooperative),
+                ),
+            ),
+        ];
+
+        enforce_deadline_policy(&mut backends, false)
+            .expect("cooperative backend should remain available");
+
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].id, 2);
+        assert!(
+            wait_for_stop_call(&best_effort_state, Duration::from_millis(250)),
+            "best-effort backend should be quarantined asynchronously"
+        );
+        assert_eq!(cooperative_state.stop_calls.load(Ordering::Relaxed), 0);
     }
 
     #[derive(Default)]
