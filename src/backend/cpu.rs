@@ -18,9 +18,30 @@ use crate::types::hash_meets_target;
 const HASH_BATCH_SIZE: u64 = 64;
 const HASH_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 const STOP_CHECK_INTERVAL_HASHES: u64 = 64;
-const SOLUTION_EVENT_BACKOFF_EVERY: u64 = 64;
-const SOLUTION_EVENT_BACKOFF_SLEEP: Duration = Duration::from_micros(50);
+const CRITICAL_EVENT_BACKOFF_EVERY: u64 = 64;
+const CRITICAL_EVENT_BACKOFF_SLEEP: Duration = Duration::from_micros(50);
 const SOLVED_MASK: u64 = 1u64 << 63;
+
+#[repr(align(64))]
+struct PaddedAtomicU64(AtomicU64);
+
+impl PaddedAtomicU64 {
+    fn new(value: u64) -> Self {
+        Self(AtomicU64::new(value))
+    }
+
+    fn store(&self, value: u64, ordering: Ordering) {
+        self.0.store(value, ordering);
+    }
+
+    fn swap(&self, value: u64, ordering: Ordering) -> u64 {
+        self.0.swap(value, ordering)
+    }
+
+    fn fetch_add(&self, value: u64, ordering: Ordering) -> u64 {
+        self.0.fetch_add(value, ordering)
+    }
+}
 
 struct ControlState {
     shutdown: bool,
@@ -39,7 +60,7 @@ struct Shared {
     work_cv: Condvar,
     idle_lock: Mutex<()>,
     idle_cv: Condvar,
-    hash_slots: Vec<AtomicU64>,
+    hash_slots: Vec<PaddedAtomicU64>,
     assignment_hashes: AtomicU64,
     assignment_generation: AtomicU64,
     assignment_reported_generation: AtomicU64,
@@ -79,7 +100,7 @@ impl CpuBackend {
                 work_cv: Condvar::new(),
                 idle_lock: Mutex::new(()),
                 idle_cv: Condvar::new(),
-                hash_slots: (0..lanes).map(|_| AtomicU64::new(0)).collect(),
+                hash_slots: (0..lanes).map(|_| PaddedAtomicU64::new(0)).collect(),
                 assignment_hashes: AtomicU64::new(0),
                 assignment_generation: AtomicU64::new(0),
                 assignment_reported_generation: AtomicU64::new(0),
@@ -669,7 +690,7 @@ fn mark_worker_inactive(shared: &Shared, worker_active: &mut bool) {
     }
 }
 
-fn reset_hash_slots(slots: &[AtomicU64]) {
+fn reset_hash_slots(slots: &[PaddedAtomicU64]) {
     for slot in slots {
         slot.store(0, Ordering::Relaxed);
     }
@@ -713,40 +734,58 @@ fn emit_event(shared: &Shared, event: BackendEvent) {
 
     match event {
         BackendEvent::Solution(solution) => {
-            let mut queued = BackendEvent::Solution(solution);
-            let mut attempts = 0u64;
-            loop {
-                match tx.try_send(queued) {
-                    Ok(()) => return,
-                    Err(TrySendError::Disconnected(_)) => return,
-                    Err(TrySendError::Full(returned)) => {
-                        queued = returned;
-                        attempts = attempts.saturating_add(1);
-                        if !shared.started.load(Ordering::Acquire) {
-                            return;
-                        }
-                        if attempts.is_multiple_of(SOLUTION_EVENT_BACKOFF_EVERY) {
-                            thread::sleep(SOLUTION_EVENT_BACKOFF_SLEEP);
-                        } else {
-                            thread::yield_now();
-                        }
-                    }
+            send_critical_event(shared, &tx, BackendEvent::Solution(solution));
+        }
+        BackendEvent::Error {
+            backend_id,
+            backend,
+            message,
+        } => {
+            send_critical_event(
+                shared,
+                &tx,
+                BackendEvent::Error {
+                    backend_id,
+                    backend,
+                    message,
+                },
+            );
+        }
+    }
+}
+
+fn send_critical_event(shared: &Shared, tx: &Sender<BackendEvent>, event: BackendEvent) {
+    let mut queued = event;
+    let mut attempts = 0u64;
+    loop {
+        match tx.try_send(queued) {
+            Ok(()) => return,
+            Err(TrySendError::Disconnected(_)) => return,
+            Err(TrySendError::Full(returned)) => {
+                queued = returned;
+                attempts = attempts.saturating_add(1);
+                if !shared.started.load(Ordering::Acquire) {
+                    return;
+                }
+                if attempts.is_multiple_of(CRITICAL_EVENT_BACKOFF_EVERY) {
+                    thread::sleep(CRITICAL_EVENT_BACKOFF_SLEEP);
+                } else {
+                    thread::yield_now();
                 }
             }
         }
-        other => match tx.try_send(other) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                shared.dropped_events.fetch_add(1, Ordering::AcqRel);
-            }
-            Err(TrySendError::Disconnected(_)) => {}
-        },
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::lane_quota_for_chunk;
+    use super::{emit_error, lane_quota_for_chunk, BackendEvent, CpuBackend, MiningSolution};
+    use crate::backend::PowBackend;
+    use crate::config::CpuAffinityMode;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn lane_quota_even_chunk_distribution() {
@@ -761,5 +800,56 @@ mod tests {
         assert_eq!(lane_quota_for_chunk(5, 1, 4), 1);
         assert_eq!(lane_quota_for_chunk(5, 3, 4), 1);
         assert_eq!(lane_quota_for_chunk(5, 6, 4), 0);
+    }
+
+    #[test]
+    fn error_event_retries_until_queue_capacity_is_available() {
+        let mut backend = CpuBackend::new(1, CpuAffinityMode::Off);
+        backend.shared.started.store(true, Ordering::Release);
+        backend.set_instance_id(7);
+        let (event_tx, event_rx) = crossbeam_channel::bounded(1);
+        backend.set_event_sink(event_tx.clone());
+
+        event_tx
+            .send(BackendEvent::Solution(MiningSolution {
+                epoch: 1,
+                nonce: 1,
+                backend_id: 99,
+                backend: "cpu",
+            }))
+            .expect("prefill should succeed");
+
+        let shared = Arc::clone(&backend.shared);
+        let emit_thread = thread::spawn(move || {
+            emit_error(&shared, "synthetic failure".to_string());
+        });
+
+        let first = event_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("first event should be available");
+        assert!(
+            matches!(first, BackendEvent::Solution(_)),
+            "expected prefilled solution event first"
+        );
+
+        let second = event_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("error event should be enqueued after capacity frees");
+        match second {
+            BackendEvent::Error {
+                backend_id,
+                backend,
+                message,
+            } => {
+                assert_eq!(backend_id, 7);
+                assert_eq!(backend, "cpu");
+                assert_eq!(message, "synthetic failure");
+            }
+            other => panic!("expected error event, got {:?}", other),
+        }
+
+        emit_thread
+            .join()
+            .expect("error emitter thread should finish once queued");
     }
 }

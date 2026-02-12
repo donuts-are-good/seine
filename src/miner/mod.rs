@@ -549,9 +549,18 @@ fn merge_backend_telemetry(
 
 fn quiesce_backend_slots(backends: &[BackendSlot]) -> Result<()> {
     for slot in backends {
-        slot.backend.quiesce().with_context(|| {
+        slot.backend.cancel_work().with_context(|| {
             format!(
-                "failed to quiesce backend {}#{}",
+                "failed to cancel backend {}#{}",
+                slot.backend.name(),
+                slot.id
+            )
+        })?;
+    }
+    for slot in backends {
+        slot.backend.fence().with_context(|| {
+            format!(
+                "failed to fence backend {}#{}",
                 slot.backend.name(),
                 slot.id
             )
@@ -1108,5 +1117,95 @@ mod tests {
         assert!(counts[0] > counts[1]);
         assert!(counts[0] >= 2);
         assert!(counts[1] >= 2);
+    }
+
+    #[derive(Default)]
+    struct QuiesceTrace {
+        events: Mutex<Vec<String>>,
+    }
+
+    struct QuiesceMockBackend {
+        name: &'static str,
+        trace: Arc<QuiesceTrace>,
+    }
+
+    impl QuiesceMockBackend {
+        fn new(name: &'static str, trace: Arc<QuiesceTrace>) -> Self {
+            Self { name, trace }
+        }
+
+        fn record(&self, action: &str) {
+            if let Ok(mut events) = self.trace.events.lock() {
+                events.push(format!("{action}:{}", self.name));
+            }
+        }
+    }
+
+    impl PowBackend for QuiesceMockBackend {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn lanes(&self) -> usize {
+            1
+        }
+
+        fn set_instance_id(&mut self, _id: BackendInstanceId) {}
+
+        fn set_event_sink(&mut self, _sink: Sender<BackendEvent>) {}
+
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) {}
+
+        fn assign_work(&self, _work: WorkAssignment) -> Result<()> {
+            Ok(())
+        }
+
+        fn cancel_work(&self) -> Result<()> {
+            self.record("cancel");
+            Ok(())
+        }
+
+        fn fence(&self) -> Result<()> {
+            self.record("fence");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn quiesce_cancels_all_backends_before_fencing_any_backend() {
+        let trace = Arc::new(QuiesceTrace::default());
+        let backends = vec![
+            slot(
+                1,
+                1,
+                Box::new(QuiesceMockBackend::new("cpu-a", Arc::clone(&trace))),
+            ),
+            slot(
+                2,
+                1,
+                Box::new(QuiesceMockBackend::new("cpu-b", Arc::clone(&trace))),
+            ),
+        ];
+
+        quiesce_backend_slots(&backends).expect("quiesce should succeed");
+
+        let events = trace
+            .events
+            .lock()
+            .expect("trace lock should not be poisoned")
+            .clone();
+        assert_eq!(
+            events,
+            vec![
+                "cancel:cpu-a".to_string(),
+                "cancel:cpu-b".to_string(),
+                "fence:cpu-a".to_string(),
+                "fence:cpu-b".to_string(),
+            ]
+        );
     }
 }

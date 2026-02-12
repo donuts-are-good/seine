@@ -32,8 +32,7 @@ use super::ui::{error, info, mined, set_tui_state, success, warn};
 use super::{
     collect_backend_hashes, distribute_work, format_round_backend_hashrate,
     format_round_backend_telemetry, next_event_wait, next_work_id, quiesce_backend_slots,
-    total_lanes, BackendRoundTelemetry, BackendSlot, RuntimeBackendEventAction, RuntimeMode,
-    TEMPLATE_RETRY_DELAY,
+    total_lanes, BackendSlot, RuntimeBackendEventAction, RuntimeMode, TEMPLATE_RETRY_DELAY,
 };
 
 type BackendEventAction = RuntimeBackendEventAction;
@@ -685,7 +684,6 @@ pub(super) fn run_mining_loop(
             WeightUpdateInputs {
                 backends,
                 round_backend_hashes: &round_backend_hashes,
-                round_backend_telemetry: &round_backend_telemetry,
                 round_elapsed_secs,
                 mode: cfg.work_allocation,
                 round_end_reason,
@@ -1022,7 +1020,6 @@ fn work_distribution_weights(
 struct WeightUpdateInputs<'a> {
     backends: &'a [BackendSlot],
     round_backend_hashes: &'a BTreeMap<u64, u64>,
-    round_backend_telemetry: &'a BTreeMap<u64, BackendRoundTelemetry>,
     round_elapsed_secs: f64,
     mode: WorkAllocation,
     round_end_reason: RoundEndReason,
@@ -1062,15 +1059,8 @@ fn update_backend_weights(
             .get(&slot.id)
             .copied()
             .unwrap_or(0);
-        let observed_secs = inputs
-            .round_backend_telemetry
-            .get(&slot.id)
-            .and_then(|metrics| {
-                (metrics.completed_assignment_micros > 0)
-                    .then_some(metrics.completed_assignment_micros as f64 / 1_000_000.0)
-            })
-            .unwrap_or(elapsed)
-            .max(0.001);
+        // Use round wall-clock elapsed time to avoid assignment-boundary attribution skew.
+        let observed_secs = elapsed;
         let observed_hps = observed_hashes as f64 / observed_secs;
         let next = if observed_hps > 0.0 {
             ((1.0 - alpha) * prior) + (alpha * observed_hps)
@@ -1424,28 +1414,12 @@ mod tests {
         let mut round_hashes = BTreeMap::new();
         round_hashes.insert(1, 10_000);
         round_hashes.insert(2, 1_000);
-        let mut round_telemetry = BTreeMap::new();
-        round_telemetry.insert(
-            1,
-            BackendRoundTelemetry {
-                completed_assignment_micros: 1_000_000,
-                ..BackendRoundTelemetry::default()
-            },
-        );
-        round_telemetry.insert(
-            2,
-            BackendRoundTelemetry {
-                completed_assignment_micros: 1_000_000,
-                ..BackendRoundTelemetry::default()
-            },
-        );
 
         update_backend_weights(
             &mut weights,
             WeightUpdateInputs {
                 backends: &backends,
                 round_backend_hashes: &round_hashes,
-                round_backend_telemetry: &round_telemetry,
                 round_elapsed_secs: 1.0,
                 mode: WorkAllocation::Adaptive,
                 round_end_reason: RoundEndReason::Refresh,
@@ -1466,14 +1440,12 @@ mod tests {
         let mut weights = seed_backend_weights(&backends);
         let mut round_hashes = BTreeMap::new();
         round_hashes.insert(7, 10_000);
-        let round_telemetry = BTreeMap::new();
 
         update_backend_weights(
             &mut weights,
             WeightUpdateInputs {
                 backends: &backends,
                 round_backend_hashes: &round_hashes,
-                round_backend_telemetry: &round_telemetry,
                 round_elapsed_secs: 1.0,
                 mode: WorkAllocation::Adaptive,
                 round_end_reason: RoundEndReason::Solved,
@@ -1494,14 +1466,12 @@ mod tests {
         let mut weights = BTreeMap::new();
         weights.insert(9, 999.0);
         let round_hashes = BTreeMap::new();
-        let round_telemetry = BTreeMap::new();
 
         update_backend_weights(
             &mut weights,
             WeightUpdateInputs {
                 backends: &backends,
                 round_backend_hashes: &round_hashes,
-                round_backend_telemetry: &round_telemetry,
                 round_elapsed_secs: 1.0,
                 mode: WorkAllocation::Static,
                 round_end_reason: RoundEndReason::Refresh,

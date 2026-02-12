@@ -189,11 +189,6 @@ pub trait PowBackend: Send {
         Ok(())
     }
 
-    fn quiesce(&self) -> Result<()> {
-        self.cancel_work()?;
-        self.fence()
-    }
-
     /// Return and reset hashes completed since the previous call.
     fn take_hashes(&self) -> u64 {
         0
