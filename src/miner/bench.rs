@@ -451,6 +451,9 @@ fn run_worker_benchmark_inner(
                         log_tag: "BENCH",
                     },
                 )?;
+                if backends.is_empty() {
+                    break;
+                }
                 hash_poll_interval =
                     super::effective_hash_poll_interval(backends, cfg.hash_poll_interval);
                 next_hash_poll_at = Instant::now() + hash_poll_interval;
