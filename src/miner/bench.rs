@@ -98,6 +98,7 @@ struct BenchReport {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
 struct BenchConfigFingerprint {
     backend_event_capacity: usize,
     hash_poll_ms: u64,
@@ -117,6 +118,7 @@ struct BenchConfigFingerprint {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
 struct BenchPowFingerprint {
     memory_kb: u32,
     iterations: u32,
@@ -126,6 +128,7 @@ struct BenchPowFingerprint {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct BenchEnvironment {
     timestamp_unix_secs: u64,
     #[serde(alias = "bnminer_version")]
@@ -1326,6 +1329,7 @@ mod tests {
 
     use anyhow::Result;
     use crossbeam_channel::Sender;
+    use serde_json::json;
 
     use crate::backend::{BackendEvent, BackendInstanceId, PowBackend, WorkAssignment};
 
@@ -1463,6 +1467,31 @@ mod tests {
         let current = sample_report();
         let mut baseline = sample_report();
         baseline.schema_version = BENCH_REPORT_SCHEMA_VERSION - 1;
+
+        let issues =
+            baseline_compatibility_issues(&current, &baseline, BenchBaselinePolicy::Strict);
+        assert!(!issues.iter().any(|issue| issue.contains("schema mismatch")));
+    }
+
+    #[test]
+    fn baseline_parsing_allows_missing_v3_fields_in_v2_report() {
+        let current = sample_report();
+        let mut baseline_value =
+            serde_json::to_value(sample_report()).expect("sample report should serialize to JSON");
+        baseline_value["schema_version"] = json!(BENCH_REPORT_COMPAT_MIN_SCHEMA_VERSION);
+        baseline_value
+            .as_object_mut()
+            .expect("baseline report should be a JSON object")
+            .remove("warmup_rounds");
+        baseline_value["config_fingerprint"]
+            .as_object_mut()
+            .expect("config fingerprint should be a JSON object")
+            .remove("bench_warmup_rounds");
+
+        let baseline: BenchReport = serde_json::from_value(baseline_value)
+            .expect("v2-style baseline report should deserialize");
+        assert_eq!(baseline.warmup_rounds, 0);
+        assert_eq!(baseline.config_fingerprint.bench_warmup_rounds, 0);
 
         let issues =
             baseline_compatibility_issues(&current, &baseline, BenchBaselinePolicy::Strict);
