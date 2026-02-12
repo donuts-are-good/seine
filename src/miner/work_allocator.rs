@@ -1,12 +1,36 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
+use crossbeam_channel::{bounded, RecvTimeoutError};
 
 use crate::backend::{BackendInstanceId, NonceChunk, WorkAssignment, WorkTemplate};
 
 use super::ui::warn;
 use super::{backend_names, total_lanes, BackendSlot, DistributeWorkOptions};
+
+struct DispatchTask {
+    idx: usize,
+    slot: BackendSlot,
+    batch: Vec<WorkAssignment>,
+}
+
+struct DispatchOutcome {
+    idx: usize,
+    slot: BackendSlot,
+    backend_id: BackendInstanceId,
+    backend: &'static str,
+    elapsed: Duration,
+    result: Result<()>,
+}
+
+struct DispatchFailure {
+    backend_id: BackendInstanceId,
+    backend: &'static str,
+    reason: String,
+}
 
 pub(super) fn distribute_work(
     backends: &mut Vec<BackendSlot>,
@@ -34,10 +58,10 @@ pub(super) fn distribute_work(
             target: options.target,
             stop_at: options.stop_at,
         });
-        let mut failed_indices = Vec::new();
-        let mut chunk_start = attempt_start_nonce;
 
-        for (idx, slot) in backends.iter().enumerate() {
+        let mut chunk_start = attempt_start_nonce;
+        let mut dispatch_tasks = Vec::with_capacity(backends.len());
+        for (idx, slot) in std::mem::take(backends).into_iter().enumerate() {
             let nonce_count = *nonce_counts.get(idx).unwrap_or(&slot.lanes.max(1));
             let batch = build_assignment_batch(
                 Arc::clone(&template),
@@ -46,34 +70,31 @@ pub(super) fn distribute_work(
                 slot.backend.capabilities().max_inflight_assignments,
             );
 
-            if let Err(err) = slot.backend.assign_work_batch(&batch) {
-                warn(
-                    "BACKEND",
-                    format!(
-                        "{}#{} failed work assignment: {err:#}",
-                        slot.backend.name(),
-                        slot.id
-                    ),
-                );
-                failed_indices.push(idx);
-            }
+            dispatch_tasks.push(DispatchTask { idx, slot, batch });
             chunk_start = chunk_start.wrapping_add(nonce_count);
         }
 
-        if failed_indices.is_empty() {
+        let (survivors, failures) =
+            dispatch_assignment_tasks(dispatch_tasks, options.assignment_timeout);
+        *backends = survivors;
+
+        if failures.is_empty() {
             return Ok(total_span_consumed.saturating_sub(options.reservation.reserved_span));
         }
 
-        for idx in failed_indices.into_iter().rev() {
-            let mut slot = backends.remove(idx);
-            let backend_name = slot.backend.name();
-            let backend_id = slot.id;
-            slot.backend.stop();
+        for failure in failures {
+            warn(
+                "BACKEND",
+                format!(
+                    "{}#{} failed work assignment: {}",
+                    failure.backend, failure.backend_id, failure.reason
+                ),
+            );
             warn(
                 "BACKEND",
                 format!(
                     "quarantined {}#{} due to assignment failure",
-                    backend_name, backend_id
+                    failure.backend, failure.backend_id
                 ),
             );
         }
@@ -92,6 +113,130 @@ pub(super) fn distribute_work(
             ),
         );
     }
+}
+
+fn dispatch_assignment_tasks(
+    tasks: Vec<DispatchTask>,
+    timeout: Duration,
+) -> (Vec<BackendSlot>, Vec<DispatchFailure>) {
+    if tasks.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let timeout = timeout.max(Duration::from_millis(1));
+    let expected = tasks.len();
+    let mut metadata = Vec::with_capacity(expected);
+    let (outcome_tx, outcome_rx) = bounded::<DispatchOutcome>(expected.max(1));
+
+    for task in tasks {
+        let backend_id = task.slot.id;
+        let backend = task.slot.backend.name();
+        metadata.push((task.idx, backend_id, backend));
+
+        let outcome_tx = outcome_tx.clone();
+        thread::spawn(move || {
+            let slot = task.slot;
+            let started = Instant::now();
+            let deadline = started + timeout;
+            let result = slot
+                .backend
+                .assign_work_batch_with_deadline(&task.batch, deadline);
+            let elapsed = started.elapsed();
+            let _ = outcome_tx.send(DispatchOutcome {
+                idx: task.idx,
+                slot,
+                backend_id,
+                backend,
+                elapsed,
+                result,
+            });
+        });
+    }
+    drop(outcome_tx);
+
+    let deadline = Instant::now() + timeout;
+    let mut outcomes: Vec<Option<DispatchOutcome>> =
+        std::iter::repeat_with(|| None).take(expected).collect();
+    let mut received = 0usize;
+    while received < expected {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match outcome_rx.recv_timeout(deadline.saturating_duration_since(now)) {
+            Ok(outcome) => {
+                let outcome_idx = outcome.idx;
+                if outcomes[outcome_idx].is_none() {
+                    received = received.saturating_add(1);
+                }
+                outcomes[outcome_idx] = Some(outcome);
+            }
+            Err(RecvTimeoutError::Timeout) => break,
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    let mut survivors = Vec::new();
+    let mut failures = Vec::new();
+    let mut metadata_by_idx = vec![(0u64, "unknown"); expected];
+    for (idx, backend_id, backend) in metadata {
+        if idx < metadata_by_idx.len() {
+            metadata_by_idx[idx] = (backend_id, backend);
+        }
+    }
+
+    for idx in 0..expected {
+        match outcomes[idx].take() {
+            Some(mut outcome) => {
+                if outcome.elapsed > timeout {
+                    outcome.slot.backend.stop();
+                    failures.push(DispatchFailure {
+                        backend_id: outcome.backend_id,
+                        backend: outcome.backend,
+                        reason: format!(
+                            "assignment timed out after {}ms (limit={}ms)",
+                            outcome.elapsed.as_millis(),
+                            timeout.as_millis()
+                        ),
+                    });
+                    continue;
+                }
+
+                match outcome.result {
+                    Ok(()) => survivors.push((idx, outcome.slot)),
+                    Err(err) => {
+                        outcome.slot.backend.stop();
+                        failures.push(DispatchFailure {
+                            backend_id: outcome.backend_id,
+                            backend: outcome.backend,
+                            reason: format!("{err:#}"),
+                        });
+                    }
+                }
+            }
+            None => {
+                let (backend_id, backend) =
+                    metadata_by_idx.get(idx).copied().unwrap_or((0, "unknown"));
+                failures.push(DispatchFailure {
+                    backend_id,
+                    backend,
+                    reason: format!(
+                        "assignment timed out after {}ms; backend detached",
+                        timeout.as_millis()
+                    ),
+                });
+            }
+        }
+    }
+
+    survivors.sort_by_key(|(idx, _)| *idx);
+    (
+        survivors
+            .into_iter()
+            .map(|(_, slot)| slot)
+            .collect::<Vec<_>>(),
+        failures,
+    )
 }
 
 pub(super) fn compute_backend_nonce_counts(

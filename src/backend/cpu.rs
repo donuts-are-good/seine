@@ -289,6 +289,25 @@ impl PowBackend for CpuBackend {
     }
 
     fn take_telemetry(&self) -> BackendTelemetry {
+        let (inflight_assignment_hashes, inflight_assignment_micros) =
+            if self.shared.active_workers.load(Ordering::Acquire) > 0 {
+                let hashes = self.shared.assignment_hashes.load(Ordering::Acquire);
+                let micros = self
+                    .shared
+                    .assignment_started_at
+                    .lock()
+                    .ok()
+                    .and_then(|slot| {
+                        slot.as_ref().map(|started| {
+                            started.elapsed().as_micros().min(u64::MAX as u128) as u64
+                        })
+                    })
+                    .unwrap_or(0);
+                (hashes, micros)
+            } else {
+                (0, 0)
+            };
+
         BackendTelemetry {
             active_lanes: self.shared.active_workers.load(Ordering::Acquire) as u64,
             pending_work: u64::from(has_pending_work(&self.shared)),
@@ -302,6 +321,8 @@ impl PowBackend for CpuBackend {
                 .shared
                 .completed_assignment_micros
                 .swap(0, Ordering::AcqRel),
+            inflight_assignment_hashes,
+            inflight_assignment_micros,
         }
     }
 

@@ -6,6 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError};
 use serde_json::Value;
 
 use crate::api::{is_unauthorized_error, ApiClient};
@@ -119,6 +120,7 @@ impl TipSignal {
 pub(super) struct TipListener {
     signal: TipSignal,
     handle: Option<JoinHandle<()>>,
+    done_rx: Receiver<()>,
 }
 
 impl TipListener {
@@ -132,9 +134,22 @@ impl TipListener {
         }
     }
 
-    pub(super) fn join(mut self) {
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+    pub(super) fn join_for(mut self, timeout: Duration) -> bool {
+        let timeout = timeout.max(Duration::from_millis(1));
+        let done = matches!(
+            self.done_rx.recv_timeout(timeout),
+            Ok(()) | Err(RecvTimeoutError::Disconnected)
+        );
+        if done {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+            true
+        } else {
+            if let Some(handle) = self.handle.take() {
+                drop(handle);
+            }
+            false
         }
     }
 }
@@ -187,6 +202,7 @@ pub(super) fn spawn_tip_listener(
 ) -> TipListener {
     let tip_signal = TipSignal::new(refresh_on_same_height);
     let signal = tip_signal.clone();
+    let (done_tx, done_rx) = bounded::<()>(1);
 
     let handle = thread::spawn(move || {
         let mut retry = RetryTracker::default();
@@ -257,11 +273,13 @@ pub(super) fn spawn_tip_listener(
                 thread::sleep(Duration::from_secs(1));
             }
         }
+        let _ = done_tx.send(());
     });
 
     TipListener {
         signal: tip_signal,
         handle: Some(handle),
+        done_rx,
     }
 }
 

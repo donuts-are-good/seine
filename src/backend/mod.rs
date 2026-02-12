@@ -2,7 +2,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use crossbeam_channel::Sender;
 
 pub mod cpu;
@@ -149,6 +149,8 @@ pub struct BackendTelemetry {
     pub completed_assignments: u64,
     pub completed_assignment_hashes: u64,
     pub completed_assignment_micros: u64,
+    pub inflight_assignment_hashes: u64,
+    pub inflight_assignment_micros: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -160,7 +162,7 @@ pub struct BackendCapabilities {
     /// Runtime clamps this against operator-configured polling limits.
     pub preferred_hash_poll_interval: Option<Duration>,
     /// Maximum number of in-flight assignments this backend can queue efficiently.
-    /// Current runtime dispatches one assignment at a time but records this for profiling.
+    /// Runtime may split one reservation into this many chunks for dispatch.
     pub max_inflight_assignments: u32,
 }
 
@@ -223,13 +225,66 @@ pub trait PowBackend: Send {
         Ok(())
     }
 
+    /// Assign one or more work chunks before a soft deadline.
+    ///
+    /// Default behavior executes the assignment call then reports timeout if the
+    /// backend did not return before the deadline.
+    fn assign_work_batch_with_deadline(
+        &self,
+        work: &[WorkAssignment],
+        deadline: Instant,
+    ) -> Result<()> {
+        self.assign_work_batch(work)?;
+        if Instant::now() > deadline {
+            return Err(anyhow!(
+                "assignment call exceeded deadline by {}ms",
+                Instant::now()
+                    .saturating_duration_since(deadline)
+                    .as_millis()
+            ));
+        }
+        Ok(())
+    }
+
     /// Request the backend to stop processing the current assignment.
     fn cancel_work(&self) -> Result<()> {
         Ok(())
     }
 
+    /// Request backend cancellation before a soft deadline.
+    ///
+    /// Default behavior executes cancel then reports timeout if call returns late.
+    fn cancel_work_with_deadline(&self, deadline: Instant) -> Result<()> {
+        self.cancel_work()?;
+        if Instant::now() > deadline {
+            return Err(anyhow!(
+                "cancel call exceeded deadline by {}ms",
+                Instant::now()
+                    .saturating_duration_since(deadline)
+                    .as_millis()
+            ));
+        }
+        Ok(())
+    }
+
     /// Wait until all backend workers have observed the most recent control action.
     fn fence(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Wait for backend quiesce/fence before a soft deadline.
+    ///
+    /// Default behavior executes fence then reports timeout if call returns late.
+    fn fence_with_deadline(&self, deadline: Instant) -> Result<()> {
+        self.fence()?;
+        if Instant::now() > deadline {
+            return Err(anyhow!(
+                "fence call exceeded deadline by {}ms",
+                Instant::now()
+                    .saturating_duration_since(deadline)
+                    .as_millis()
+            ));
+        }
         Ok(())
     }
 

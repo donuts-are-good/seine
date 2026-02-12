@@ -133,6 +133,22 @@ struct Cli {
     #[arg(long, default_value_t = 200)]
     hash_poll_ms: u64,
 
+    /// Maximum time to wait for one backend assignment dispatch call, in milliseconds.
+    #[arg(long, default_value_t = 1000)]
+    backend_assign_timeout_ms: u64,
+
+    /// Maximum time to wait for backend cancel/fence control calls, in milliseconds.
+    #[arg(long, default_value_t = 1000)]
+    backend_control_timeout_ms: u64,
+
+    /// Maximum time to wait for a prefetched block template before falling back.
+    #[arg(long, default_value_t = 250)]
+    prefetch_wait_ms: u64,
+
+    /// Maximum time to wait for tip-listener shutdown before detaching.
+    #[arg(long, default_value_t = 250)]
+    tip_listener_join_wait_ms: u64,
+
     /// Disable strict round quiesce barriers to favor peak throughput over exact per-round accounting.
     #[arg(long, action = ArgAction::SetTrue)]
     relaxed_accounting: bool,
@@ -212,6 +228,10 @@ pub struct Config {
     pub stats_interval: Duration,
     pub backend_event_capacity: usize,
     pub hash_poll_interval: Duration,
+    pub backend_assign_timeout: Duration,
+    pub backend_control_timeout: Duration,
+    pub prefetch_wait: Duration,
+    pub tip_listener_join_wait: Duration,
     pub strict_round_accounting: bool,
     pub start_nonce: u64,
     pub nonce_iters_per_lane: u64,
@@ -243,6 +263,18 @@ impl Config {
         }
         if cli.hash_poll_ms == 0 {
             bail!("hash-poll-ms must be >= 1");
+        }
+        if cli.backend_assign_timeout_ms == 0 {
+            bail!("backend-assign-timeout-ms must be >= 1");
+        }
+        if cli.backend_control_timeout_ms == 0 {
+            bail!("backend-control-timeout-ms must be >= 1");
+        }
+        if cli.prefetch_wait_ms == 0 {
+            bail!("prefetch-wait-ms must be >= 1");
+        }
+        if cli.tip_listener_join_wait_ms == 0 {
+            bail!("tip-listener-join-wait-ms must be >= 1");
         }
         if let Some(threshold) = cli.bench_fail_below_pct {
             if !cli.bench {
@@ -288,6 +320,10 @@ impl Config {
             stats_interval: Duration::from_secs(cli.stats_secs.max(1)),
             backend_event_capacity: cli.backend_event_capacity,
             hash_poll_interval: Duration::from_millis(cli.hash_poll_ms),
+            backend_assign_timeout: Duration::from_millis(cli.backend_assign_timeout_ms),
+            backend_control_timeout: Duration::from_millis(cli.backend_control_timeout_ms),
+            prefetch_wait: Duration::from_millis(cli.prefetch_wait_ms),
+            tip_listener_join_wait: Duration::from_millis(cli.tip_listener_join_wait_ms),
             strict_round_accounting: !cli.relaxed_accounting,
             start_nonce: cli.start_nonce.unwrap_or_else(|| {
                 if cli.bench {
@@ -546,6 +582,10 @@ mod tests {
             stats_secs: 10,
             backend_event_capacity: 1024,
             hash_poll_ms: 200,
+            backend_assign_timeout_ms: 1000,
+            backend_control_timeout_ms: 1000,
+            prefetch_wait_ms: 250,
+            tip_listener_join_wait_ms: 250,
             relaxed_accounting: false,
             start_nonce: None,
             nonce_iters_per_lane: 1u64 << 36,

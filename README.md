@@ -91,13 +91,18 @@ Run headless/plain logs (no fullscreen TUI):
   - Same-height competing hash events are coalesced by default; pass `--refresh-on-same-height` for aggressive tip freshness.
 - Runtime tuning knobs for performance iteration:
   - `--backend-event-capacity` (default `1024`) controls bounded backend event queue size.
+  - `--backend-assign-timeout-ms` (default `1000`) bounds per-backend assignment dispatch calls; timed-out backends are quarantined.
+  - `--backend-control-timeout-ms` (default `1000`) bounds `cancel/fence` control calls; timed-out backends are quarantined.
   - `--hash-poll-ms` (default `200`) controls backend hash counter polling cadence.
     - Runtime may tighten this cadence based on backend capability hints (for example future GPU backends) while preserving the configured upper bound.
   - `--stats-secs` (default `10`) controls periodic stats log emission cadence.
   - `--work-allocation` (`adaptive` or `static`) controls backend nonce-chunk splitting policy in mining mode.
+    - Adaptive mode now also incorporates solved/stale rounds with reduced gain so weights stay fresh under frequent tip churn.
   - `--request-timeout-secs` (default `10`) controls JSON API request timeout for template/submit/wallet calls.
   - `--events-stream-timeout-secs` (default `10`) controls SSE connect timeout per attempt (stream itself is long-lived).
   - `--events-idle-timeout-secs` (default `90`) bounds one SSE stream request lifetime before reconnect to avoid liveness stalls.
+  - `--prefetch-wait-ms` (default `250`) bounds how long mining waits for prefetched templates before falling back to direct fetch.
+  - `--tip-listener-join-wait-ms` (default `250`) bounds shutdown wait for SSE listener thread before detaching.
   - `--cpu-affinity` (`auto` or `off`) controls CPU worker pinning policy for better repeatability on NUMA/SMT hosts.
   - `--ui` (`auto`, `tui`, `plain`) controls rendering mode. `auto` enables TUI only when stdout/stderr are terminals.
   - `--relaxed-accounting` disables per-round quiesce barriers (higher throughput, less exact round accounting).

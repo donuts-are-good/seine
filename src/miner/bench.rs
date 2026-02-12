@@ -35,6 +35,10 @@ struct BenchBackendRun {
     #[serde(default)]
     peak_pending_work: u64,
     #[serde(default)]
+    peak_inflight_assignment_hashes: u64,
+    #[serde(default)]
+    peak_inflight_assignment_secs: f64,
+    #[serde(default)]
     dropped_events: u64,
     #[serde(default)]
     completed_assignments: u64,
@@ -89,6 +93,10 @@ struct BenchReport {
 struct BenchConfigFingerprint {
     backend_event_capacity: usize,
     hash_poll_ms: u64,
+    backend_assign_timeout_ms: u64,
+    backend_control_timeout_ms: u64,
+    prefetch_wait_ms: u64,
+    tip_listener_join_wait_ms: u64,
     strict_round_accounting: bool,
     refresh_secs: u64,
     nonce_iters_per_lane: u64,
@@ -275,6 +283,14 @@ fn run_worker_benchmark(
             ),
         ),
         (
+            "Assign Timeout",
+            format!("{}ms", cfg.backend_assign_timeout.as_millis()),
+        ),
+        (
+            "Control Timeout",
+            format!("{}ms", cfg.backend_control_timeout.as_millis()),
+        ),
+        (
             "Accounting",
             if cfg.strict_round_accounting {
                 "strict"
@@ -357,6 +373,7 @@ fn run_worker_benchmark_inner(
                 target: impossible_target,
                 reservation,
                 stop_at,
+                assignment_timeout: cfg.backend_assign_timeout,
                 backend_weights: None,
             },
         )?;
@@ -423,6 +440,7 @@ fn run_worker_benchmark_inner(
                         target: impossible_target,
                         reservation,
                         stop_at,
+                        assignment_timeout: cfg.backend_assign_timeout,
                         backend_weights: None,
                     },
                 )?;
@@ -449,7 +467,7 @@ fn run_worker_benchmark_inner(
             .as_secs_f64()
             .max(0.001);
         let fence_start = Instant::now();
-        let _ = quiesce_backend_slots(backends, RuntimeMode::Bench)?;
+        let _ = quiesce_backend_slots(backends, RuntimeMode::Bench, cfg.backend_control_timeout)?;
         let fence_elapsed = fence_start.elapsed().as_secs_f64();
         let mut late_hashes = 0u64;
         let mut late_backend_hashes = BTreeMap::new();
@@ -714,6 +732,42 @@ fn baseline_compatibility_issues(
                 baseline.config_fingerprint.hash_poll_ms, current.config_fingerprint.hash_poll_ms
             ));
         }
+        if baseline.config_fingerprint.backend_assign_timeout_ms
+            != current.config_fingerprint.backend_assign_timeout_ms
+        {
+            issues.push(format!(
+                "backend_assign_timeout_ms mismatch baseline={} current={}",
+                baseline.config_fingerprint.backend_assign_timeout_ms,
+                current.config_fingerprint.backend_assign_timeout_ms
+            ));
+        }
+        if baseline.config_fingerprint.backend_control_timeout_ms
+            != current.config_fingerprint.backend_control_timeout_ms
+        {
+            issues.push(format!(
+                "backend_control_timeout_ms mismatch baseline={} current={}",
+                baseline.config_fingerprint.backend_control_timeout_ms,
+                current.config_fingerprint.backend_control_timeout_ms
+            ));
+        }
+        if baseline.config_fingerprint.prefetch_wait_ms
+            != current.config_fingerprint.prefetch_wait_ms
+        {
+            issues.push(format!(
+                "prefetch_wait_ms mismatch baseline={} current={}",
+                baseline.config_fingerprint.prefetch_wait_ms,
+                current.config_fingerprint.prefetch_wait_ms
+            ));
+        }
+        if baseline.config_fingerprint.tip_listener_join_wait_ms
+            != current.config_fingerprint.tip_listener_join_wait_ms
+        {
+            issues.push(format!(
+                "tip_listener_join_wait_ms mismatch baseline={} current={}",
+                baseline.config_fingerprint.tip_listener_join_wait_ms,
+                current.config_fingerprint.tip_listener_join_wait_ms
+            ));
+        }
         if baseline.config_fingerprint.strict_round_accounting
             != current.config_fingerprint.strict_round_accounting
         {
@@ -922,6 +976,10 @@ fn benchmark_config_fingerprint(cfg: &Config) -> BenchConfigFingerprint {
     BenchConfigFingerprint {
         backend_event_capacity: cfg.backend_event_capacity,
         hash_poll_ms: cfg.hash_poll_interval.as_millis() as u64,
+        backend_assign_timeout_ms: cfg.backend_assign_timeout.as_millis() as u64,
+        backend_control_timeout_ms: cfg.backend_control_timeout.as_millis() as u64,
+        prefetch_wait_ms: cfg.prefetch_wait.as_millis() as u64,
+        tip_listener_join_wait_ms: cfg.tip_listener_join_wait.as_millis() as u64,
         strict_round_accounting: cfg.strict_round_accounting,
         refresh_secs: cfg.refresh_interval.as_secs(),
         nonce_iters_per_lane: cfg.nonce_iters_per_lane,
@@ -976,6 +1034,12 @@ fn merge_round_telemetry(
         .saturating_add(telemetry.completed_assignment_micros);
     entry.peak_active_lanes = entry.peak_active_lanes.max(telemetry.peak_active_lanes);
     entry.peak_pending_work = entry.peak_pending_work.max(telemetry.peak_pending_work);
+    entry.peak_inflight_assignment_hashes = entry
+        .peak_inflight_assignment_hashes
+        .max(telemetry.peak_inflight_assignment_hashes);
+    entry.peak_inflight_assignment_micros = entry
+        .peak_inflight_assignment_micros
+        .max(telemetry.peak_inflight_assignment_micros);
 }
 
 fn build_backend_round_stats(
@@ -1003,6 +1067,9 @@ fn build_backend_round_stats(
             hps: *hashes as f64 / elapsed_secs,
             peak_active_lanes: telemetry.peak_active_lanes,
             peak_pending_work: telemetry.peak_pending_work,
+            peak_inflight_assignment_hashes: telemetry.peak_inflight_assignment_hashes,
+            peak_inflight_assignment_secs: telemetry.peak_inflight_assignment_micros as f64
+                / 1_000_000.0,
             dropped_events: telemetry.dropped_events,
             completed_assignments: telemetry.completed_assignments,
             completed_assignment_hashes: telemetry.completed_assignment_hashes,
@@ -1051,6 +1118,10 @@ mod tests {
             config_fingerprint: BenchConfigFingerprint {
                 backend_event_capacity: 1024,
                 hash_poll_ms: 200,
+                backend_assign_timeout_ms: 1000,
+                backend_control_timeout_ms: 1000,
+                prefetch_wait_ms: 250,
+                tip_listener_join_wait_ms: 250,
                 strict_round_accounting: true,
                 refresh_secs: 20,
                 nonce_iters_per_lane: 1u64 << 36,

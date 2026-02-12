@@ -48,6 +48,7 @@ struct DistributeWorkOptions<'a> {
     target: [u8; 32],
     reservation: NonceReservation,
     stop_at: Instant,
+    assignment_timeout: Duration,
     backend_weights: Option<&'a BTreeMap<BackendInstanceId, f64>>,
 }
 
@@ -59,6 +60,8 @@ struct BackendRoundTelemetry {
     completed_assignment_micros: u64,
     peak_active_lanes: u64,
     peak_pending_work: u64,
+    peak_inflight_assignment_hashes: u64,
+    peak_inflight_assignment_micros: u64,
 }
 
 pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
@@ -130,6 +133,16 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
             effective_hash_poll_interval(&backends, cfg.hash_poll_interval).as_millis(),
         ),
     );
+    info(
+        "MINER",
+        format!(
+            "timeouts | assign={}ms control={}ms prefetch_wait={}ms tip_join_wait={}ms",
+            cfg.backend_assign_timeout.as_millis(),
+            cfg.backend_control_timeout.as_millis(),
+            cfg.prefetch_wait.as_millis(),
+            cfg.tip_listener_join_wait.as_millis(),
+        ),
+    );
     if cfg.strict_round_accounting {
         let constrained: Vec<String> = backends
             .iter()
@@ -185,8 +198,14 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
     if let Some(listener) = tip_listener {
         if shutdown_requested {
             listener.detach();
-        } else {
-            listener.join();
+        } else if !listener.join_for(cfg.tip_listener_join_wait) {
+            warn(
+                "EVENTS",
+                format!(
+                    "tip listener shutdown exceeded {}ms; detached",
+                    cfg.tip_listener_join_wait.as_millis()
+                ),
+            );
         }
     }
     result
@@ -398,6 +417,8 @@ fn merge_backend_telemetry(
         && telemetry.completed_assignments == 0
         && telemetry.completed_assignment_hashes == 0
         && telemetry.completed_assignment_micros == 0
+        && telemetry.inflight_assignment_hashes == 0
+        && telemetry.inflight_assignment_micros == 0
     {
         return;
     }
@@ -417,20 +438,28 @@ fn merge_backend_telemetry(
         .saturating_add(telemetry.completed_assignment_micros);
     entry.peak_active_lanes = entry.peak_active_lanes.max(telemetry.active_lanes);
     entry.peak_pending_work = entry.peak_pending_work.max(telemetry.pending_work);
+    entry.peak_inflight_assignment_hashes = entry
+        .peak_inflight_assignment_hashes
+        .max(telemetry.inflight_assignment_hashes);
+    entry.peak_inflight_assignment_micros = entry
+        .peak_inflight_assignment_micros
+        .max(telemetry.inflight_assignment_micros);
 }
 
 fn cancel_backend_slots(
     backends: &mut Vec<BackendSlot>,
     mode: RuntimeMode,
+    control_timeout: Duration,
 ) -> Result<RuntimeBackendEventAction> {
-    backend_control::cancel_backend_slots(backends, mode)
+    backend_control::cancel_backend_slots(backends, mode, control_timeout)
 }
 
 fn quiesce_backend_slots(
     backends: &mut Vec<BackendSlot>,
     mode: RuntimeMode,
+    control_timeout: Duration,
 ) -> Result<RuntimeBackendEventAction> {
-    backend_control::quiesce_backend_slots(backends, mode)
+    backend_control::quiesce_backend_slots(backends, mode, control_timeout)
 }
 
 fn remove_backend_by_id(backends: &mut Vec<BackendSlot>, backend_id: BackendInstanceId) -> bool {
@@ -589,6 +618,8 @@ fn format_round_backend_telemetry(
             && telemetry.completed_assignments == 0
             && telemetry.peak_active_lanes == 0
             && telemetry.peak_pending_work == 0
+            && telemetry.peak_inflight_assignment_hashes == 0
+            && telemetry.peak_inflight_assignment_micros == 0
         {
             continue;
         }
@@ -598,9 +629,11 @@ fn format_round_backend_telemetry(
             .map(|slot| slot.backend.name())
             .unwrap_or("unknown");
         parts.push(format!(
-            "{backend_name}#{backend_id}:active_peak={} pending_peak={} drops={} assignments={} assignment_hashes={} assignment_secs={:.3}",
+            "{backend_name}#{backend_id}:active_peak={} pending_peak={} inflight_hashes_peak={} inflight_secs_peak={:.3} drops={} assignments={} assignment_hashes={} assignment_secs={:.3}",
             telemetry.peak_active_lanes,
             telemetry.peak_pending_work,
+            telemetry.peak_inflight_assignment_hashes,
+            telemetry.peak_inflight_assignment_micros as f64 / 1_000_000.0,
             telemetry.dropped_events,
             telemetry.completed_assignments,
             telemetry.completed_assignment_hashes,
@@ -849,6 +882,7 @@ mod tests {
                     reserved_span: 40,
                 },
                 stop_at: Instant::now() + Duration::from_secs(1),
+                assignment_timeout: Duration::from_secs(1),
                 backend_weights: None,
             },
         )
@@ -904,6 +938,7 @@ mod tests {
                     reserved_span: 12,
                 },
                 stop_at: Instant::now() + Duration::from_secs(1),
+                assignment_timeout: Duration::from_secs(1),
                 backend_weights: None,
             },
         )
@@ -1146,7 +1181,8 @@ mod tests {
             ),
         ];
 
-        quiesce_backend_slots(&mut backends, RuntimeMode::Mining).expect("quiesce should succeed");
+        quiesce_backend_slots(&mut backends, RuntimeMode::Mining, Duration::from_secs(1))
+            .expect("quiesce should succeed");
 
         let events = trace
             .events
@@ -1274,8 +1310,9 @@ mod tests {
             ),
         ];
 
-        let action = quiesce_backend_slots(&mut backends, RuntimeMode::Mining)
-            .expect("quiesce should quarantine only the failing backend");
+        let action =
+            quiesce_backend_slots(&mut backends, RuntimeMode::Mining, Duration::from_secs(1))
+                .expect("quiesce should quarantine only the failing backend");
 
         assert_eq!(action, RuntimeBackendEventAction::TopologyChanged);
         assert_eq!(backends.len(), 1);

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use blocknet_pow_spec::POW_HEADER_BASE_LEN;
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::is_raw_mode_enabled;
 
@@ -463,7 +463,7 @@ impl<'a> MiningControlPlane<'a> {
             if self.shutdown.load(Ordering::Relaxed) {
                 prefetch_task.detach();
             } else {
-                let _ = prefetch_task.join();
+                let _ = prefetch_task.join_for(self.cfg.prefetch_wait);
             }
         }
     }
@@ -581,6 +581,7 @@ pub(super) fn run_mining_loop(
                 target,
                 reservation,
                 stop_at,
+                assignment_timeout: cfg.backend_assign_timeout,
                 backend_weights: work_distribution_weights(cfg.work_allocation, &backend_weights),
             },
         )?;
@@ -610,9 +611,11 @@ pub(super) fn run_mining_loop(
         )?;
 
         if cfg.strict_round_accounting {
-            let _ = quiesce_backend_slots(backends, RuntimeMode::Mining)?;
+            let _ =
+                quiesce_backend_slots(backends, RuntimeMode::Mining, cfg.backend_control_timeout)?;
         } else if round_state.stale_tip_event || round_state.solved.is_some() {
-            let _ = cancel_backend_slots(backends, RuntimeMode::Mining)?;
+            let _ =
+                cancel_backend_slots(backends, RuntimeMode::Mining, cfg.backend_control_timeout)?;
         }
         let _ =
             drain_mining_backend_events(backend_events, epoch, &mut round_state.solved, backends)?;
@@ -874,6 +877,7 @@ fn run_round_event_loop(
                     target,
                     reservation,
                     stop_at,
+                    assignment_timeout: cfg.backend_assign_timeout,
                     backend_weights: work_distribution_weights(
                         cfg.work_allocation,
                         backend_weights,
@@ -912,32 +916,49 @@ fn run_round_event_loop(
 }
 
 struct TemplatePrefetch {
-    handle: JoinHandle<Option<BlockTemplateResponse>>,
+    handle: Option<JoinHandle<()>>,
+    result_rx: Receiver<Option<BlockTemplateResponse>>,
     tip_sequence: u64,
 }
 
 impl TemplatePrefetch {
     fn spawn(client: ApiClient, cfg: Config, shutdown: Arc<AtomicBool>, tip_sequence: u64) -> Self {
-        let handle =
-            thread::spawn(move || fetch_template_prefetch_once(&client, &cfg, shutdown.as_ref()));
+        let (result_tx, result_rx) = bounded(1);
+        let handle = thread::spawn(move || {
+            let template = fetch_template_prefetch_once(&client, &cfg, shutdown.as_ref());
+            let _ = result_tx.send(template);
+        });
         Self {
-            handle,
+            handle: Some(handle),
+            result_rx,
             tip_sequence,
         }
     }
 
-    fn detach(self) {
-        drop(self.handle);
+    fn detach(mut self) {
+        if let Some(handle) = self.handle.take() {
+            drop(handle);
+        }
     }
 
-    fn join(self) -> Option<BlockTemplateResponse> {
-        match self.handle.join() {
-            Ok(template) => template,
-            Err(_) => {
-                error("TEMPLATE", "prefetch thread panicked");
-                None
+    fn join_for(mut self, wait: Duration) -> Option<Option<BlockTemplateResponse>> {
+        let wait = wait.max(Duration::from_millis(1));
+        let received = match self.result_rx.recv_timeout(wait) {
+            Ok(template) => Some(template),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => Some(None),
+        };
+
+        if let Some(handle) = self.handle.take() {
+            if received.is_some() {
+                if handle.join().is_err() {
+                    error("TEMPLATE", "prefetch thread panicked");
+                }
+            } else {
+                drop(handle);
             }
         }
+        received
     }
 }
 
@@ -958,7 +979,7 @@ fn resolve_next_template(
 
     if let Some(task) = prefetch.take() {
         let spawned_tip_sequence = task.tip_sequence;
-        let prefetched_template = task.join();
+        let prefetched_template = task.join_for(cfg.prefetch_wait).flatten();
         let latest_tip_sequence = current_tip_sequence(tip_signal);
         if spawned_tip_sequence == latest_tip_sequence {
             if let Some(template) = prefetched_template {
@@ -1173,16 +1194,26 @@ fn update_backend_weights(
         return;
     }
 
-    if inputs.round_end_reason != RoundEndReason::Refresh {
-        return;
-    }
-    // Skip adaptive updates when a round exits too early; those samples are luck/network-biased.
-    if inputs.round_elapsed_secs < inputs.refresh_interval.as_secs_f64().max(0.001) * 0.5 {
+    let elapsed = inputs.round_elapsed_secs.max(0.001);
+    if elapsed < 0.050 {
         return;
     }
 
-    let elapsed = inputs.round_elapsed_secs.max(0.001);
-    let alpha = 0.35f64;
+    let base_alpha = match inputs.round_end_reason {
+        RoundEndReason::Refresh => 0.35f64,
+        RoundEndReason::Solved => 0.18f64,
+        RoundEndReason::StaleTip => 0.12f64,
+        RoundEndReason::Shutdown => 0.0f64,
+    };
+    if base_alpha <= 0.0 {
+        return;
+    }
+
+    // Scale update strength by round coverage to keep short churny rounds useful but bounded.
+    let refresh_secs = inputs.refresh_interval.as_secs_f64().max(0.001);
+    let coverage = (elapsed / refresh_secs).clamp(0.1, 1.0);
+    let alpha = (base_alpha * coverage).clamp(0.02, 0.35);
+
     backend_weights
         .retain(|backend_id, _| inputs.backends.iter().any(|slot| slot.id == *backend_id));
 
@@ -1553,7 +1584,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_weight_update_skips_solved_rounds() {
+    fn adaptive_weight_update_uses_solved_rounds_with_lower_gain() {
         let backends = vec![BackendSlot {
             id: 7,
             backend: Box::new(NoopBackend::new("cpu")),
@@ -1575,7 +1606,7 @@ mod tests {
             },
         );
 
-        assert_eq!(weights.get(&7).copied(), Some(1.0));
+        assert!(weights.get(&7).copied().unwrap_or(0.0) > 1.0);
     }
 
     #[test]
