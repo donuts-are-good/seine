@@ -295,8 +295,8 @@ fn wave_lines(width: usize, tick: u64, block_ticks: &[u64]) -> Vec<Line<'static>
     const BLOCK_COLOR: Color = Color::Rgb(230, 190, 60);
 
     // Two dense layers (coprime lengths so they drift in/out of phase)
-    let upper: Vec<char> = "≈ ~ ≈ ≈ ~ ≈ ~ ≈ ≈ ~ ~ ≈ ".chars().collect();
-    let lower: Vec<char> = "~ · ≈ · ~ ≈ ~ · ≈ · ~ ".chars().collect();
+    let upper: Vec<char> = "≈ ~ ≈ ~ ≈ ~ ~ ≈ ~ ≈ ^ ≈ ~ ≈ ~ ~ ≈ ".chars().collect();
+    let lower: Vec<char> = "~ ≈ ~ ≈ ~ ~ ≈ ~ ~ ≈ ~ ^ ≈ ~ ≈ ~ ≈ ~ ".chars().collect();
 
     // Block indicators scroll left from right edge on the crest row
     let block_cols: Vec<usize> = block_ticks
