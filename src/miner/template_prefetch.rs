@@ -118,6 +118,10 @@ impl TemplatePrefetch {
         let _ = self.queue_desired_request();
     }
 
+    pub(super) fn is_closed(&self) -> bool {
+        self.request_tx.is_none()
+    }
+
     pub(super) fn wait_for_result(&mut self, wait: Duration) -> Option<(u64, PrefetchOutcome)> {
         let wait = wait.max(Duration::from_millis(1));
         match self.result_rx.recv_timeout(wait) {
@@ -141,6 +145,7 @@ impl TemplatePrefetch {
                 None
             }
             Err(RecvTimeoutError::Disconnected) => {
+                self.request_tx = None;
                 self.inflight_tip_sequence = None;
                 self.desired_tip_sequence = None;
                 None
@@ -238,6 +243,25 @@ mod tests {
 
         assert!(prefetch.wait_for_result(Duration::from_millis(1)).is_none());
         assert_eq!(prefetch.inflight_tip_sequence, Some(7));
+    }
+
+    #[test]
+    fn prefetch_disconnect_marks_worker_closed() {
+        let (request_tx, _request_rx) = bounded::<PrefetchRequest>(1);
+        let (result_tx, result_rx) = bounded::<PrefetchResult>(1);
+        let (_done_tx, done_rx) = bounded::<()>(1);
+        drop(result_tx);
+        let mut prefetch = TemplatePrefetch {
+            handle: None,
+            request_tx: Some(request_tx),
+            result_rx,
+            done_rx,
+            inflight_tip_sequence: Some(7),
+            desired_tip_sequence: Some(7),
+        };
+
+        assert!(prefetch.wait_for_result(Duration::from_millis(1)).is_none());
+        assert!(prefetch.is_closed());
     }
 
     #[test]

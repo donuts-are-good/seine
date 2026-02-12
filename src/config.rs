@@ -201,6 +201,10 @@ struct Cli {
     #[arg(long, default_value_t = 3)]
     bench_rounds: u32,
 
+    /// Number of warmup rounds run before measured benchmark rounds.
+    #[arg(long, default_value_t = 0)]
+    bench_warmup_rounds: u32,
+
     /// Write benchmark report JSON to this file.
     #[arg(long)]
     bench_output: Option<PathBuf>,
@@ -252,6 +256,7 @@ pub struct Config {
     pub bench_kind: BenchKind,
     pub bench_secs: u64,
     pub bench_rounds: u32,
+    pub bench_warmup_rounds: u32,
     pub bench_output: Option<PathBuf>,
     pub bench_baseline: Option<PathBuf>,
     pub bench_fail_below_pct: Option<f64>,
@@ -354,6 +359,7 @@ impl Config {
             bench_kind: cli.bench_kind,
             bench_secs: cli.bench_secs.max(1),
             bench_rounds: cli.bench_rounds.max(1),
+            bench_warmup_rounds: cli.bench_warmup_rounds,
             bench_output: cli.bench_output,
             bench_baseline: cli.bench_baseline,
             bench_fail_below_pct: cli.bench_fail_below_pct,
@@ -612,6 +618,7 @@ mod tests {
             bench_kind: BenchKind::Backend,
             bench_secs: 20,
             bench_rounds: 3,
+            bench_warmup_rounds: 0,
             bench_output: None,
             bench_baseline: None,
             bench_fail_below_pct: None,

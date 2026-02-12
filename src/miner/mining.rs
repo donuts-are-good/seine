@@ -1060,13 +1060,33 @@ fn resolve_next_template(
     let mut auth_retry = RetryTracker::default();
 
     while !shutdown.load(Ordering::Relaxed) {
-        let task = prefetch.as_mut()?;
+        if prefetch.as_ref().is_some_and(TemplatePrefetch::is_closed) {
+            *prefetch = Some(TemplatePrefetch::spawn(
+                client.clone(),
+                cfg.clone(),
+                Arc::clone(shutdown),
+            ));
+        }
 
         let latest_tip_sequence = current_tip_sequence(tip_signal);
-        task.request_if_idle(latest_tip_sequence);
-
         let wait = cfg.prefetch_wait.max(Duration::from_millis(1));
-        let Some((tip_sequence, outcome)) = task.wait_for_result(wait) else {
+        let (prefetch_result, prefetch_closed) = {
+            let task = prefetch.as_mut()?;
+            task.request_if_idle(latest_tip_sequence);
+            let result = task.wait_for_result(wait);
+            let closed = task.is_closed();
+            (result, closed)
+        };
+        let Some((tip_sequence, outcome)) = prefetch_result else {
+            if prefetch_closed {
+                *prefetch = Some(TemplatePrefetch::spawn(
+                    client.clone(),
+                    cfg.clone(),
+                    Arc::clone(shutdown),
+                ));
+                warn("TEMPLATE", "prefetch worker disconnected; respawned");
+                continue;
+            }
             network_retry.note_failure(
                 "NETWORK",
                 "failed to fetch blocktemplate; retrying",
@@ -1079,7 +1099,9 @@ fn resolve_next_template(
 
         let latest_after_wait = current_tip_sequence(tip_signal);
         if tip_sequence < latest_after_wait {
-            task.request_if_idle(latest_after_wait);
+            if let Some(task) = prefetch.as_mut() {
+                task.request_if_idle(latest_after_wait);
+            }
             continue;
         }
 

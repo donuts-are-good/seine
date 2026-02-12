@@ -1,5 +1,6 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
@@ -349,6 +350,16 @@ pub trait PowBackend: Send + Sync {
     fn assign_work_batch_nonblocking(&self, work: &[WorkAssignment]) -> Result<BackendCallStatus> {
         self.assign_work_batch(work)?;
         Ok(BackendCallStatus::Complete)
+    }
+
+    /// Optional wait hook used after non-blocking calls report `Pending`.
+    ///
+    /// Backends can override this to block on backend-native readiness signals
+    /// (for example condition variables, CUDA events, or queue doorbells) instead
+    /// of host-side sleep polling.
+    fn wait_for_nonblocking_progress(&self, wait_for: Duration) -> Result<()> {
+        thread::sleep(wait_for);
+        Ok(())
     }
 
     /// Optional non-blocking cancel hook for future high-throughput backends.

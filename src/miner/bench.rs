@@ -88,6 +88,8 @@ struct BenchReport {
     cpu_threads: usize,
     bench_secs: u64,
     rounds: u32,
+    #[serde(default)]
+    warmup_rounds: u32,
     avg_hps: f64,
     median_hps: f64,
     min_hps: f64,
@@ -101,6 +103,7 @@ struct BenchConfigFingerprint {
     hash_poll_ms: u64,
     backend_assign_timeout_ms: u64,
     backend_control_timeout_ms: u64,
+    bench_warmup_rounds: u32,
     allow_best_effort_deadlines: bool,
     prefetch_wait_ms: u64,
     tip_listener_join_wait_ms: u64,
@@ -152,7 +155,7 @@ struct WorkerBenchmarkIdentity {
 }
 
 type BackendEventAction = RuntimeBackendEventAction;
-const BENCH_REPORT_SCHEMA_VERSION: u32 = 2;
+const BENCH_REPORT_SCHEMA_VERSION: u32 = 3;
 
 pub(super) fn run_benchmark(cfg: &Config, shutdown: &AtomicBool) -> Result<()> {
     let instances = super::build_backend_instances(cfg);
@@ -198,6 +201,7 @@ fn run_kernel_benchmark(
         ("Backend", backend.name().to_string()),
         ("Preemption", backend.preemption_granularity().describe()),
         ("Rounds", cfg.bench_rounds.to_string()),
+        ("Warmup Rounds", cfg.bench_warmup_rounds.to_string()),
         ("Seconds/Round", cfg.bench_secs.to_string()),
         (
             "Regress Gate",
@@ -220,21 +224,40 @@ fn run_kernel_benchmark(
     let bench_backend = backend
         .bench_backend()
         .ok_or_else(|| anyhow!("kernel benchmark is not implemented for {}", backend.name()))?;
-    for round in 0..cfg.bench_rounds {
+    let total_rounds = cfg.bench_warmup_rounds.saturating_add(cfg.bench_rounds);
+    let mut measured_round = 0u32;
+    for round in 0..total_rounds {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
 
+        let is_warmup = round < cfg.bench_warmup_rounds;
         let round_start = Instant::now();
         let hashes = bench_backend.kernel_bench(cfg.bench_secs, shutdown)?;
         let elapsed = round_start.elapsed().as_secs_f64().max(0.001);
         let hps = hashes as f64 / elapsed;
 
+        if is_warmup {
+            info(
+                "BENCH",
+                format!(
+                    "warmup {}/{} | hashes={} | elapsed={:.2}s | {}",
+                    round + 1,
+                    cfg.bench_warmup_rounds,
+                    hashes,
+                    elapsed,
+                    format_hashrate(hps),
+                ),
+            );
+            continue;
+        }
+
+        measured_round = measured_round.saturating_add(1);
         info(
             "BENCH",
             format!(
                 "round {}/{} | hashes={} | elapsed={:.2}s | {}",
-                round + 1,
+                measured_round,
                 cfg.bench_rounds,
                 hashes,
                 elapsed,
@@ -243,7 +266,7 @@ fn run_kernel_benchmark(
         );
 
         runs.push(BenchRun {
-            round: round + 1,
+            round: measured_round,
             hashes,
             counted_hashes: hashes,
             late_hashes: 0,
@@ -272,6 +295,7 @@ fn run_kernel_benchmark(
             cpu_threads: cfg.threads,
             bench_secs: cfg.bench_secs,
             rounds: runs.len() as u32,
+            warmup_rounds: cfg.bench_warmup_rounds,
             avg_hps: 0.0,
             median_hps: 0.0,
             min_hps: 0.0,
@@ -379,6 +403,7 @@ fn run_worker_benchmark(
         ("Preemption", identity.preemption.join(", ")),
         ("Lanes", identity.total_lanes.to_string()),
         ("Rounds", cfg.bench_rounds.to_string()),
+        ("Warmup Rounds", cfg.bench_warmup_rounds.to_string()),
         ("Seconds/Round", cfg.bench_secs.to_string()),
         (
             "Hash Poll",
@@ -456,14 +481,22 @@ fn run_worker_benchmark_inner(
     let mut scheduler = NonceScheduler::new(cfg.start_nonce, cfg.nonce_iters_per_lane);
     let mut backend_weights = seed_backend_weights(backends);
     ensure_worker_topology_identity(backends, identity, "benchmark setup")?;
+    let total_rounds = cfg.bench_warmup_rounds.saturating_add(cfg.bench_rounds);
+    let mut measured_round = 0u32;
 
-    for round in 0..cfg.bench_rounds {
+    for round in 0..total_rounds {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
         if backends.is_empty() {
             bail!("all benchmark backends are unavailable");
         }
+        let is_warmup = round < cfg.bench_warmup_rounds;
+        let phase_label = if is_warmup {
+            format!("warmup {}", round + 1)
+        } else {
+            format!("round {}", measured_round + 1)
+        };
 
         if restart_each_round {
             start_backend_slots(backends)?;
@@ -522,7 +555,7 @@ fn run_worker_benchmark_inner(
                         ensure_worker_topology_identity(
                             backends,
                             identity,
-                            &format!("round {}", round + 1),
+                            &phase_label,
                         )?;
                     }
                 }
@@ -552,11 +585,7 @@ fn run_worker_benchmark_inner(
             backend_executor,
         )? == BackendEventAction::TopologyChanged
         {
-            ensure_worker_topology_identity(
-                backends,
-                identity,
-                &format!("round {} fence", round + 1),
-            )?;
+            ensure_worker_topology_identity(backends, identity, &format!("{phase_label} fence"))?;
         }
         let fence_elapsed = fence_start.elapsed().as_secs_f64();
         let mut late_hashes = 0u64;
@@ -575,7 +604,7 @@ fn run_worker_benchmark_inner(
             ensure_worker_topology_identity(
                 backends,
                 identity,
-                &format!("round {} event drain", round + 1),
+                &format!("{phase_label} event drain"),
             )?;
         }
 
@@ -597,36 +626,61 @@ fn run_worker_benchmark_inner(
             measured_elapsed,
         );
 
-        info(
-            "BENCH",
-            format!(
-                "round {}/{} hashes={} counted={} late={} window={:.2}s fence={:.3}s rate={} backends={}",
-                round + 1,
-                cfg.bench_rounds,
-                round_hashes,
+        let backend_rates =
+            format_bench_backend_hashrate(backends, &round_backend_hashes, measured_elapsed);
+        let telemetry_line = format_round_backend_telemetry(backends, &round_backend_telemetry);
+
+        if is_warmup {
+            info(
+                "BENCH",
+                format!(
+                    "warmup {}/{} hashes={} counted={} late={} window={:.2}s fence={:.3}s rate={} backends={}",
+                    round + 1,
+                    cfg.bench_warmup_rounds,
+                    round_hashes,
+                    counted_hashes,
+                    late_hashes,
+                    counted_elapsed,
+                    fence_elapsed,
+                    format_hashrate(hps),
+                    backend_rates,
+                ),
+            );
+            if telemetry_line != "none" {
+                info("BENCH", format!("warmup telemetry | {telemetry_line}"));
+            }
+        } else {
+            measured_round = measured_round.saturating_add(1);
+            info(
+                "BENCH",
+                format!(
+                    "round {}/{} hashes={} counted={} late={} window={:.2}s fence={:.3}s rate={} backends={}",
+                    measured_round,
+                    cfg.bench_rounds,
+                    round_hashes,
+                    counted_hashes,
+                    late_hashes,
+                    counted_elapsed,
+                    fence_elapsed,
+                    format_hashrate(hps),
+                    backend_rates,
+                ),
+            );
+            if telemetry_line != "none" {
+                info("BENCH", format!("telemetry | {telemetry_line}"));
+            }
+
+            runs.push(BenchRun {
+                round: measured_round,
+                hashes: round_hashes,
                 counted_hashes,
                 late_hashes,
-                counted_elapsed,
-                fence_elapsed,
-                format_hashrate(hps),
-                format_bench_backend_hashrate(backends, &round_backend_hashes, measured_elapsed),
-            ),
-        );
-        let telemetry_line = format_round_backend_telemetry(backends, &round_backend_telemetry);
-        if telemetry_line != "none" {
-            info("BENCH", format!("telemetry | {telemetry_line}"));
+                elapsed_secs: measured_elapsed,
+                fence_secs: fence_elapsed,
+                hps,
+                backend_runs,
+            });
         }
-
-        runs.push(BenchRun {
-            round: round + 1,
-            hashes: round_hashes,
-            counted_hashes,
-            late_hashes,
-            elapsed_secs: measured_elapsed,
-            fence_secs: fence_elapsed,
-            hps,
-            backend_runs,
-        });
 
         let round_end_reason = if shutdown.load(Ordering::Relaxed) {
             RoundEndReason::Shutdown
@@ -669,6 +723,7 @@ fn run_worker_benchmark_inner(
             cpu_threads: cfg.threads,
             bench_secs: cfg.bench_secs,
             rounds: runs.len() as u32,
+            warmup_rounds: cfg.bench_warmup_rounds,
             avg_hps: 0.0,
             median_hps: 0.0,
             min_hps: 0.0,
@@ -856,6 +911,15 @@ fn baseline_compatibility_issues(
                 current.config_fingerprint.backend_control_timeout_ms
             ));
         }
+        if baseline.config_fingerprint.bench_warmup_rounds
+            != current.config_fingerprint.bench_warmup_rounds
+        {
+            issues.push(format!(
+                "bench_warmup_rounds mismatch baseline={} current={}",
+                baseline.config_fingerprint.bench_warmup_rounds,
+                current.config_fingerprint.bench_warmup_rounds
+            ));
+        }
         if baseline.config_fingerprint.allow_best_effort_deadlines
             != current.config_fingerprint.allow_best_effort_deadlines
         {
@@ -863,24 +927,6 @@ fn baseline_compatibility_issues(
                 "allow_best_effort_deadlines mismatch baseline={} current={}",
                 baseline.config_fingerprint.allow_best_effort_deadlines,
                 current.config_fingerprint.allow_best_effort_deadlines
-            ));
-        }
-        if baseline.config_fingerprint.prefetch_wait_ms
-            != current.config_fingerprint.prefetch_wait_ms
-        {
-            issues.push(format!(
-                "prefetch_wait_ms mismatch baseline={} current={}",
-                baseline.config_fingerprint.prefetch_wait_ms,
-                current.config_fingerprint.prefetch_wait_ms
-            ));
-        }
-        if baseline.config_fingerprint.tip_listener_join_wait_ms
-            != current.config_fingerprint.tip_listener_join_wait_ms
-        {
-            issues.push(format!(
-                "tip_listener_join_wait_ms mismatch baseline={} current={}",
-                baseline.config_fingerprint.tip_listener_join_wait_ms,
-                current.config_fingerprint.tip_listener_join_wait_ms
             ));
         }
         if baseline.config_fingerprint.strict_round_accounting
@@ -925,15 +971,6 @@ fn baseline_compatibility_issues(
             issues.push(format!(
                 "cpu_affinity mismatch baseline={} current={}",
                 baseline.config_fingerprint.cpu_affinity, current.config_fingerprint.cpu_affinity
-            ));
-        }
-        if baseline.config_fingerprint.events_idle_timeout_secs
-            != current.config_fingerprint.events_idle_timeout_secs
-        {
-            issues.push(format!(
-                "events_idle_timeout_secs mismatch baseline={} current={}",
-                baseline.config_fingerprint.events_idle_timeout_secs,
-                current.config_fingerprint.events_idle_timeout_secs
             ));
         }
         if baseline.pow_fingerprint != current.pow_fingerprint {
@@ -1093,6 +1130,7 @@ fn benchmark_config_fingerprint(cfg: &Config) -> BenchConfigFingerprint {
         hash_poll_ms: cfg.hash_poll_interval.as_millis() as u64,
         backend_assign_timeout_ms: cfg.backend_assign_timeout.as_millis() as u64,
         backend_control_timeout_ms: cfg.backend_control_timeout.as_millis() as u64,
+        bench_warmup_rounds: cfg.bench_warmup_rounds,
         allow_best_effort_deadlines: cfg.allow_best_effort_deadlines,
         prefetch_wait_ms: cfg.prefetch_wait.as_millis() as u64,
         tip_listener_join_wait_ms: cfg.tip_listener_join_wait.as_millis() as u64,
@@ -1331,6 +1369,7 @@ mod tests {
                 hash_poll_ms: 200,
                 backend_assign_timeout_ms: 1000,
                 backend_control_timeout_ms: 60_000,
+                bench_warmup_rounds: 0,
                 allow_best_effort_deadlines: false,
                 prefetch_wait_ms: 250,
                 tip_listener_join_wait_ms: 250,
@@ -1356,6 +1395,7 @@ mod tests {
             cpu_threads: 1,
             bench_secs: 10,
             rounds: 1,
+            warmup_rounds: 0,
             avg_hps: 10.0,
             median_hps: 10.0,
             min_hps: 10.0,
@@ -1442,6 +1482,39 @@ mod tests {
             .any(|issue| issue.contains("git mismatch")));
     }
 
+    #[test]
+    fn baseline_compatibility_detects_warmup_round_mismatch() {
+        let current = sample_report();
+        let mut baseline = sample_report();
+        baseline.config_fingerprint.bench_warmup_rounds = 2;
+
+        let issues =
+            baseline_compatibility_issues(&current, &baseline, BenchBaselinePolicy::Strict);
+        assert!(issues
+            .iter()
+            .any(|issue| issue.contains("bench_warmup_rounds mismatch")));
+    }
+
+    #[test]
+    fn baseline_compatibility_ignores_context_only_timeout_fields() {
+        let current = sample_report();
+        let mut baseline = sample_report();
+        baseline.config_fingerprint.prefetch_wait_ms = 999;
+        baseline.config_fingerprint.tip_listener_join_wait_ms = 888;
+        baseline.config_fingerprint.events_idle_timeout_secs = 777;
+
+        let issues =
+            baseline_compatibility_issues(&current, &baseline, BenchBaselinePolicy::Strict);
+        assert!(!issues
+            .iter()
+            .any(|issue| issue.contains("prefetch_wait_ms")));
+        assert!(!issues
+            .iter()
+            .any(|issue| issue.contains("tip_listener_join_wait_ms")));
+        assert!(!issues
+            .iter()
+            .any(|issue| issue.contains("events_idle_timeout_secs")));
+    }
     #[test]
     fn backend_round_stats_include_zero_hash_backends() {
         let backends = vec![BackendSlot {

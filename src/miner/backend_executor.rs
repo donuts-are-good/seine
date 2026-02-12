@@ -419,21 +419,25 @@ fn run_backend_call(
         BackendTaskKind::Assign(work) => run_nonblocking_until_deadline(
             deadline,
             || backend_handle.assign_work_batch_nonblocking(std::slice::from_ref(&work)),
+            |wait| backend_handle.wait_for_nonblocking_progress(wait),
             "assignment deadline elapsed before backend accepted work",
         ),
         BackendTaskKind::AssignBatch(batch) => run_nonblocking_until_deadline(
             deadline,
             || backend_handle.assign_work_batch_nonblocking(&batch),
+            |wait| backend_handle.wait_for_nonblocking_progress(wait),
             "assignment deadline elapsed before backend accepted work",
         ),
         BackendTaskKind::Cancel => run_nonblocking_until_deadline(
             deadline,
             || backend_handle.cancel_work_nonblocking(),
+            |wait| backend_handle.wait_for_nonblocking_progress(wait),
             "cancel deadline elapsed before backend acknowledged cancel",
         ),
         BackendTaskKind::Fence => run_nonblocking_until_deadline(
             deadline,
             || backend_handle.fence_nonblocking(),
+            |wait| backend_handle.wait_for_nonblocking_progress(wait),
             "fence deadline elapsed before backend acknowledged fence",
         ),
     })) {
@@ -442,13 +446,15 @@ fn run_backend_call(
     }
 }
 
-fn run_nonblocking_until_deadline<F>(
+fn run_nonblocking_until_deadline<F, W>(
     deadline: Instant,
     mut op: F,
+    mut wait_for_progress: W,
     timeout_message: &'static str,
 ) -> Result<()>
 where
     F: FnMut() -> Result<BackendCallStatus>,
+    W: FnMut(Duration) -> Result<()>,
 {
     let mut backoff = NONBLOCKING_BACKOFF_MIN;
     loop {
@@ -472,13 +478,12 @@ where
                     .saturating_duration_since(now)
                     .min(backoff)
                     .max(Duration::from_micros(10));
-                thread::sleep(wait);
+                wait_for_progress(wait)?;
                 backoff = backoff.saturating_mul(2).min(NONBLOCKING_BACKOFF_MAX);
             }
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,12 +767,14 @@ mod tests {
 
     struct PendingThenCompleteBackend {
         pending: AtomicUsize,
+        wait_calls: AtomicUsize,
     }
 
     impl PendingThenCompleteBackend {
         fn new(pending: usize) -> Self {
             Self {
                 pending: AtomicUsize::new(pending),
+                wait_calls: AtomicUsize::new(0),
             }
         }
     }
@@ -815,12 +822,18 @@ mod tests {
                 }
             }
         }
+
+        fn wait_for_nonblocking_progress(&self, _wait_for: Duration) -> Result<()> {
+            self.wait_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
     }
 
     #[test]
     fn dispatch_retries_pending_nonblocking_assignment_until_complete() {
         let executor = BackendExecutor::new();
-        let backend = Arc::new(PendingThenCompleteBackend::new(3)) as Arc<dyn PowBackend>;
+        let backend = Arc::new(PendingThenCompleteBackend::new(3));
+        let backend_dyn = Arc::clone(&backend) as Arc<dyn PowBackend>;
 
         let work = WorkAssignment {
             template: Arc::new(WorkTemplate {
@@ -841,7 +854,7 @@ mod tests {
                 idx: 0,
                 backend_id: 1,
                 backend: "pending-assign",
-                backend_handle: backend,
+                backend_handle: backend_dyn,
                 kind: BackendTaskKind::Assign(work),
             }],
             Duration::from_millis(25),
@@ -850,5 +863,9 @@ mod tests {
         assert!(outcomes[0]
             .as_ref()
             .is_some_and(|outcome| outcome.result.is_ok()));
+        assert!(
+            backend.wait_calls.load(Ordering::Relaxed) > 0,
+            "pending path should use backend wait hook"
+        );
     }
 }
