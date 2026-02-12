@@ -376,7 +376,10 @@ fn quarantine_backend(backend: Arc<dyn PowBackend>) {
         .spawn(move || detached.stop())
         .is_err()
     {
-        backend.stop();
+        warn(
+            "BACKEND",
+            "failed to spawn backend quarantine worker; skipping synchronous stop to avoid runtime stall",
+        );
     }
 }
 
@@ -523,7 +526,7 @@ fn run_backend_control_phase(
                 match outcome.result {
                     Ok(()) => survivors.push((idx, slot)),
                     Err(err) => {
-                        slot.backend.stop();
+                        quarantine_backend(Arc::clone(&slot.backend));
                         remove_backend_control_worker(backend_id);
                         failures
                             .entry(backend_id)

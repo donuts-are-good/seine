@@ -612,25 +612,21 @@ pub(super) fn run_mining_loop(
             target,
         })?;
         let mut submitted_solution = None;
-        if let Some(solution) = round_state.solved.take() {
-            control_plane.submit_solution(&template, solution.clone(), &stats, &mut tui);
-            submitted_solution = Some(solution);
-        }
+        let solved_found = round_state.solved.is_some();
+        let mut pending_solution = round_state.solved.take();
 
         if cfg.strict_round_accounting {
             let _ =
                 quiesce_backend_slots(backends, RuntimeMode::Mining, cfg.backend_control_timeout)?;
-        } else if round_state.stale_tip_event || round_state.solved.is_some() {
+        } else if should_cancel_relaxed_round(round_state.stale_tip_event, solved_found) {
             let _ =
                 cancel_backend_slots(backends, RuntimeMode::Mining, cfg.backend_control_timeout)?;
         }
         let _ =
-            drain_mining_backend_events(backend_events, epoch, &mut round_state.solved, backends)?;
-        if submitted_solution.is_none() {
-            if let Some(solution) = round_state.solved.take() {
-                control_plane.submit_solution(&template, solution.clone(), &stats, &mut tui);
-                submitted_solution = Some(solution);
-            }
+            drain_mining_backend_events(backend_events, epoch, &mut pending_solution, backends)?;
+        if let Some(solution) = pending_solution.take() {
+            control_plane.submit_solution(&template, solution.clone(), &stats, &mut tui);
+            submitted_solution = Some(solution);
         }
         collect_backend_hashes(
             backends,
@@ -745,6 +741,10 @@ pub(super) fn run_mining_loop(
     stats.print();
     info("MINER", "stopped");
     Ok(())
+}
+
+fn should_cancel_relaxed_round(stale_tip_event: bool, solved_found: bool) -> bool {
+    stale_tip_event || solved_found
 }
 
 struct RoundInput<'a> {
@@ -1520,6 +1520,13 @@ mod tests {
 
         assert_eq!(action, BackendEventAction::None);
         assert!(solved.is_none());
+    }
+
+    #[test]
+    fn relaxed_round_cancel_triggers_on_solved_or_stale_tip() {
+        assert!(should_cancel_relaxed_round(false, true));
+        assert!(should_cancel_relaxed_round(true, false));
+        assert!(!should_cancel_relaxed_round(false, false));
     }
 
     #[test]

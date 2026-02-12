@@ -380,6 +380,7 @@ impl PowBackend for CpuBackend {
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             preferred_iters_per_lane: None,
+            preferred_allocation_iters_per_lane: None,
             preferred_hash_poll_interval: Some(HASH_FLUSH_INTERVAL),
             max_inflight_assignments: 1,
             deadline_support: DeadlineSupport::Cooperative,

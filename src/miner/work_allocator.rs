@@ -147,7 +147,10 @@ fn quarantine_backend(backend: Arc<dyn PowBackend>) {
         .spawn(move || detached.stop())
         .is_err()
     {
-        backend.stop();
+        warn(
+            "BACKEND",
+            "failed to spawn backend quarantine worker; skipping synchronous stop to avoid runtime stall",
+        );
     }
 }
 
@@ -183,11 +186,12 @@ pub(super) fn distribute_work(
         let mut slots_by_idx = Vec::with_capacity(backends.len());
         for (idx, slot) in std::mem::take(backends).into_iter().enumerate() {
             let nonce_count = *nonce_counts.get(idx).unwrap_or(&slot.lanes.max(1));
+            let capabilities = backend_capabilities(&slot);
             let batch = build_assignment_batch(
                 Arc::clone(&template),
                 chunk_start,
                 nonce_count,
-                backend_capabilities(&slot).max_inflight_assignments,
+                capabilities.max_inflight_assignments,
             );
 
             dispatch_tasks.push(DispatchTask {
@@ -401,20 +405,20 @@ pub(super) fn compute_backend_nonce_counts(
     }
 
     let base_counts: Vec<u64> = backends.iter().map(|slot| slot.lanes.max(1)).collect();
-    let preferred_counts: Vec<u64> = backends
+    let allocation_counts: Vec<u64> = backends
         .iter()
         .map(|slot| {
             let lanes = slot.lanes.max(1);
-            let iters = backend_iters_per_lane(slot, max_iters_per_lane);
+            let iters = backend_allocation_iters_per_lane(slot, max_iters_per_lane);
             lanes.saturating_mul(iters).max(lanes)
         })
         .collect();
     if backend_weights.is_none() {
-        return preferred_counts;
+        return allocation_counts;
     }
 
     let total_lanes = total_lanes(backends);
-    let total_span = preferred_counts
+    let total_span = allocation_counts
         .iter()
         .fold(0u64, |acc, count| acc.saturating_add(*count))
         .max(total_lanes);
@@ -429,7 +433,7 @@ pub(super) fn compute_backend_nonce_counts(
     let mut weights = Vec::with_capacity(backends.len());
     let mut sum_weights = 0.0f64;
     for (idx, slot) in backends.iter().enumerate() {
-        let fallback = preferred_counts
+        let fallback = allocation_counts
             .get(idx)
             .copied()
             .unwrap_or_else(|| slot.lanes.max(1)) as f64;
@@ -481,6 +485,24 @@ pub(super) fn compute_backend_nonce_counts(
 }
 
 pub(super) fn backend_iters_per_lane(slot: &BackendSlot, default_iters_per_lane: u64) -> u64 {
+    backend_allocation_iters_per_lane(slot, default_iters_per_lane)
+}
+
+pub(super) fn backend_allocation_iters_per_lane(
+    slot: &BackendSlot,
+    default_iters_per_lane: u64,
+) -> u64 {
+    let default_iters_per_lane = default_iters_per_lane.max(1);
+    backend_capabilities(slot)
+        .preferred_allocation_iters_per_lane
+        .unwrap_or(default_iters_per_lane)
+        .max(1)
+}
+
+pub(super) fn backend_dispatch_iters_per_lane(
+    slot: &BackendSlot,
+    default_iters_per_lane: u64,
+) -> u64 {
     let default_iters_per_lane = default_iters_per_lane.max(1);
     backend_capabilities(slot)
         .preferred_iters_per_lane

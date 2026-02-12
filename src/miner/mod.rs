@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
@@ -429,6 +430,10 @@ fn backend_iters_per_lane(slot: &BackendSlot, default_iters_per_lane: u64) -> u6
     work_allocator::backend_iters_per_lane(slot, default_iters_per_lane)
 }
 
+fn backend_dispatch_iters_per_lane(slot: &BackendSlot, default_iters_per_lane: u64) -> u64 {
+    work_allocator::backend_dispatch_iters_per_lane(slot, default_iters_per_lane)
+}
+
 fn collect_backend_hashes(
     backends: &[BackendSlot],
     stats: Option<&Stats>,
@@ -527,10 +532,30 @@ fn remove_backend_by_id(backends: &mut Vec<BackendSlot>, backend_id: BackendInst
     };
 
     let slot = backends.remove(idx);
-    slot.backend.stop();
+    quarantine_backend_stop(Arc::clone(&slot.backend), slot.backend.name(), slot.id);
     work_allocator::prune_assign_workers(backends);
     backend_control::prune_backend_control_workers(backends);
     true
+}
+
+fn quarantine_backend_stop(
+    backend: Arc<dyn PowBackend>,
+    backend_name: &'static str,
+    backend_id: u64,
+) {
+    let detached = Arc::clone(&backend);
+    if thread::Builder::new()
+        .name(format!("seine-backend-remove-{backend_name}-{backend_id}"))
+        .spawn(move || detached.stop())
+        .is_err()
+    {
+        warn(
+            "BACKEND",
+            format!(
+                "failed to spawn stop worker for {backend_name}#{backend_id}; skipping synchronous stop to avoid runtime stall"
+            ),
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -599,7 +624,8 @@ fn backend_chunk_profiles(backends: &[BackendSlot], default_iters_per_lane: u64)
     backends
         .iter()
         .map(|slot| {
-            let hinted = backend_iters_per_lane(slot, default_iters_per_lane);
+            let allocation_hint = backend_iters_per_lane(slot, default_iters_per_lane);
+            let dispatch_hint = backend_dispatch_iters_per_lane(slot, default_iters_per_lane);
             let capabilities = backend_capabilities(slot);
             let inflight = capabilities.max_inflight_assignments.max(1);
             let poll_hint = capabilities
@@ -609,10 +635,11 @@ fn backend_chunk_profiles(backends: &[BackendSlot], default_iters_per_lane: u64)
             let deadline_support = capabilities.deadline_support.describe();
             let assignment_semantics = capabilities.assignment_semantics.describe();
             format!(
-                "{}#{}={} iters/lane inflight={} poll_hint={} deadline={} assign={}",
+                "{}#{}=alloc:{} dispatch:{} iters/lane inflight={} poll_hint={} deadline={} assign={}",
                 slot.backend.name(),
                 slot.id,
-                hinted,
+                allocation_hint,
+                dispatch_hint,
                 inflight,
                 poll_hint,
                 deadline_support,
@@ -805,6 +832,7 @@ mod tests {
         lanes: usize,
         state: Arc<MockState>,
         preferred_iters_per_lane: Option<u64>,
+        preferred_allocation_iters_per_lane: Option<u64>,
         preferred_hash_poll_interval: Option<Duration>,
         max_inflight_assignments: u32,
         supports_assignment_batching: bool,
@@ -818,6 +846,7 @@ mod tests {
                 lanes,
                 state,
                 preferred_iters_per_lane: None,
+                preferred_allocation_iters_per_lane: None,
                 preferred_hash_poll_interval: None,
                 max_inflight_assignments: 1,
                 supports_assignment_batching: false,
@@ -826,7 +855,9 @@ mod tests {
         }
 
         fn with_preferred_iters_per_lane(mut self, preferred_iters_per_lane: u64) -> Self {
-            self.preferred_iters_per_lane = Some(preferred_iters_per_lane.max(1));
+            let preferred = preferred_iters_per_lane.max(1);
+            self.preferred_iters_per_lane = Some(preferred);
+            self.preferred_allocation_iters_per_lane = Some(preferred);
             self
         }
 
@@ -915,6 +946,7 @@ mod tests {
         fn capabilities(&self) -> crate::backend::BackendCapabilities {
             crate::backend::BackendCapabilities {
                 preferred_iters_per_lane: self.preferred_iters_per_lane,
+                preferred_allocation_iters_per_lane: self.preferred_allocation_iters_per_lane,
                 preferred_hash_poll_interval: self.preferred_hash_poll_interval,
                 max_inflight_assignments: self.max_inflight_assignments.max(1),
                 deadline_support: crate::backend::DeadlineSupport::Cooperative,
@@ -931,6 +963,19 @@ mod tests {
         let deadline = Instant::now() + timeout;
         loop {
             if state.stop_calls.load(Ordering::Relaxed) > 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_stop_counter(counter: &AtomicUsize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if counter.load(Ordering::Relaxed) > 0 {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -978,7 +1023,10 @@ mod tests {
         assert_eq!(backends.len(), 1);
         assert_eq!(backends[0].id, 11);
         assert_eq!(first_state.stop_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(second_state.stop_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            wait_for_stop_call(&second_state, Duration::from_millis(250)),
+            "removed backend should be stopped asynchronously"
+        );
     }
 
     #[test]
@@ -1613,7 +1661,10 @@ mod tests {
         assert_eq!(action, RuntimeBackendEventAction::TopologyChanged);
         assert_eq!(backends.len(), 1);
         assert_eq!(backends[0].id, 2);
-        assert_eq!(fail_stop_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            wait_for_stop_counter(&fail_stop_calls, Duration::from_millis(250)),
+            "failing backend should be stopped asynchronously"
+        );
         assert_eq!(ok_stop_calls.load(Ordering::Relaxed), 0);
     }
 
@@ -1651,7 +1702,10 @@ mod tests {
         assert_eq!(action, RuntimeBackendEventAction::TopologyChanged);
         assert_eq!(backends.len(), 1);
         assert_eq!(backends[0].id, 2);
-        assert_eq!(panic_stop_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            wait_for_stop_counter(&panic_stop_calls, Duration::from_millis(250)),
+            "panicing backend should be stopped asynchronously"
+        );
         assert_eq!(ok_stop_calls.load(Ordering::Relaxed), 0);
     }
 }

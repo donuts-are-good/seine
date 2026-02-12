@@ -82,6 +82,7 @@ pub mod nvidia {
         fn capabilities(&self) -> BackendCapabilities {
             BackendCapabilities {
                 preferred_iters_per_lane: Some(1),
+                preferred_allocation_iters_per_lane: None,
                 preferred_hash_poll_interval: Some(Duration::from_millis(50)),
                 max_inflight_assignments: 1,
                 deadline_support: DeadlineSupport::BestEffort,
@@ -191,9 +192,12 @@ impl AssignmentSemantics {
 
 #[derive(Debug, Clone, Copy)]
 pub struct BackendCapabilities {
-    /// Preferred iterations per lane for one assignment chunk.
-    /// Runtime treats this as a scheduling hint, not a hard contract.
+    /// Preferred iterations per lane for one dispatched assignment chunk.
+    /// Runtime treats this as a dispatch-granularity hint, not a hard contract.
     pub preferred_iters_per_lane: Option<u64>,
+    /// Preferred iterations per lane for sizing per-backend nonce reservations.
+    /// Runtime uses this to shape allocation windows independently from dispatch chunking.
+    pub preferred_allocation_iters_per_lane: Option<u64>,
     /// Preferred backend hash-poll cadence for telemetry/accounting.
     /// Runtime clamps this against operator-configured polling limits.
     pub preferred_hash_poll_interval: Option<Duration>,
@@ -210,6 +214,7 @@ impl Default for BackendCapabilities {
     fn default() -> Self {
         Self {
             preferred_iters_per_lane: None,
+            preferred_allocation_iters_per_lane: None,
             preferred_hash_poll_interval: None,
             max_inflight_assignments: 1,
             deadline_support: DeadlineSupport::BestEffort,
