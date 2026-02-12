@@ -141,6 +141,10 @@ struct Cli {
     #[arg(long, default_value_t = 60_000)]
     backend_control_timeout_ms: u64,
 
+    /// Allow backends with best-effort deadline semantics.
+    #[arg(long, default_value_t = false)]
+    allow_best_effort_deadlines: bool,
+
     /// Maximum time to wait for a prefetched block template before falling back.
     #[arg(long, default_value_t = 250)]
     prefetch_wait_ms: u64,
@@ -230,6 +234,7 @@ pub struct Config {
     pub hash_poll_interval: Duration,
     pub backend_assign_timeout: Duration,
     pub backend_control_timeout: Duration,
+    pub allow_best_effort_deadlines: bool,
     pub prefetch_wait: Duration,
     pub tip_listener_join_wait: Duration,
     pub strict_round_accounting: bool,
@@ -322,6 +327,7 @@ impl Config {
             hash_poll_interval: Duration::from_millis(cli.hash_poll_ms),
             backend_assign_timeout: Duration::from_millis(cli.backend_assign_timeout_ms),
             backend_control_timeout: Duration::from_millis(cli.backend_control_timeout_ms),
+            allow_best_effort_deadlines: cli.allow_best_effort_deadlines,
             prefetch_wait: Duration::from_millis(cli.prefetch_wait_ms),
             tip_listener_join_wait: Duration::from_millis(cli.tip_listener_join_wait_ms),
             strict_round_accounting: !cli.relaxed_accounting,
@@ -584,6 +590,7 @@ mod tests {
             hash_poll_ms: 200,
             backend_assign_timeout_ms: 1000,
             backend_control_timeout_ms: 60_000,
+            allow_best_effort_deadlines: false,
             prefetch_wait_ms: 250,
             tip_listener_join_wait_ms: 250,
             relaxed_accounting: false,

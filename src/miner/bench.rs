@@ -96,6 +96,7 @@ struct BenchConfigFingerprint {
     hash_poll_ms: u64,
     backend_assign_timeout_ms: u64,
     backend_control_timeout_ms: u64,
+    allow_best_effort_deadlines: bool,
     prefetch_wait_ms: u64,
     tip_listener_join_wait_ms: u64,
     strict_round_accounting: bool,
@@ -259,6 +260,7 @@ fn run_worker_benchmark(
     restart_each_round: bool,
 ) -> Result<()> {
     let (mut backends, backend_events) = activate_backends(instances, cfg.backend_event_capacity)?;
+    super::enforce_deadline_policy(&backends, cfg.allow_best_effort_deadlines)?;
     let bench_kind = if restart_each_round {
         "end_to_end"
     } else {
@@ -751,6 +753,15 @@ fn baseline_compatibility_issues(
                 current.config_fingerprint.backend_control_timeout_ms
             ));
         }
+        if baseline.config_fingerprint.allow_best_effort_deadlines
+            != current.config_fingerprint.allow_best_effort_deadlines
+        {
+            issues.push(format!(
+                "allow_best_effort_deadlines mismatch baseline={} current={}",
+                baseline.config_fingerprint.allow_best_effort_deadlines,
+                current.config_fingerprint.allow_best_effort_deadlines
+            ));
+        }
         if baseline.config_fingerprint.prefetch_wait_ms
             != current.config_fingerprint.prefetch_wait_ms
         {
@@ -979,6 +990,7 @@ fn benchmark_config_fingerprint(cfg: &Config) -> BenchConfigFingerprint {
         hash_poll_ms: cfg.hash_poll_interval.as_millis() as u64,
         backend_assign_timeout_ms: cfg.backend_assign_timeout.as_millis() as u64,
         backend_control_timeout_ms: cfg.backend_control_timeout.as_millis() as u64,
+        allow_best_effort_deadlines: cfg.allow_best_effort_deadlines,
         prefetch_wait_ms: cfg.prefetch_wait.as_millis() as u64,
         tip_listener_join_wait_ms: cfg.tip_listener_join_wait.as_millis() as u64,
         strict_round_accounting: cfg.strict_round_accounting,
@@ -1121,6 +1133,7 @@ mod tests {
                 hash_poll_ms: 200,
                 backend_assign_timeout_ms: 1000,
                 backend_control_timeout_ms: 60_000,
+                allow_best_effort_deadlines: false,
                 prefetch_wait_ms: 250,
                 tip_listener_join_wait_ms: 250,
                 strict_round_accounting: true,

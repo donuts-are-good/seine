@@ -6,7 +6,7 @@ Current status:
 - CPU backend: implemented (Argon2id, consensus-compatible params).
 - NVIDIA backend: scaffolded interface only (not implemented yet).
 - Runtime architecture: supports multiple backends in one process with persistent workers, configurable bounded backend event queues with lossless `Solution` delivery and deduplicated backend `Error` events (prevents multi-thread error storms from stalling worker teardown), coalesced tip notifications (deduped across SSE reconnects), template prefetch overlap to reduce round-boundary idle, and optional strict quiesce barriers for round-accurate hash accounting.
-  - Backend assignment/control dispatch now runs isolated per-backend tasks with panic capture and timeout quarantine, avoiding queue-induced false timeout quarantines.
+  - Backend assignment/control dispatch now runs through one shared per-backend task executor with panic capture and timeout quarantine to avoid duplicated control paths and extra thread churn.
   - Runtime assigns disjoint nonce chunks per backend per round (backend-local scheduling inside each chunk) so CPU and future GPU implementations can iterate independently without nonce overlap.
   - Runtime supports batched per-backend work assignment via backend queue-depth hints (`max_inflight_assignments`) so future GPU backends can overlap control and kernel scheduling.
   - Backends explicitly advertise deadline semantics (`cooperative` vs `best-effort`) so timeout behavior is visible before mixing heterogeneous devices.
@@ -95,6 +95,7 @@ Run headless/plain logs (no fullscreen TUI):
   - `--backend-event-capacity` (default `1024`) controls bounded backend event queue size.
   - `--backend-assign-timeout-ms` (default `1000`) bounds per-backend assignment dispatch calls; timed-out backends are quarantined.
   - `--backend-control-timeout-ms` (default `60000`) bounds `cancel/fence` control calls; timed-out backends are quarantined.
+  - By default, backends reporting best-effort deadlines are rejected; pass `--allow-best-effort-deadlines` to override.
   - `--hash-poll-ms` (default `200`) controls backend hash counter polling cadence.
     - Runtime may tighten this cadence based on backend capability hints (for example future GPU backends) while preserving the configured upper bound.
   - `--stats-secs` (default `10`) controls periodic stats log emission cadence.
@@ -108,6 +109,7 @@ Run headless/plain logs (no fullscreen TUI):
   - `--cpu-affinity` (`auto` or `off`) controls CPU worker pinning policy for better repeatability on NUMA/SMT hosts.
   - `--ui` (`auto`, `tui`, `plain`) controls rendering mode. `auto` enables TUI only when stdout/stderr are terminals.
   - `--relaxed-accounting` disables per-round quiesce barriers (higher throughput, less exact round accounting).
+    - If any backend reports append assignment semantics, relaxed mode still issues round-boundary cancels to prevent stale queue carry-over.
   - `--refresh-on-same-height` forces immediate refresh on same-height `new_block` hash changes.
 - A backend runtime fault quarantines only that backend; mining continues on remaining active backends when possible.
 - CPU backend runtime errors are latched per assignment so only the first fault event is emitted, avoiding queue saturation during shutdown.

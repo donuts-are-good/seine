@@ -1,5 +1,6 @@
 mod auth;
 mod backend_control;
+mod backend_executor;
 mod bench;
 mod mining;
 mod runtime;
@@ -14,7 +15,6 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
@@ -86,6 +86,7 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
     let backend_instances = build_backend_instances(cfg);
     let (mut backends, backend_events) =
         activate_backends(backend_instances, cfg.backend_event_capacity)?;
+    enforce_deadline_policy(&backends, cfg.allow_best_effort_deadlines)?;
     let total_lanes = total_lanes(&backends);
     let cpu_lanes = cpu_lane_count(&backends);
     let cpu_ram_gib =
@@ -142,7 +143,7 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
         warn(
             "MINER",
             format!(
-                "append assignment semantics reported by {}; ensure stale work is dropped by work_id/epoch",
+                "append assignment semantics reported by {}; relaxed mode will force round-boundary cancels",
                 append_semantics.join(", ")
             ),
         );
@@ -406,8 +407,7 @@ fn stop_backend_slots(backends: &mut [BackendSlot]) {
     for slot in backends {
         slot.backend.stop();
     }
-    work_allocator::clear_assign_workers();
-    backend_control::clear_backend_control_workers();
+    backend_executor::clear_backend_workers();
 }
 
 fn distribute_work(
@@ -532,30 +532,10 @@ fn remove_backend_by_id(backends: &mut Vec<BackendSlot>, backend_id: BackendInst
     };
 
     let slot = backends.remove(idx);
-    quarantine_backend_stop(Arc::clone(&slot.backend), slot.backend.name(), slot.id);
-    work_allocator::prune_assign_workers(backends);
-    backend_control::prune_backend_control_workers(backends);
+    backend_executor::quarantine_backend(Arc::clone(&slot.backend));
+    backend_executor::remove_backend_worker(slot.id);
+    backend_executor::prune_backend_workers(backends);
     true
-}
-
-fn quarantine_backend_stop(
-    backend: Arc<dyn PowBackend>,
-    backend_name: &'static str,
-    backend_id: u64,
-) {
-    let detached = Arc::clone(&backend);
-    if thread::Builder::new()
-        .name(format!("seine-backend-remove-{backend_name}-{backend_id}"))
-        .spawn(move || detached.stop())
-        .is_err()
-    {
-        warn(
-            "BACKEND",
-            format!(
-                "failed to spawn stop worker for {backend_name}#{backend_id}; skipping synchronous stop to avoid runtime stall"
-            ),
-        );
-    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -568,6 +548,35 @@ enum RuntimeMode {
 enum RuntimeBackendEventAction {
     None,
     TopologyChanged,
+}
+
+fn enforce_deadline_policy(
+    backends: &[BackendSlot],
+    allow_best_effort_deadlines: bool,
+) -> Result<()> {
+    if allow_best_effort_deadlines {
+        return Ok(());
+    }
+
+    let best_effort: Vec<String> = backends
+        .iter()
+        .filter_map(|slot| {
+            let capabilities = backend_capabilities(slot);
+            if capabilities.deadline_support == DeadlineSupport::BestEffort {
+                Some(format!("{}#{}", slot.backend.name(), slot.id))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if best_effort.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "best-effort deadline backends are disabled by default: {}. pass --allow-best-effort-deadlines to continue",
+        best_effort.join(", ")
+    );
 }
 
 fn handle_runtime_backend_event(
@@ -837,6 +846,7 @@ mod tests {
         max_inflight_assignments: u32,
         supports_assignment_batching: bool,
         assign_delay: Option<Duration>,
+        deadline_support: crate::backend::DeadlineSupport,
     }
 
     impl MockBackend {
@@ -851,6 +861,7 @@ mod tests {
                 max_inflight_assignments: 1,
                 supports_assignment_batching: false,
                 assign_delay: None,
+                deadline_support: crate::backend::DeadlineSupport::Cooperative,
             }
         }
 
@@ -874,6 +885,14 @@ mod tests {
 
         fn with_assign_delay(mut self, assign_delay: Duration) -> Self {
             self.assign_delay = Some(assign_delay);
+            self
+        }
+
+        fn with_deadline_support(
+            mut self,
+            deadline_support: crate::backend::DeadlineSupport,
+        ) -> Self {
+            self.deadline_support = deadline_support;
             self
         }
     }
@@ -949,7 +968,7 @@ mod tests {
                 preferred_allocation_iters_per_lane: self.preferred_allocation_iters_per_lane,
                 preferred_hash_poll_interval: self.preferred_hash_poll_interval,
                 max_inflight_assignments: self.max_inflight_assignments.max(1),
-                deadline_support: crate::backend::DeadlineSupport::Cooperative,
+                deadline_support: self.deadline_support,
                 assignment_semantics: crate::backend::AssignmentSemantics::Replace,
             }
         }
@@ -1386,6 +1405,23 @@ mod tests {
 
         let effective = effective_hash_poll_interval(&backends, Duration::from_millis(200));
         assert_eq!(effective, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn deadline_policy_rejects_best_effort_when_not_allowed() {
+        let state = Arc::new(MockState::default());
+        let backends = vec![slot(
+            1,
+            1,
+            Arc::new(
+                MockBackend::new("nvidia", 1, Arc::clone(&state))
+                    .with_deadline_support(crate::backend::DeadlineSupport::BestEffort),
+            ),
+        )];
+
+        let err = enforce_deadline_policy(&backends, false)
+            .expect_err("best-effort backend should be rejected by default");
+        assert!(format!("{err:#}").contains("--allow-best-effort-deadlines"));
     }
 
     #[derive(Default)]

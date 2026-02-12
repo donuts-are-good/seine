@@ -16,7 +16,7 @@ use crossterm::terminal::is_raw_mode_enabled;
 use crate::api::{
     is_no_wallet_loaded_error, is_unauthorized_error, is_wallet_already_loaded_error, ApiClient,
 };
-use crate::backend::{BackendEvent, MiningSolution};
+use crate::backend::{AssignmentSemantics, BackendEvent, MiningSolution};
 use crate::config::Config;
 use crate::types::{
     decode_hex, parse_target, set_block_nonce, template_difficulty, template_height,
@@ -614,11 +614,16 @@ pub(super) fn run_mining_loop(
         let mut submitted_solution = None;
         let solved_found = round_state.solved.is_some();
         let mut pending_solution = round_state.solved.take();
+        let append_semantics_active = has_append_assignment_semantics(backends);
 
         if cfg.strict_round_accounting {
             let _ =
                 quiesce_backend_slots(backends, RuntimeMode::Mining, cfg.backend_control_timeout)?;
-        } else if should_cancel_relaxed_round(round_state.stale_tip_event, solved_found) {
+        } else if should_cancel_relaxed_round(
+            round_state.stale_tip_event,
+            solved_found,
+            append_semantics_active,
+        ) {
             let _ =
                 cancel_backend_slots(backends, RuntimeMode::Mining, cfg.backend_control_timeout)?;
         }
@@ -743,8 +748,18 @@ pub(super) fn run_mining_loop(
     Ok(())
 }
 
-fn should_cancel_relaxed_round(stale_tip_event: bool, solved_found: bool) -> bool {
-    stale_tip_event || solved_found
+fn should_cancel_relaxed_round(
+    stale_tip_event: bool,
+    solved_found: bool,
+    append_semantics_active: bool,
+) -> bool {
+    stale_tip_event || solved_found || append_semantics_active
+}
+
+fn has_append_assignment_semantics(backends: &[BackendSlot]) -> bool {
+    backends.iter().any(|slot| {
+        super::backend_capabilities(slot).assignment_semantics == AssignmentSemantics::Append
+    })
 }
 
 struct RoundInput<'a> {
@@ -881,6 +896,19 @@ impl<'a> RoundRuntime<'a> {
                 && Instant::now() < input.stop_at
                 && !self.backends.is_empty()
             {
+                if has_append_assignment_semantics(self.backends) {
+                    if cancel_backend_slots(
+                        self.backends,
+                        RuntimeMode::Mining,
+                        self.cfg.backend_control_timeout,
+                    )? == BackendEventAction::TopologyChanged
+                    {
+                        topology_changed = true;
+                        if self.backends.is_empty() {
+                            continue;
+                        }
+                    }
+                }
                 let reservation = self.nonce_scheduler.reserve(total_lanes(self.backends));
                 warn(
                     "BACKEND",
@@ -1524,9 +1552,10 @@ mod tests {
 
     #[test]
     fn relaxed_round_cancel_triggers_on_solved_or_stale_tip() {
-        assert!(should_cancel_relaxed_round(false, true));
-        assert!(should_cancel_relaxed_round(true, false));
-        assert!(!should_cancel_relaxed_round(false, false));
+        assert!(should_cancel_relaxed_round(false, true, false));
+        assert!(should_cancel_relaxed_round(true, false, false));
+        assert!(should_cancel_relaxed_round(false, false, true));
+        assert!(!should_cancel_relaxed_round(false, false, false));
     }
 
     #[test]
