@@ -142,14 +142,16 @@ pub(super) fn dispatch_backend_tasks(
     }
 
     let timeout = timeout.max(Duration::from_millis(1));
-    let expected = tasks
+    let expected_indices = tasks.iter().map(|task| task.idx).collect::<BTreeSet<_>>();
+    let expected = expected_indices.len();
+    let outcomes_len = expected_indices
         .iter()
-        .map(|task| task.idx)
-        .max()
+        .next_back()
+        .copied()
         .unwrap_or(0)
         .saturating_add(1);
     let mut outcomes: Vec<Option<BackendTaskOutcome>> =
-        std::iter::repeat_with(|| None).take(expected).collect();
+        std::iter::repeat_with(|| None).take(outcomes_len).collect();
     let (outcome_tx, outcome_rx) = bounded::<BackendTaskOutcome>(expected.max(1));
 
     for task in tasks {
@@ -198,7 +200,7 @@ pub(super) fn dispatch_backend_tasks(
         match outcome_rx.recv_timeout(deadline.saturating_duration_since(now)) {
             Ok(outcome) => {
                 let outcome_idx = outcome.idx;
-                if outcomes[outcome_idx].is_none() {
+                if expected_indices.contains(&outcome_idx) && outcomes[outcome_idx].is_none() {
                     received = received.saturating_add(1);
                 }
                 outcomes[outcome_idx] = Some(outcome);
@@ -209,7 +211,7 @@ pub(super) fn dispatch_backend_tasks(
     }
     while let Ok(outcome) = outcome_rx.try_recv() {
         let outcome_idx = outcome.idx;
-        if outcomes[outcome_idx].is_none() {
+        if expected_indices.contains(&outcome_idx) && outcomes[outcome_idx].is_none() {
             received = received.saturating_add(1);
         }
         outcomes[outcome_idx] = Some(outcome);
@@ -293,5 +295,82 @@ fn run_backend_call(
     })) {
         Ok(result) => result,
         Err(_) => Err(anyhow!("backend task panicked")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::Sender;
+
+    use crate::backend::{BackendEvent, PowBackend};
+
+    struct NoopBackend;
+
+    impl PowBackend for NoopBackend {
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+
+        fn lanes(&self) -> usize {
+            1
+        }
+
+        fn set_instance_id(&self, _id: BackendInstanceId) {}
+
+        fn set_event_sink(&self, _sink: Sender<BackendEvent>) {}
+
+        fn start(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&self) {}
+
+        fn assign_work(&self, _work: WorkAssignment) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn dispatch_handles_sparse_indices_without_waiting_for_missing_slots() {
+        clear_backend_workers();
+
+        let backend = Arc::new(NoopBackend) as Arc<dyn PowBackend>;
+        let tasks = vec![
+            BackendTask {
+                idx: 0,
+                backend_id: 1,
+                backend: "noop",
+                backend_handle: Arc::clone(&backend),
+                kind: BackendTaskKind::Cancel,
+            },
+            BackendTask {
+                idx: 5,
+                backend_id: 2,
+                backend: "noop",
+                backend_handle: backend,
+                kind: BackendTaskKind::Fence,
+            },
+        ];
+
+        let started = Instant::now();
+        let outcomes = dispatch_backend_tasks(tasks, Duration::from_millis(250));
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "sparse indices should not block waiting for missing outcomes"
+        );
+        assert_eq!(outcomes.len(), 6);
+        assert!(outcomes[0]
+            .as_ref()
+            .is_some_and(|outcome| outcome.result.is_ok()));
+        assert!(outcomes[5]
+            .as_ref()
+            .is_some_and(|outcome| outcome.result.is_ok()));
+        assert!(outcomes[1].is_none());
+        assert!(outcomes[2].is_none());
+        assert!(outcomes[3].is_none());
+        assert!(outcomes[4].is_none());
+
+        clear_backend_workers();
     }
 }
