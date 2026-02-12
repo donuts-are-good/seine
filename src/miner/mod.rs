@@ -2,6 +2,7 @@ mod bench;
 mod mining;
 mod scheduler;
 mod stats;
+mod ui;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +23,7 @@ use crate::backend::{
 use crate::config::{BackendKind, Config};
 use scheduler::NonceReservation;
 use stats::{format_hashrate, Stats};
+use ui::{error, info, startup_banner, warn};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TEMPLATE_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -53,22 +55,42 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
     let cpu_ram_gib =
         (cpu_lanes as f64 * CPU_LANE_MEMORY_BYTES as f64) / (1024.0 * 1024.0 * 1024.0);
 
-    println!(
-        "starting bnminer | backends={} | cpu_lanes={} (~{:.1}GiB RAM) | lanes={} | nonce_iters_per_lane={} | event_queue={} | hash_poll={}ms | accounting={} | api={} | sse={}",
-        backend_names(&backends),
-        cpu_lanes,
-        cpu_ram_gib,
-        total_lanes,
-        cfg.nonce_iters_per_lane,
-        cfg.backend_event_capacity,
-        cfg.hash_poll_interval.as_millis(),
-        if cfg.strict_round_accounting {
-            "strict"
-        } else {
-            "relaxed"
-        },
-        cfg.api_url,
-        if cfg.sse_enabled { "on" } else { "off" }
+    let startup_lines = vec![
+        ("Mode", "mining".to_string()),
+        ("Backends", backend_names(&backends)),
+        (
+            "Lanes",
+            format!(
+                "total={} | cpu={} (~{:.1} GiB RAM)",
+                total_lanes, cpu_lanes, cpu_ram_gib
+            ),
+        ),
+        ("API", cfg.api_url.clone()),
+        (
+            "SSE",
+            if cfg.sse_enabled { "on" } else { "off" }.to_string(),
+        ),
+        ("Refresh", format!("{}s", cfg.refresh_interval.as_secs())),
+        (
+            "Hash Poll",
+            format!("{}ms", cfg.hash_poll_interval.as_millis()),
+        ),
+        ("Event Queue", cfg.backend_event_capacity.to_string()),
+        (
+            "Accounting",
+            if cfg.strict_round_accounting {
+                "strict"
+            } else {
+                "relaxed"
+            }
+            .to_string(),
+        ),
+        ("Nonce Span/Lane", cfg.nonce_iters_per_lane.to_string()),
+    ];
+    startup_banner(
+        "SEINE",
+        "A Seine Net That Catches Blocks",
+        &startup_lines,
     );
 
     let tip_listener = if cfg.sse_enabled {
@@ -127,9 +149,12 @@ fn activate_backends(
             Ok(()) => {
                 let lanes = backend.lanes() as u64;
                 if lanes == 0 {
-                    eprintln!(
-                        "[backend] skipping {}#{}: reported zero lanes",
-                        backend_name, backend_id
+                    warn(
+                        "BACKEND",
+                        format!(
+                            "skipping {}#{}: reported zero lanes",
+                            backend_name, backend_id
+                        ),
                     );
                     backend.stop();
                     continue;
@@ -142,9 +167,9 @@ fn activate_backends(
                 });
             }
             Err(err) => {
-                eprintln!(
-                    "[backend] {}#{} unavailable: {err:#}",
-                    backend_name, backend_id
+                warn(
+                    "BACKEND",
+                    format!("{backend_name}#{backend_id} unavailable: {err:#}"),
                 );
                 backend.stop();
             }
@@ -214,10 +239,13 @@ fn distribute_work(
                 },
             };
             if let Err(err) = slot.backend.assign_work(work) {
-                eprintln!(
-                    "[backend] {}#{} failed work assignment: {err:#}",
-                    slot.backend.name(),
-                    slot.id
+                warn(
+                    "BACKEND",
+                    format!(
+                        "{}#{} failed work assignment: {err:#}",
+                        slot.backend.name(),
+                        slot.id
+                    ),
                 );
                 failed_indices.push(idx);
             }
@@ -232,9 +260,12 @@ fn distribute_work(
             let backend_name = slot.backend.name();
             let backend_id = slot.id;
             slot.backend.stop();
-            eprintln!(
-                "[backend] quarantined {}#{} due to assignment failure",
-                backend_name, backend_id
+            warn(
+                "BACKEND",
+                format!(
+                    "quarantined {}#{} due to assignment failure",
+                    backend_name, backend_id
+                ),
             );
         }
 
@@ -243,9 +274,12 @@ fn distribute_work(
         }
 
         recalculate_lane_offsets(backends);
-        eprintln!(
-            "[backend] retrying work assignment with remaining={}",
-            backend_names(backends)
+        warn(
+            "BACKEND",
+            format!(
+                "retrying work assignment with remaining={}",
+                backend_names(backends)
+            ),
         );
     }
 }
@@ -333,9 +367,12 @@ fn handle_runtime_backend_event(
                         return Ok((RuntimeBackendEventAction::None, Some(solution)));
                     }
                     RuntimeMode::Bench => {
-                        println!(
-                            "[bench] unexpected solution found by {}#{} at nonce={}",
-                            solution.backend, solution.backend_id, solution.nonce
+                        info(
+                            "BENCH",
+                            format!(
+                                "unexpected solution from {}#{} at nonce={}",
+                                solution.backend, solution.backend_id, solution.nonce
+                            ),
                         );
                     }
                 }
@@ -349,10 +386,16 @@ fn handle_runtime_backend_event(
         } => {
             match mode {
                 RuntimeMode::Mining => {
-                    eprintln!("[backend] {backend}#{backend_id} runtime error: {message}");
+                    error(
+                        "BACKEND",
+                        format!("{backend}#{backend_id} runtime error: {message}"),
+                    );
                 }
                 RuntimeMode::Bench => {
-                    eprintln!("[bench] backend '{backend}#{backend_id}' runtime error: {message}");
+                    error(
+                        "BENCH",
+                        format!("backend '{backend}#{backend_id}' runtime error: {message}"),
+                    );
                 }
             }
 
@@ -375,23 +418,30 @@ fn handle_runtime_backend_event(
 
                 match mode {
                     RuntimeMode::Mining => {
-                        eprintln!(
-                            "[backend] quarantined {backend}#{backend_id}; continuing with {}",
-                            backend_names(backends)
+                        warn(
+                            "BACKEND",
+                            format!(
+                                "quarantined {backend}#{backend_id}; continuing with {}",
+                                backend_names(backends)
+                            ),
                         );
                     }
                     RuntimeMode::Bench => {
-                        eprintln!(
-                            "[bench] quarantined {backend}#{backend_id}; remaining backends={}",
-                            backend_names(backends)
+                        warn(
+                            "BENCH",
+                            format!(
+                                "quarantined {backend}#{backend_id}; remaining backends={}",
+                                backend_names(backends)
+                            ),
                         );
                     }
                 }
                 Ok((RuntimeBackendEventAction::TopologyChanged, None))
             } else {
                 if mode == RuntimeMode::Mining {
-                    eprintln!(
-                        "[backend] ignoring error from unavailable backend '{backend}#{backend_id}'"
+                    warn(
+                        "BACKEND",
+                        format!("ignoring error from unavailable backend '{backend}#{backend_id}'"),
                     );
                 }
                 Ok((RuntimeBackendEventAction::None, None))

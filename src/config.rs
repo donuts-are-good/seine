@@ -27,7 +27,7 @@ pub enum CpuAffinityMode {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "bnminer", version, about = "External Blocknet miner")]
+#[command(name = "seine", version, about = "Seine net miner for Blocknet")]
 struct Cli {
     /// API base URL for the blocknet daemon.
     #[arg(long = "api-url", default_value = "http://127.0.0.1:8332")]
@@ -359,7 +359,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be >= unix epoch")
             .as_nanos();
-        dir.push(format!("bnminer-test-{}-{}", std::process::id(), now));
+        dir.push(format!("seine-test-{}-{}", std::process::id(), now));
         dir
     }
 

@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use super::ui::info;
+
 pub struct Stats {
     started_at: Instant,
     hashes: AtomicU64,
@@ -46,14 +48,17 @@ impl Stats {
         let accepted = self.accepted.load(Ordering::Relaxed);
         let hps = hashes as f64 / elapsed;
 
-        println!(
-            "[stats] {:.1}s elapsed | {} hashes | {} | templates={} submitted={} accepted={}",
-            elapsed,
-            hashes,
-            format_hashrate(hps),
-            templates,
-            submitted,
-            accepted,
+        info(
+            "STATS",
+            format!(
+                "{:.1}s elapsed | {} hashes | {} | templates={} submitted={} accepted={}",
+                elapsed,
+                hashes,
+                format_hashrate(hps),
+                templates,
+                submitted,
+                accepted,
+            ),
         );
     }
 }

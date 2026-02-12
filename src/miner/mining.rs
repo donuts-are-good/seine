@@ -22,6 +22,7 @@ use crate::types::{
 
 use super::scheduler::NonceScheduler;
 use super::stats::Stats;
+use super::ui::{error, info, success, warn};
 use super::{
     collect_backend_hashes, distribute_work, format_round_backend_hashrate, next_event_wait,
     next_work_id, quiesce_backend_slots, total_lanes, BackendSlot, RuntimeBackendEventAction,
@@ -134,7 +135,7 @@ impl WalletPasswordSource {
         match self {
             Self::CliFlag => "--wallet-password",
             Self::PasswordFile => "--wallet-password-file",
-            Self::Environment => "BNMINER_WALLET_PASSWORD",
+            Self::Environment => "SEINE_WALLET_PASSWORD",
             Self::Prompt => "terminal prompt",
         }
     }
@@ -159,7 +160,7 @@ pub(super) fn run_mining_loop(
         Some(t) => t,
         None => {
             stats.print();
-            println!("bnminer stopped");
+            info("MINER", "stopped");
             return Ok(());
         }
     };
@@ -172,7 +173,7 @@ pub(super) fn run_mining_loop(
         let header_base = match decode_hex(&template.header_base, "header_base") {
             Ok(v) => v,
             Err(err) => {
-                eprintln!("template decode error: {err:#}");
+                warn("TEMPLATE", format!("decode error: {err:#}"));
                 if !sleep_with_shutdown(shutdown.as_ref(), TEMPLATE_RETRY_DELAY) {
                     break;
                 }
@@ -187,10 +188,13 @@ pub(super) fn run_mining_loop(
         };
 
         if header_base.len() != POW_HEADER_BASE_LEN {
-            eprintln!(
-                "template header_base length mismatch: expected {} bytes, got {}",
-                POW_HEADER_BASE_LEN,
-                header_base.len()
+            warn(
+                "TEMPLATE",
+                format!(
+                    "header_base length mismatch: expected {} bytes, got {}",
+                    POW_HEADER_BASE_LEN,
+                    header_base.len()
+                ),
             );
             if !sleep_with_shutdown(shutdown.as_ref(), TEMPLATE_RETRY_DELAY) {
                 break;
@@ -206,7 +210,7 @@ pub(super) fn run_mining_loop(
         let target = match parse_target(&template.target) {
             Ok(t) => t,
             Err(err) => {
-                eprintln!("target parse error: {err:#}");
+                warn("TEMPLATE", format!("target parse error: {err:#}"));
                 if !sleep_with_shutdown(shutdown.as_ref(), TEMPLATE_RETRY_DELAY) {
                     break;
                 }
@@ -241,14 +245,17 @@ pub(super) fn run_mining_loop(
 
         stats.bump_templates();
 
-        println!(
-            "[template] height={} difficulty={} epoch={} work_id={} nonce_seed={} refresh={}s",
-            height,
-            difficulty,
-            epoch,
-            work_id,
-            reservation.start_nonce,
-            cfg.refresh_interval.as_secs(),
+        info(
+            "WORK",
+            format!(
+                "template height={} difficulty={} epoch={} work_id={} nonce_seed={} refresh={}s",
+                height,
+                difficulty,
+                epoch,
+                work_id,
+                reservation.start_nonce,
+                cfg.refresh_interval.as_secs(),
+            ),
         );
 
         distribute_work(
@@ -329,12 +336,15 @@ pub(super) fn run_mining_loop(
                 && !backends.is_empty()
             {
                 let reservation = nonce_scheduler.reserve(total_lanes(backends));
-                eprintln!(
-                    "[backend] topology changed; redistributing work epoch={} work_id={} nonce_seed={} backends={}",
-                    epoch,
-                    work_id,
-                    reservation.start_nonce,
-                    super::backend_names(backends),
+                warn(
+                    "BACKEND",
+                    format!(
+                        "topology changed; redistributing epoch={} work_id={} nonce_seed={} backends={}",
+                        epoch,
+                        work_id,
+                        reservation.start_nonce,
+                        super::backend_names(backends),
+                    ),
                 );
                 distribute_work(
                     backends,
@@ -361,22 +371,28 @@ pub(super) fn run_mining_loop(
             Some(&mut round_backend_hashes),
         );
         stale_tip_event |= tip_signal.is_some_and(TipSignal::take_stale);
-        println!(
-            "[template] backend_throughput {}",
-            format_round_backend_hashrate(
-                backends,
-                &round_backend_hashes,
-                round_start.elapsed().as_secs_f64()
-            )
+        info(
+            "WORK",
+            format!(
+                "backend throughput {}",
+                format_round_backend_hashrate(
+                    backends,
+                    &round_backend_hashes,
+                    round_start.elapsed().as_secs_f64()
+                )
+            ),
         );
 
         if let Some(solution) = solved {
-            println!(
-                "[solution] backend={}#{} nonce={} elapsed={:.2}s",
-                solution.backend,
-                solution.backend_id,
-                solution.nonce,
-                round_start.elapsed().as_secs_f64(),
+            success(
+                "SOLVE",
+                format!(
+                    "backend={}#{} nonce={} elapsed={:.2}s",
+                    solution.backend,
+                    solution.backend_id,
+                    solution.nonce,
+                    round_start.elapsed().as_secs_f64(),
+                ),
             );
 
             let template_id = template.template_id.clone();
@@ -389,25 +405,28 @@ pub(super) fn run_mining_loop(
                 Ok(resp) => {
                     if resp.accepted {
                         stats.bump_accepted();
-                        println!(
-                            "[submit] accepted=true height={} hash={}",
-                            resp.height
-                                .map(|h| h.to_string())
-                                .unwrap_or_else(|| "unknown".to_string()),
-                            resp.hash.unwrap_or_else(|| "unknown".to_string())
+                        success(
+                            "SUBMIT",
+                            format!(
+                                "accepted height={} hash={}",
+                                resp.height
+                                    .map(|h| h.to_string())
+                                    .unwrap_or_else(|| "unknown".to_string()),
+                                resp.hash.unwrap_or_else(|| "unknown".to_string())
+                            ),
                         );
                     } else {
-                        println!("[submit] accepted=false");
+                        warn("SUBMIT", "rejected by daemon");
                     }
                 }
                 Err(err) => {
-                    eprintln!("submit failed: {err:#}");
+                    error("SUBMIT", format!("submit failed: {err:#}"));
                 }
             }
         } else if stale_tip_event {
-            println!("[template] stale tip event received; refreshing template immediately");
+            info("WORK", "stale tip event received; refreshing template");
         } else {
-            println!("[template] no solution before refresh or shutdown");
+            info("WORK", "no solution before refresh/shutdown");
         }
 
         if last_stats_print.elapsed() >= cfg.stats_interval {
@@ -431,7 +450,7 @@ pub(super) fn run_mining_loop(
     }
 
     stats.print();
-    println!("bnminer stopped");
+    info("MINER", "stopped");
     Ok(())
 }
 
@@ -450,7 +469,7 @@ impl TemplatePrefetch {
         match self.handle.join() {
             Ok(template) => template,
             Err(_) => {
-                eprintln!("template prefetch thread panicked");
+                error("TEMPLATE", "prefetch thread panicked");
                 None
             }
         }
@@ -514,13 +533,13 @@ pub(super) fn spawn_tip_listener(client: ApiClient, shutdown: Arc<AtomicBool>) -
                 Ok(resp) => {
                     if let Err(err) = stream_tip_events(resp, &signal, &shutdown) {
                         if !shutdown.load(Ordering::Relaxed) && !is_stream_timeout_error(&err) {
-                            eprintln!("events stream dropped: {err:#}");
+                            warn("EVENTS", format!("stream dropped: {err:#}"));
                         }
                     }
                 }
                 Err(err) => {
                     if !shutdown.load(Ordering::Relaxed) && !is_stream_timeout_error(&err) {
-                        eprintln!("failed to open events stream: {err:#}");
+                        warn("EVENTS", format!("failed to open stream: {err:#}"));
                     }
                 }
             }
@@ -625,25 +644,30 @@ fn fetch_template_with_retry(
         match client.get_block_template() {
             Ok(template) => return Some(template),
             Err(err) if is_no_wallet_loaded_error(&err) => {
-                eprintln!(
-                    "[wallet] blocktemplate requires a loaded wallet; attempting automatic wallet load"
+                warn(
+                    "WALLET",
+                    "blocktemplate requires loaded wallet; attempting automatic load",
                 );
                 match auto_load_wallet(client, cfg, shutdown) {
                     Ok(true) => continue,
                     Ok(false) => {
-                        eprintln!(
-                            "[wallet] unable to load wallet automatically. Provide --wallet-password, --wallet-password-file, BNMINER_WALLET_PASSWORD, or run bnminer in a terminal for prompt-based loading."
+                        warn(
+                            "WALLET",
+                            "unable to auto-load wallet; use --wallet-password, --wallet-password-file, SEINE_WALLET_PASSWORD, or interactive prompt",
                         );
                         return None;
                     }
                     Err(load_err) => {
-                        eprintln!("[wallet] automatic wallet load failed: {load_err:#}");
+                        error(
+                            "WALLET",
+                            format!("automatic wallet load failed: {load_err:#}"),
+                        );
                         return None;
                     }
                 }
             }
             Err(err) => {
-                eprintln!("blocktemplate request failed: {err:#}");
+                warn("NETWORK", format!("blocktemplate request failed: {err:#}"));
                 if !sleep_with_shutdown(shutdown, TEMPLATE_RETRY_DELAY) {
                     break;
                 }
@@ -684,12 +708,12 @@ fn auto_load_wallet(client: &ApiClient, cfg: &Config, shutdown: &AtomicBool) -> 
 
         match client.load_wallet(&password) {
             Ok(()) => {
-                println!("[wallet] loaded wallet via {}", source.as_str());
+                success("WALLET", format!("loaded via {}", source.as_str()));
                 password.clear();
                 return Ok(true);
             }
             Err(err) if is_wallet_already_loaded_error(&err) => {
-                println!("[wallet] wallet already loaded");
+                info("WALLET", "already loaded");
                 password.clear();
                 return Ok(true);
             }
@@ -697,7 +721,7 @@ fn auto_load_wallet(client: &ApiClient, cfg: &Config, shutdown: &AtomicBool) -> 
                 if source == WalletPasswordSource::Prompt
                     && prompt_attempt < MAX_PROMPT_ATTEMPTS =>
             {
-                eprintln!("[wallet] load failed: {err:#}");
+                warn("WALLET", format!("load failed: {err:#}"));
                 prompt_attempt += 1;
                 let Some(next_password) = prompt_wallet_password()? else {
                     return Ok(false);
@@ -730,6 +754,12 @@ fn resolve_wallet_password(cfg: &Config) -> Result<Option<(String, WalletPasswor
             bail!("wallet password file is empty: {}", path.display());
         }
         return Ok(Some((password, WalletPasswordSource::PasswordFile)));
+    }
+
+    if let Ok(password) = env::var("SEINE_WALLET_PASSWORD") {
+        if !password.is_empty() {
+            return Ok(Some((password, WalletPasswordSource::Environment)));
+        }
     }
 
     if let Ok(password) = env::var("BNMINER_WALLET_PASSWORD") {

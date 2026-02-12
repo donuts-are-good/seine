@@ -14,6 +14,7 @@ use crate::config::{BenchKind, Config};
 
 use super::scheduler::NonceScheduler;
 use super::stats::{format_hashrate, median};
+use super::ui::{info, startup_banner, success, warn};
 use super::{
     activate_backends, backend_name_list, backend_names, collect_backend_hashes, distribute_work,
     format_round_backend_hashrate, next_work_id, quiesce_backend_slots, start_backend_slots,
@@ -61,7 +62,8 @@ struct BenchReport {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct BenchEnvironment {
     timestamp_unix_secs: u64,
-    bnminer_version: String,
+    #[serde(alias = "bnminer_version")]
+    seine_version: String,
     git_commit: Option<String>,
     target_triple: String,
     hostname: Option<String>,
@@ -103,12 +105,14 @@ fn run_kernel_benchmark(
         bail!("kernel benchmark requires exactly one backend");
     }
 
-    println!(
-        "benchmark mode | kind=kernel | backend={} | rounds={} | seconds_per_round={}",
-        backend.name(),
-        cfg.bench_rounds,
-        cfg.bench_secs
-    );
+    let lines = vec![
+        ("Mode", "benchmark".to_string()),
+        ("Kind", "kernel".to_string()),
+        ("Backend", backend.name().to_string()),
+        ("Rounds", cfg.bench_rounds.to_string()),
+        ("Seconds/Round", cfg.bench_secs.to_string()),
+    ];
+    startup_banner("SEINE", "Seine Net Benchmark", &lines);
 
     let mut runs = Vec::with_capacity(cfg.bench_rounds as usize);
     let environment = benchmark_environment();
@@ -122,13 +126,16 @@ fn run_kernel_benchmark(
         let elapsed = round_start.elapsed().as_secs_f64().max(0.001);
         let hps = hashes as f64 / elapsed;
 
-        println!(
-            "[bench] round {}/{} | hashes={} | elapsed={:.2}s | {}",
-            round + 1,
-            cfg.bench_rounds,
-            hashes,
-            elapsed,
-            format_hashrate(hps),
+        info(
+            "BENCH",
+            format!(
+                "round {}/{} | hashes={} | elapsed={:.2}s | {}",
+                round + 1,
+                cfg.bench_rounds,
+                hashes,
+                elapsed,
+                format_hashrate(hps),
+            ),
         );
 
         runs.push(BenchRun {
@@ -173,20 +180,29 @@ fn run_worker_benchmark(
         "backend"
     };
 
-    println!(
-        "benchmark mode | kind={} | backends={} | lanes={} | rounds={} | seconds_per_round={} | hash_poll={}ms | accounting={} | measurement_fence=on",
-        bench_kind,
-        backend_names(&backends),
-        total_lanes(&backends),
-        cfg.bench_rounds,
-        cfg.bench_secs,
-        cfg.hash_poll_interval.as_millis(),
-        if cfg.strict_round_accounting {
-            "strict"
-        } else {
-            "relaxed"
-        }
-    );
+    let lines = vec![
+        ("Mode", "benchmark".to_string()),
+        ("Kind", bench_kind.to_string()),
+        ("Backends", backend_names(&backends)),
+        ("Lanes", total_lanes(&backends).to_string()),
+        ("Rounds", cfg.bench_rounds.to_string()),
+        ("Seconds/Round", cfg.bench_secs.to_string()),
+        (
+            "Hash Poll",
+            format!("{}ms", cfg.hash_poll_interval.as_millis()),
+        ),
+        (
+            "Accounting",
+            if cfg.strict_round_accounting {
+                "strict"
+            } else {
+                "relaxed"
+            }
+            .to_string(),
+        ),
+        ("Measurement", "counted window + end fence".to_string()),
+    ];
+    startup_banner("SEINE", "Seine Net Benchmark", &lines);
 
     if restart_each_round {
         stop_backend_slots(&mut backends);
@@ -285,12 +301,15 @@ fn run_worker_benchmark_inner(
                 && !backends.is_empty()
             {
                 let reservation = scheduler.reserve(total_lanes(backends));
-                eprintln!(
-                    "[bench] topology changed; redistributing work epoch={} work_id={} nonce_seed={} backends={}",
-                    epoch,
-                    work_id,
-                    reservation.start_nonce,
-                    backend_names(backends),
+                warn(
+                    "BENCH",
+                    format!(
+                        "topology changed; redistributing epoch={} work_id={} nonce_seed={} backends={}",
+                        epoch,
+                        work_id,
+                        reservation.start_nonce,
+                        backend_names(backends),
+                    ),
                 );
                 distribute_work(
                     backends,
@@ -326,15 +345,18 @@ fn run_worker_benchmark_inner(
         let backend_runs =
             build_backend_round_stats(backends, &round_backend_hashes, counted_elapsed);
 
-        println!(
-            "[bench] round {}/{} | hashes={} | counted={:.2}s | fence={:.3}s | {} | per_backend={}",
-            round + 1,
-            cfg.bench_rounds,
-            round_hashes,
-            counted_elapsed,
-            fence_elapsed,
-            format_hashrate(hps),
-            format_round_backend_hashrate(backends, &round_backend_hashes, counted_elapsed),
+        info(
+            "BENCH",
+            format!(
+                "round {}/{} | hashes={} | counted={:.2}s | fence={:.3}s | {} | per_backend={}",
+                round + 1,
+                cfg.bench_rounds,
+                round_hashes,
+                counted_elapsed,
+                fence_elapsed,
+                format_hashrate(hps),
+                format_round_backend_hashrate(backends, &round_backend_hashes, counted_elapsed),
+            ),
         );
 
         runs.push(BenchRun {
@@ -376,7 +398,7 @@ fn run_worker_benchmark_inner(
 
 fn summarize_benchmark(cfg: &Config, mut report: BenchReport) -> Result<()> {
     if report.runs.is_empty() {
-        println!("benchmark aborted before first round");
+        warn("BENCH", "aborted before first round");
         return Ok(());
     }
 
@@ -388,12 +410,15 @@ fn summarize_benchmark(cfg: &Config, mut report: BenchReport) -> Result<()> {
     report.min_hps = *sorted_hps.first().unwrap_or(&0.0);
     report.max_hps = *sorted_hps.last().unwrap_or(&0.0);
 
-    println!(
-        "[bench] summary | avg={} | median={} | min={} | max={}",
-        format_hashrate(report.avg_hps),
-        format_hashrate(report.median_hps),
-        format_hashrate(report.min_hps),
-        format_hashrate(report.max_hps),
+    success(
+        "BENCH",
+        format!(
+            "summary | avg={} | median={} | min={} | max={}",
+            format_hashrate(report.avg_hps),
+            format_hashrate(report.median_hps),
+            format_hashrate(report.min_hps),
+            format_hashrate(report.max_hps),
+        ),
     );
 
     if let Some(path) = &cfg.bench_baseline {
@@ -403,10 +428,13 @@ fn summarize_benchmark(cfg: &Config, mut report: BenchReport) -> Result<()> {
             .with_context(|| format!("failed to parse baseline JSON {}", path.display()))?;
         if baseline.avg_hps > 0.0 {
             let delta_pct = ((report.avg_hps - baseline.avg_hps) / baseline.avg_hps) * 100.0;
-            println!(
-                "[bench] baseline compare | baseline_avg={} | delta={:+.2}%",
-                format_hashrate(baseline.avg_hps),
-                delta_pct
+            info(
+                "BENCH",
+                format!(
+                    "baseline compare | baseline_avg={} | delta={:+.2}%",
+                    format_hashrate(baseline.avg_hps),
+                    delta_pct
+                ),
             );
         }
     }
@@ -416,7 +444,7 @@ fn summarize_benchmark(cfg: &Config, mut report: BenchReport) -> Result<()> {
             .context("failed to serialize benchmark report")?;
         std::fs::write(path, json)
             .with_context(|| format!("failed to write benchmark report {}", path.display()))?;
-        println!("[bench] wrote report to {}", path.display());
+        success("BENCH", format!("wrote report to {}", path.display()));
     }
 
     Ok(())
@@ -444,9 +472,11 @@ fn benchmark_environment() -> BenchEnvironment {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
-        bnminer_version: env!("CARGO_PKG_VERSION").to_string(),
-        git_commit: std::env::var("BNMINER_GIT_COMMIT")
+        seine_version: env!("CARGO_PKG_VERSION").to_string(),
+        git_commit: std::env::var("SEINE_GIT_COMMIT")
             .ok()
+            .or_else(|| std::env::var("BNMINER_GIT_COMMIT").ok())
+            .or_else(|| option_env!("SEINE_GIT_COMMIT").map(str::to_string))
             .or_else(|| option_env!("BNMINER_GIT_COMMIT").map(str::to_string)),
         target_triple: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
         hostname: System::host_name(),
