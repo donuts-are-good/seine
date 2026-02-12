@@ -80,7 +80,19 @@ impl TipSignal {
 
         let mut changed = false;
         if let Ok(mut last_event) = self.last_new_block.lock() {
-            if !matches!(
+            let same_height = matches!(
+                (last_event.as_ref().and_then(|last| last.height), event_height),
+                (Some(last_height), Some(height)) if last_height == height
+            );
+            if same_height {
+                // Daemon-side event streams can replay competing hashes at the same height.
+                // Treat those as one refresh hint and rely on periodic template refresh for
+                // any subsequent same-height churn.
+                *last_event = Some(LastNewBlock {
+                    hash: hash.to_string(),
+                    height: event_height,
+                });
+            } else if !matches!(
                 last_event.as_ref(),
                 Some(last) if last.hash == hash && last.height == event_height
             ) {
@@ -1136,5 +1148,27 @@ mod tests {
             &signal,
         );
         assert!(signal.take_stale());
+    }
+
+    #[test]
+    fn same_height_hash_change_is_coalesced() {
+        let signal = TipSignal::new();
+        let mut event_name = String::new();
+
+        process_sse_line("event: new_block", &mut event_name, &signal);
+        process_sse_line(
+            "data: {\"hash\":\"abc\",\"height\":1782}",
+            &mut event_name,
+            &signal,
+        );
+        assert!(signal.take_stale());
+
+        process_sse_line("event: new_block", &mut event_name, &signal);
+        process_sse_line(
+            "data: {\"hash\":\"def\",\"height\":1782}",
+            &mut event_name,
+            &signal,
+        );
+        assert!(!signal.take_stale());
     }
 }
