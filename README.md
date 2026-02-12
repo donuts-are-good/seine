@@ -71,13 +71,17 @@ Run headless/plain logs (no fullscreen TUI):
 - If `/api/mining/blocktemplate` reports `no wallet loaded`, the miner automatically calls `/api/wallet/load` and retries.
 - The miner listens to `/api/events` and refreshes work immediately on `new_block` events (disable with `--disable-sse`).
   - SSE events with heights older than the current template tip are ignored to avoid historical replay storms.
+  - Same-height competing hash events are coalesced by default; pass `--refresh-on-same-height` for aggressive tip freshness.
 - Runtime tuning knobs for performance iteration:
   - `--backend-event-capacity` (default `1024`) controls bounded backend event queue size.
   - `--hash-poll-ms` (default `200`) controls backend hash counter polling cadence.
   - `--stats-secs` (default `10`) controls periodic stats log emission cadence.
+  - `--request-timeout-secs` (default `10`) controls JSON API request timeout for template/submit/wallet calls.
+  - `--events-stream-timeout-secs` (default `10`) controls SSE stream connection timeout per attempt.
   - `--cpu-affinity` (`auto` or `off`) controls CPU worker pinning policy for better repeatability on NUMA/SMT hosts.
   - `--ui` (`auto`, `tui`, `plain`) controls rendering mode. `auto` enables TUI only when stdout/stderr are terminals.
   - `--relaxed-accounting` disables per-round quiesce barriers (higher throughput, less exact round accounting).
+  - `--refresh-on-same-height` forces immediate refresh on same-height `new_block` hash changes.
 - A backend runtime fault quarantines only that backend; mining continues on remaining active backends when possible.
 - This miner is intentionally external so consensus-critical validation remains in the daemon.
 - Nonce space is reserved deterministically per epoch via `--nonce-iters-per-lane` (default `2^36` iterations per lane), avoiding overlap between refresh rounds without relying on sampled hash counters.

@@ -86,6 +86,14 @@ struct Cli {
     #[arg(long, default_value_t = 20)]
     refresh_secs: u64,
 
+    /// Timeout for JSON API requests (blocktemplate/submitblock/wallet/load), in seconds.
+    #[arg(long, default_value_t = 10)]
+    request_timeout_secs: u64,
+
+    /// Timeout for each SSE stream connection attempt, in seconds.
+    #[arg(long, default_value_t = 10)]
+    events_stream_timeout_secs: u64,
+
     /// Interval for periodic stats printing.
     #[arg(long, default_value_t = 10)]
     stats_secs: u64,
@@ -113,6 +121,10 @@ struct Cli {
     /// Disable SSE tip notifications (/api/events) and rely only on refresh timer.
     #[arg(long, action = ArgAction::SetTrue)]
     disable_sse: bool,
+
+    /// Refresh on same-height new_block hash changes (disabled by default to avoid replay churn).
+    #[arg(long, action = ArgAction::SetTrue)]
+    refresh_on_same_height: bool,
 
     /// UI mode: auto (TTY-detected), tui (force full-screen TUI), plain (stdout logs only).
     #[arg(long, value_enum, default_value_t = UiMode::Auto)]
@@ -153,6 +165,8 @@ pub struct Config {
     pub threads: usize,
     pub cpu_affinity: CpuAffinityMode,
     pub refresh_interval: Duration,
+    pub request_timeout: Duration,
+    pub events_stream_timeout: Duration,
     pub stats_interval: Duration,
     pub backend_event_capacity: usize,
     pub hash_poll_interval: Duration,
@@ -160,6 +174,7 @@ pub struct Config {
     pub start_nonce: u64,
     pub nonce_iters_per_lane: u64,
     pub sse_enabled: bool,
+    pub refresh_on_same_height: bool,
     pub ui_mode: UiMode,
     pub bench: bool,
     pub bench_kind: BenchKind,
@@ -208,6 +223,8 @@ impl Config {
             threads: cli.threads,
             cpu_affinity: cli.cpu_affinity,
             refresh_interval: Duration::from_secs(cli.refresh_secs.max(1)),
+            request_timeout: Duration::from_secs(cli.request_timeout_secs.max(1)),
+            events_stream_timeout: Duration::from_secs(cli.events_stream_timeout_secs.max(1)),
             stats_interval: Duration::from_secs(cli.stats_secs.max(1)),
             backend_event_capacity: cli.backend_event_capacity,
             hash_poll_interval: Duration::from_millis(cli.hash_poll_ms),
@@ -215,6 +232,7 @@ impl Config {
             start_nonce: cli.start_nonce.unwrap_or_else(default_nonce_seed),
             nonce_iters_per_lane: cli.nonce_iters_per_lane,
             sse_enabled: !cli.disable_sse,
+            refresh_on_same_height: cli.refresh_on_same_height,
             ui_mode: cli.ui,
             bench: cli.bench,
             bench_kind: cli.bench_kind,
@@ -389,6 +407,8 @@ mod tests {
             cpu_affinity: CpuAffinityMode::Auto,
             allow_oversubscribe: false,
             refresh_secs: 20,
+            request_timeout_secs: 10,
+            events_stream_timeout_secs: 10,
             stats_secs: 10,
             backend_event_capacity: 1024,
             hash_poll_ms: 200,
@@ -396,6 +416,7 @@ mod tests {
             start_nonce: None,
             nonce_iters_per_lane: 1u64 << 36,
             disable_sse: false,
+            refresh_on_same_height: false,
             ui: UiMode::Auto,
             bench: false,
             bench_kind: BenchKind::Backend,

@@ -10,8 +10,6 @@ use serde_json::Value;
 
 use crate::types::{BlockTemplateResponse, SubmitBlockResponse};
 
-const EVENTS_STREAM_TIMEOUT: Duration = Duration::from_secs(45);
-
 #[derive(Debug, Serialize)]
 struct CompactSubmitPayload<'a> {
     template_id: &'a str,
@@ -61,10 +59,16 @@ pub struct ApiClient {
     json_client: Client,
     stream_client: Client,
     base_url: String,
+    events_stream_timeout: Duration,
 }
 
 impl ApiClient {
-    pub fn new(base_url: String, token: String, timeout: Duration) -> Result<Self> {
+    pub fn new(
+        base_url: String,
+        token: String,
+        timeout: Duration,
+        events_stream_timeout: Duration,
+    ) -> Result<Self> {
         let mut headers = HeaderMap::new();
 
         let auth_value = format!("Bearer {token}");
@@ -91,6 +95,7 @@ impl ApiClient {
             json_client,
             stream_client,
             base_url,
+            events_stream_timeout,
         })
     }
 
@@ -143,7 +148,7 @@ impl ApiClient {
         let url = format!("{}/api/events", self.base_url);
         self.stream_client
             .get(url)
-            .timeout(EVENTS_STREAM_TIMEOUT)
+            .timeout(self.events_stream_timeout)
             .send()
             .context("request to events endpoint failed")
     }
@@ -204,8 +209,13 @@ mod tests {
 
     fn test_client(server: &MockServer) -> ApiClient {
         let base = server.url("").trim_end_matches('/').to_string();
-        ApiClient::new(base, "testtoken".to_string(), Duration::from_secs(5))
-            .expect("test client should be created")
+        ApiClient::new(
+            base,
+            "testtoken".to_string(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .expect("test client should be created")
     }
 
     #[test]

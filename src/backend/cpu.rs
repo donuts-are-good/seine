@@ -18,6 +18,7 @@ use crate::types::hash_meets_target;
 const HASH_BATCH_SIZE: u64 = 64;
 const HASH_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 const SOLUTION_SEND_TIMEOUT: Duration = Duration::from_millis(10);
+const ERROR_SEND_TIMEOUT: Duration = Duration::from_millis(50);
 const SOLVED_MASK: u64 = 1u64 << 63;
 
 struct ControlState {
@@ -462,11 +463,10 @@ fn wait_for_idle(shared: &Shared) -> Result<()> {
         .lock()
         .map_err(|_| anyhow!("CPU idle lock poisoned"))?;
     while shared.active_workers.load(Ordering::Acquire) != 0 {
-        let (next_guard, _) = shared
+        idle_guard = shared
             .idle_cv
-            .wait_timeout(idle_guard, Duration::from_millis(10))
+            .wait(idle_guard)
             .map_err(|_| anyhow!("CPU idle lock poisoned"))?;
-        idle_guard = next_guard;
     }
     Ok(())
 }
@@ -551,11 +551,18 @@ fn emit_event(shared: &Shared, event: BackendEvent) {
                 backend,
                 message,
             } => {
-                let _ = tx.try_send(BackendEvent::Error {
+                let event = BackendEvent::Error {
                     backend_id,
                     backend,
                     message,
-                });
+                };
+                match tx.try_send(event) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(event)) => {
+                        let _ = tx.send_timeout(event, ERROR_SEND_TIMEOUT);
+                    }
+                    Err(TrySendError::Disconnected(_)) => {}
+                }
             }
         }
     }

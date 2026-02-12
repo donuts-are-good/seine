@@ -157,7 +157,12 @@ impl TuiStateInner {
         } else if secs < 3600 {
             format!("{}m {:02}s", secs / 60, secs % 60)
         } else {
-            format!("{}h {:02}m {:02}s", secs / 3600, (secs % 3600) / 60, secs % 60)
+            format!(
+                "{}h {:02}m {:02}s",
+                secs / 3600,
+                (secs % 3600) / 60,
+                secs % 60
+            )
         }
     }
 }
@@ -194,9 +199,7 @@ impl TuiRenderer {
     pub fn poll_quit(&self) -> bool {
         if event::poll(std::time::Duration::ZERO).unwrap_or(false) {
             if let Ok(Event::Key(key)) = event::read() {
-                if key.code == KeyCode::Char('c')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                {
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     return true;
                 }
                 if key.code == KeyCode::Char('q') {
@@ -308,7 +311,14 @@ fn wave_lines(width: usize, tick: u64, block_ticks: &[u64]) -> Vec<Line<'static>
         .collect();
 
     vec![
-        wave_row(width, tick as usize, &upper, CREST_COLOR, &block_cols, BLOCK_COLOR),
+        wave_row(
+            width,
+            tick as usize,
+            &upper,
+            CREST_COLOR,
+            &block_cols,
+            BLOCK_COLOR,
+        ),
         wave_row(width, tick as usize, &lower, WAVE_COLOR, &[], BLOCK_COLOR),
     ]
 }
@@ -338,10 +348,7 @@ fn wave_row(
             if ch == ' ' {
                 spans.push(Span::raw(" "));
             } else {
-                spans.push(Span::styled(
-                    ch.to_string(),
-                    Style::default().fg(color),
-                ));
+                spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
             }
         }
     }
@@ -397,7 +404,9 @@ fn draw_stats_wide(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner
             Span::styled("  State      ".to_string(), LABEL_STYLE),
             Span::styled(
                 state.state.clone(),
-                Style::default().fg(state_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(state_color)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
     ];
@@ -446,7 +455,10 @@ fn draw_stats_narrow(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInn
         .title(Span::styled(" HASHRATE ", TITLE_STYLE))
         .borders(Borders::ALL)
         .border_style(BORDER_STYLE);
-    frame.render_widget(Paragraph::new(hashrate_lines).block(hashrate_block), rows[0]);
+    frame.render_widget(
+        Paragraph::new(hashrate_lines).block(hashrate_block),
+        rows[0],
+    );
 
     // Network
     let epoch_str = state.epoch.to_string();
@@ -518,10 +530,7 @@ fn draw_log(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner) {
         .iter()
         .skip(start)
         .map(|entry| {
-            let time = Span::styled(
-                format!("{:>6.0}s ", entry.elapsed_secs),
-                DIM_STYLE,
-            );
+            let time = Span::styled(format!("{:>6.0}s ", entry.elapsed_secs), DIM_STYLE);
             let level = Span::styled(
                 format!(" {} ", entry.level.label()),
                 Style::default()

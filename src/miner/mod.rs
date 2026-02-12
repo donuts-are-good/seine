@@ -28,7 +28,6 @@ use stats::{format_hashrate, Stats};
 use tui::{new_tui_state, TuiState};
 use ui::{error, info, warn};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TEMPLATE_RETRY_DELAY: Duration = Duration::from_secs(2);
 const MIN_EVENT_WAIT: Duration = Duration::from_millis(1);
 
@@ -48,7 +47,12 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
         .token
         .clone()
         .ok_or_else(|| anyhow!("missing API token in mining mode"))?;
-    let client = ApiClient::new(cfg.api_url.clone(), token, REQUEST_TIMEOUT)?;
+    let client = ApiClient::new(
+        cfg.api_url.clone(),
+        token,
+        cfg.request_timeout,
+        cfg.events_stream_timeout,
+    )?;
 
     let backend_instances = build_backend_instances(cfg);
     let (mut backends, backend_events) =
@@ -78,6 +82,7 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
         Some(mining::spawn_tip_listener(
             client.clone(),
             Arc::clone(&shutdown),
+            cfg.refresh_on_same_height,
         ))
     } else {
         None
@@ -93,10 +98,15 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
         tip_listener.as_ref().map(mining::TipListener::signal),
     );
 
+    let shutdown_requested = shutdown.load(Ordering::SeqCst);
     stop_backend_slots(&mut backends);
     shutdown.store(true, Ordering::SeqCst);
     if let Some(listener) = tip_listener {
-        listener.join();
+        if shutdown_requested {
+            listener.detach();
+        } else {
+            listener.join();
+        }
     }
     result
 }

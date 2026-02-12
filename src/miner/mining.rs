@@ -34,6 +34,8 @@ pub(super) struct TipSignal {
     stale: Arc<AtomicBool>,
     current_template_height: Arc<AtomicU64>,
     last_new_block: Arc<Mutex<Option<LastNewBlock>>>,
+    sequence: Arc<AtomicU64>,
+    refresh_on_same_height: bool,
 }
 
 struct LastNewBlock {
@@ -42,16 +44,22 @@ struct LastNewBlock {
 }
 
 impl TipSignal {
-    fn new() -> Self {
+    fn new(refresh_on_same_height: bool) -> Self {
         Self {
             stale: Arc::new(AtomicBool::new(false)),
             current_template_height: Arc::new(AtomicU64::new(0)),
             last_new_block: Arc::new(Mutex::new(None)),
+            sequence: Arc::new(AtomicU64::new(0)),
+            refresh_on_same_height,
         }
     }
 
     fn take_stale(&self) -> bool {
         self.stale.swap(false, Ordering::AcqRel)
+    }
+
+    fn snapshot_sequence(&self) -> u64 {
+        self.sequence.load(Ordering::Acquire)
     }
 
     fn set_current_template_height(&self, height: u64) {
@@ -86,12 +94,16 @@ impl TipSignal {
             );
             if same_height {
                 // Daemon-side event streams can replay competing hashes at the same height.
-                // Treat those as one refresh hint and rely on periodic template refresh for
-                // any subsequent same-height churn.
+                // Coalesce by default, but allow forcing refresh for same-height hash changes.
+                let hash_changed = last_event
+                    .as_ref()
+                    .map(|last| last.hash != hash)
+                    .unwrap_or(false);
                 *last_event = Some(LastNewBlock {
                     hash: hash.to_string(),
                     height: event_height,
                 });
+                changed = self.refresh_on_same_height && hash_changed;
             } else if !matches!(
                 last_event.as_ref(),
                 Some(last) if last.hash == hash && last.height == event_height
@@ -108,11 +120,13 @@ impl TipSignal {
         }
         if changed {
             self.stale.store(true, Ordering::Release);
+            self.sequence.fetch_add(1, Ordering::AcqRel);
         }
     }
 
     fn mark_stale_on_unparsed_event(&self) {
         self.stale.store(true, Ordering::Release);
+        self.sequence.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -124,6 +138,12 @@ pub(super) struct TipListener {
 impl TipListener {
     pub(super) fn signal(&self) -> &TipSignal {
         &self.signal
+    }
+
+    pub(super) fn detach(mut self) {
+        if let Some(handle) = self.handle.take() {
+            drop(handle);
+        }
     }
 
     pub(super) fn join(mut self) {
@@ -254,6 +274,10 @@ fn update_tui(tui: &mut Option<TuiDisplay>, stats: &Stats, view: RoundUiView<'_>
     }
 }
 
+fn current_tip_sequence(tip_signal: Option<&TipSignal>) -> u64 {
+    tip_signal.map(TipSignal::snapshot_sequence).unwrap_or(0)
+}
+
 pub(super) fn run_mining_loop(
     cfg: &Config,
     client: &ApiClient,
@@ -294,7 +318,7 @@ pub(super) fn run_mining_loop(
                     break;
                 }
                 let Some(next_template) =
-                    resolve_next_template(&mut prefetch, client, cfg, &shutdown)
+                    resolve_next_template(&mut prefetch, client, cfg, &shutdown, tip_signal)
                 else {
                     break;
                 };
@@ -315,7 +339,8 @@ pub(super) fn run_mining_loop(
             if !sleep_with_shutdown(shutdown.as_ref(), TEMPLATE_RETRY_DELAY) {
                 break;
             }
-            let Some(next_template) = resolve_next_template(&mut prefetch, client, cfg, &shutdown)
+            let Some(next_template) =
+                resolve_next_template(&mut prefetch, client, cfg, &shutdown, tip_signal)
             else {
                 break;
             };
@@ -331,7 +356,7 @@ pub(super) fn run_mining_loop(
                     break;
                 }
                 let Some(next_template) =
-                    resolve_next_template(&mut prefetch, client, cfg, &shutdown)
+                    resolve_next_template(&mut prefetch, client, cfg, &shutdown, tip_signal)
                 else {
                     break;
                 };
@@ -375,6 +400,7 @@ pub(super) fn run_mining_loop(
                 client.clone(),
                 cfg.clone(),
                 Arc::clone(&shutdown),
+                current_tip_sequence(tip_signal),
             ));
         }
 
@@ -524,6 +550,9 @@ pub(super) fn run_mining_loop(
             }
         }
 
+        if stale_tip_event || solved.is_some() {
+            cancel_backend_slots(backends)?;
+        }
         if cfg.strict_round_accounting {
             quiesce_backend_slots(backends)?;
         }
@@ -632,7 +661,8 @@ pub(super) fn run_mining_loop(
             break;
         }
 
-        let Some(next_template) = resolve_next_template(&mut prefetch, client, cfg, &shutdown)
+        let Some(next_template) =
+            resolve_next_template(&mut prefetch, client, cfg, &shutdown, tip_signal)
         else {
             break;
         };
@@ -640,7 +670,11 @@ pub(super) fn run_mining_loop(
     }
 
     if let Some(prefetch_task) = prefetch {
-        let _ = prefetch_task.join();
+        if shutdown.load(Ordering::Relaxed) {
+            prefetch_task.detach();
+        } else {
+            let _ = prefetch_task.join();
+        }
     }
 
     stats.print();
@@ -650,13 +684,21 @@ pub(super) fn run_mining_loop(
 
 struct TemplatePrefetch {
     handle: JoinHandle<Option<BlockTemplateResponse>>,
+    tip_sequence: u64,
 }
 
 impl TemplatePrefetch {
-    fn spawn(client: ApiClient, cfg: Config, shutdown: Arc<AtomicBool>) -> Self {
+    fn spawn(client: ApiClient, cfg: Config, shutdown: Arc<AtomicBool>, tip_sequence: u64) -> Self {
         let handle =
             thread::spawn(move || fetch_template_with_retry(&client, &cfg, shutdown.as_ref()));
-        Self { handle }
+        Self {
+            handle,
+            tip_sequence,
+        }
+    }
+
+    fn detach(self) {
+        drop(self.handle);
     }
 
     fn join(self) -> Option<BlockTemplateResponse> {
@@ -675,10 +717,31 @@ fn resolve_next_template(
     client: &ApiClient,
     cfg: &Config,
     shutdown: &Arc<AtomicBool>,
+    tip_signal: Option<&TipSignal>,
 ) -> Option<BlockTemplateResponse> {
+    if shutdown.load(Ordering::Relaxed) {
+        if let Some(task) = prefetch.take() {
+            task.detach();
+        }
+        return None;
+    }
+
     if let Some(task) = prefetch.take() {
-        if let Some(template) = task.join() {
-            return Some(template);
+        let spawned_tip_sequence = task.tip_sequence;
+        let prefetched_template = task.join();
+        let latest_tip_sequence = current_tip_sequence(tip_signal);
+        if spawned_tip_sequence == latest_tip_sequence {
+            if let Some(template) = prefetched_template {
+                return Some(template);
+            }
+        } else if prefetched_template.is_some() {
+            warn(
+                "TEMPLATE",
+                format!(
+                    "discarding stale prefetched template (tip-seq {} -> {})",
+                    spawned_tip_sequence, latest_tip_sequence
+                ),
+            );
         }
     }
 
@@ -713,12 +776,18 @@ fn drain_mining_backend_events(
     Ok(action)
 }
 
-pub(super) fn spawn_tip_listener(client: ApiClient, shutdown: Arc<AtomicBool>) -> TipListener {
-    let tip_signal = TipSignal::new();
+pub(super) fn spawn_tip_listener(
+    client: ApiClient,
+    shutdown: Arc<AtomicBool>,
+    refresh_on_same_height: bool,
+) -> TipListener {
+    let tip_signal = TipSignal::new(refresh_on_same_height);
     let signal = TipSignal {
         stale: Arc::clone(&tip_signal.stale),
         current_template_height: Arc::clone(&tip_signal.current_template_height),
         last_new_block: Arc::clone(&tip_signal.last_new_block),
+        sequence: Arc::clone(&tip_signal.sequence),
+        refresh_on_same_height: tip_signal.refresh_on_same_height,
     };
 
     let handle = thread::spawn(move || {
@@ -885,6 +954,19 @@ fn maybe_print_stats(
         stats.print();
         *last_stats_print = Instant::now();
     }
+}
+
+fn cancel_backend_slots(backends: &[BackendSlot]) -> Result<()> {
+    for slot in backends {
+        slot.backend.cancel_work().with_context(|| {
+            format!(
+                "failed to cancel backend {}#{}",
+                slot.backend.name(),
+                slot.id
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn compact_hash(hash: &str) -> String {
@@ -1131,7 +1213,7 @@ mod tests {
 
     #[test]
     fn duplicate_new_block_hashes_are_coalesced() {
-        let signal = TipSignal::new();
+        let signal = TipSignal::new(false);
         let mut event_name = String::new();
 
         process_sse_line("event: new_block", &mut event_name, &signal);
@@ -1153,7 +1235,7 @@ mod tests {
 
     #[test]
     fn duplicate_new_block_hashes_across_reconnects_are_coalesced() {
-        let signal = TipSignal::new();
+        let signal = TipSignal::new(false);
         let mut first_stream_event = String::new();
 
         process_sse_line("event: new_block", &mut first_stream_event, &signal);
@@ -1176,7 +1258,7 @@ mod tests {
 
     #[test]
     fn historical_new_block_events_are_ignored() {
-        let signal = TipSignal::new();
+        let signal = TipSignal::new(false);
         signal.set_current_template_height(1761);
         let mut event_name = String::new();
 
@@ -1199,7 +1281,7 @@ mod tests {
 
     #[test]
     fn setting_template_height_clears_only_historical_stale_state() {
-        let signal = TipSignal::new();
+        let signal = TipSignal::new(false);
         let mut event_name = String::new();
 
         process_sse_line("event: new_block", &mut event_name, &signal);
@@ -1216,7 +1298,7 @@ mod tests {
 
     #[test]
     fn new_block_hash_change_triggers_refresh() {
-        let signal = TipSignal::new();
+        let signal = TipSignal::new(false);
         let mut event_name = String::new();
 
         process_sse_line("event: new_block", &mut event_name, &signal);
@@ -1245,7 +1327,7 @@ mod tests {
 
     #[test]
     fn same_height_hash_change_is_coalesced() {
-        let signal = TipSignal::new();
+        let signal = TipSignal::new(false);
         let mut event_name = String::new();
 
         process_sse_line("event: new_block", &mut event_name, &signal);
@@ -1263,5 +1345,27 @@ mod tests {
             &signal,
         );
         assert!(!signal.take_stale());
+    }
+
+    #[test]
+    fn same_height_hash_change_can_trigger_refresh_when_enabled() {
+        let signal = TipSignal::new(true);
+        let mut event_name = String::new();
+
+        process_sse_line("event: new_block", &mut event_name, &signal);
+        process_sse_line(
+            "data: {\"hash\":\"abc\",\"height\":1782}",
+            &mut event_name,
+            &signal,
+        );
+        assert!(signal.take_stale());
+
+        process_sse_line("event: new_block", &mut event_name, &signal);
+        process_sse_line(
+            "data: {\"hash\":\"def\",\"height\":1782}",
+            &mut event_name,
+            &signal,
+        );
+        assert!(signal.take_stale());
     }
 }
