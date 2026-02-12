@@ -6,14 +6,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use blocknet_pow_spec::POW_HEADER_BASE_LEN;
-use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 
 use crate::api::ApiClient;
 use crate::backend::{BackendEvent, MiningSolution};
 use crate::config::Config;
 use crate::types::{
     decode_hex, parse_target, set_block_nonce, template_difficulty, template_height,
-    BlockTemplateResponse, SubmitBlockResponse,
+    BlockTemplateResponse, SubmitBlockResponse, TemplateBlock,
 };
 
 use super::hash_poll::{build_backend_poll_state, next_backend_poll_deadline};
@@ -46,6 +46,8 @@ const RECENT_TEMPLATE_CACHE_MIN: usize = 16;
 const RECENT_TEMPLATE_CACHE_MAX: usize = 512;
 const RECENT_TEMPLATE_CACHE_HEADROOM_ROUNDS: usize = 4;
 const RECENT_SUBMITTED_SOLUTIONS_CAPACITY: usize = 4096;
+const SUBMIT_REQUEST_CAPACITY: usize = 128;
+const SUBMIT_RESULT_CAPACITY: usize = 128;
 
 #[derive(Default)]
 struct RetryTracker {
@@ -87,8 +89,33 @@ impl RetryTracker {
     }
 }
 
+#[derive(Debug, Clone)]
+enum SubmitTemplate {
+    Compact { template_id: String },
+    FullBlock { block: TemplateBlock },
+}
+
+impl SubmitTemplate {
+    fn from_template(template: &BlockTemplateResponse) -> Self {
+        if let Some(template_id) = template
+            .template_id
+            .as_ref()
+            .map(|template_id| template_id.trim())
+            .filter(|template_id| !template_id.is_empty())
+        {
+            Self::Compact {
+                template_id: template_id.to_string(),
+            }
+        } else {
+            Self::FullBlock {
+                block: template.block.clone(),
+            }
+        }
+    }
+}
+
 struct SubmitRequest {
-    template: BlockTemplateResponse,
+    template: SubmitTemplate,
     solution: MiningSolution,
 }
 
@@ -111,8 +138,8 @@ struct SubmitWorker {
 
 impl SubmitWorker {
     fn spawn(client: ApiClient, shutdown: Arc<AtomicBool>) -> Self {
-        let (request_tx, request_rx) = unbounded::<SubmitRequest>();
-        let (result_tx, result_rx) = unbounded::<SubmitResult>();
+        let (request_tx, request_rx) = bounded::<SubmitRequest>(SUBMIT_REQUEST_CAPACITY);
+        let (result_tx, result_rx) = bounded::<SubmitResult>(SUBMIT_RESULT_CAPACITY);
         let (done_tx, done_rx) = bounded::<()>(1);
 
         let handle = thread::spawn(move || {
@@ -152,13 +179,17 @@ impl SubmitWorker {
         }
     }
 
-    fn submit(&self, template: BlockTemplateResponse, solution: MiningSolution) -> bool {
+    fn submit(&self, request: SubmitRequest) -> Option<SubmitRequest> {
         let Some(request_tx) = self.request_tx.as_ref() else {
-            return false;
+            return Some(request);
         };
-        request_tx
-            .send(SubmitRequest { template, solution })
-            .is_ok()
+
+        match request_tx.try_send(request) {
+            Ok(()) => None,
+            Err(TrySendError::Full(request)) | Err(TrySendError::Disconnected(request)) => {
+                Some(request)
+            }
+        }
     }
 
     fn drain_results(&self, stats: &Stats, tui: &mut Option<TuiDisplay>) {
@@ -197,17 +228,21 @@ impl SubmitWorker {
 }
 
 fn process_submit_request(client: &ApiClient, request: SubmitRequest) -> SubmitResult {
-    let template_id = request.template.template_id.clone();
-    let mut solved_block = request.template.block;
-    set_block_nonce(&mut solved_block, request.solution.nonce);
-
-    let outcome = match client.submit_block(
-        &solved_block,
-        template_id.as_deref(),
-        request.solution.nonce,
-    ) {
-        Ok(resp) => SubmitOutcome::Response(resp),
-        Err(err) => SubmitOutcome::Error(format!("{err:#}")),
+    let nonce = request.solution.nonce;
+    let outcome = match request.template {
+        SubmitTemplate::Compact { template_id } => {
+            match client.submit_block(&(), Some(template_id.as_str()), nonce) {
+                Ok(resp) => SubmitOutcome::Response(resp),
+                Err(err) => SubmitOutcome::Error(format!("{err:#}")),
+            }
+        }
+        SubmitTemplate::FullBlock { mut block } => {
+            set_block_nonce(&mut block, nonce);
+            match client.submit_block(&block, None, nonce) {
+                Ok(resp) => SubmitOutcome::Response(resp),
+                Err(err) => SubmitOutcome::Error(format!("{err:#}")),
+            }
+        }
     };
 
     SubmitResult {
@@ -279,7 +314,7 @@ struct RoundLoopState {
 struct RecentTemplateEntry {
     epoch: u64,
     recorded_at: Instant,
-    template: BlockTemplateResponse,
+    submit_template: SubmitTemplate,
 }
 
 fn current_tip_sequence(tip_signal: Option<&TipSignal>) -> u64 {
@@ -341,23 +376,33 @@ impl<'a> MiningControlPlane<'a> {
         stats: &Stats,
         tui: &mut Option<TuiDisplay>,
     ) {
+        self.submit_template(
+            SubmitTemplate::from_template(template),
+            solution,
+            stats,
+            tui,
+        );
+    }
+
+    fn submit_template(
+        &self,
+        template: SubmitTemplate,
+        solution: MiningSolution,
+        stats: &Stats,
+        tui: &mut Option<TuiDisplay>,
+    ) {
         stats.bump_submitted();
 
-        let queued = self
-            .submit_worker
-            .as_ref()
-            .is_some_and(|worker| worker.submit(template.clone(), solution.clone()));
-        if queued {
-            return;
+        let mut request = SubmitRequest { template, solution };
+        if let Some(worker) = self.submit_worker.as_ref() {
+            if let Some(returned) = worker.submit(request) {
+                request = returned;
+            } else {
+                return;
+            }
         }
 
-        let result = process_submit_request(
-            self.client,
-            SubmitRequest {
-                template: template.clone(),
-                solution,
-            },
-        );
+        let result = process_submit_request(self.client, request);
         handle_submit_result(result, stats, tui);
     }
 
@@ -372,12 +417,12 @@ impl<'a> MiningControlPlane<'a> {
             if self.shutdown.load(Ordering::Relaxed) {
                 submit_worker.detach();
             } else {
-                if !submit_worker.shutdown_for(self.cfg.tip_listener_join_wait) {
+                if !submit_worker.shutdown_for(self.cfg.submit_join_wait) {
                     warn(
                         "SUBMIT",
                         format!(
                             "submit worker shutdown exceeded {}ms; detached",
-                            self.cfg.tip_listener_join_wait.as_millis()
+                            self.cfg.submit_join_wait.as_millis()
                         ),
                     );
                 }
@@ -1276,7 +1321,7 @@ fn submit_deferred_solutions(
         if already_submitted_solution(state.submitted_solution_keys, &solution) {
             continue;
         }
-        let Some(template) = template_for_solution_epoch(
+        let Some(submit_template) = submit_template_for_solution_epoch(
             current_epoch,
             current_template,
             state.recent_templates,
@@ -1291,7 +1336,7 @@ fn submit_deferred_solutions(
             );
             continue;
         };
-        control_plane.submit_solution(template, solution.clone(), state.stats, state.tui);
+        control_plane.submit_template(submit_template, solution.clone(), state.stats, state.tui);
         remember_submitted_solution(
             state.submitted_solution_order,
             state.submitted_solution_keys,
@@ -1324,18 +1369,18 @@ fn drop_solution_from_deferred(
     });
 }
 
-fn template_for_solution_epoch<'a>(
+fn submit_template_for_solution_epoch(
     current_epoch: u64,
-    current_template: &'a BlockTemplateResponse,
-    recent_templates: &'a VecDeque<RecentTemplateEntry>,
+    current_template: &BlockTemplateResponse,
+    recent_templates: &VecDeque<RecentTemplateEntry>,
     solution_epoch: u64,
-) -> Option<&'a BlockTemplateResponse> {
+) -> Option<SubmitTemplate> {
     if solution_epoch == current_epoch {
-        return Some(current_template);
+        return Some(SubmitTemplate::from_template(current_template));
     }
     for entry in recent_templates.iter().rev() {
         if entry.epoch == solution_epoch {
-            return Some(&entry.template);
+            return Some(entry.submit_template.clone());
         }
     }
     None
@@ -1354,7 +1399,7 @@ fn remember_recent_template(
     recent_templates.push_back(RecentTemplateEntry {
         epoch,
         recorded_at: now,
-        template,
+        submit_template: SubmitTemplate::from_template(&template),
     });
     while let Some(front) = recent_templates.front() {
         let over_capacity = recent_templates.len() > max_entries;
@@ -1769,12 +1814,12 @@ mod tests {
         recent.push_back(RecentTemplateEntry {
             epoch: 9,
             recorded_at: Instant::now(),
-            template: previous,
+            submit_template: SubmitTemplate::from_template(&previous),
         });
 
-        assert!(template_for_solution_epoch(10, &current, &recent, 10).is_some());
-        assert!(template_for_solution_epoch(10, &current, &recent, 9).is_some());
-        assert!(template_for_solution_epoch(10, &current, &recent, 8).is_none());
+        assert!(submit_template_for_solution_epoch(10, &current, &recent, 10).is_some());
+        assert!(submit_template_for_solution_epoch(10, &current, &recent, 9).is_some());
+        assert!(submit_template_for_solution_epoch(10, &current, &recent, 8).is_none());
     }
 
     #[test]
@@ -1805,7 +1850,7 @@ mod tests {
         recent.push_back(RecentTemplateEntry {
             epoch: 1,
             recorded_at: Instant::now() - Duration::from_secs(10),
-            template: sample_template("old"),
+            submit_template: SubmitTemplate::from_template(&sample_template("old")),
         });
         remember_recent_template(
             &mut recent,

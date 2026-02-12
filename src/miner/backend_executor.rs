@@ -48,6 +48,12 @@ enum BackendWorkerCommand {
         deadline: Instant,
         outcome_tx: Sender<BackendTaskOutcome>,
     },
+    Stop {
+        backend_id: BackendInstanceId,
+        backend: &'static str,
+        backend_handle: Arc<dyn PowBackend>,
+        done_tx: Sender<()>,
+    },
 }
 
 #[derive(Clone)]
@@ -61,10 +67,20 @@ struct BackendWorkerKey {
     backend_ptr: usize,
 }
 
+pub(super) struct AssignmentTimeoutDecision {
+    pub strikes: u32,
+    pub threshold: u32,
+    pub should_quarantine: bool,
+}
+
+const ASSIGNMENT_TIMEOUT_STRIKES_BEFORE_QUARANTINE: u32 = 3;
+const BACKEND_STOP_ACK_TIMEOUT: Duration = Duration::from_secs(1);
+
 #[derive(Clone)]
 pub(super) struct BackendExecutor {
     workers: Arc<Mutex<BTreeMap<BackendWorkerKey, BackendWorker>>>,
     quarantined: Arc<Mutex<BTreeSet<BackendWorkerKey>>>,
+    assignment_timeout_strikes: Arc<Mutex<BTreeMap<BackendWorkerKey, u32>>>,
 }
 
 impl BackendExecutor {
@@ -72,6 +88,7 @@ impl BackendExecutor {
         Self {
             workers: Arc::new(Mutex::new(BTreeMap::new())),
             quarantined: Arc::new(Mutex::new(BTreeSet::new())),
+            assignment_timeout_strikes: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -95,7 +112,28 @@ fn spawn_backend_worker(
     let thread_name = format!("seine-backend-{backend}-{backend_id}-{backend_ptr:x}");
     let spawn_result = thread::Builder::new().name(thread_name).spawn(move || {
         while let Ok(command) = cmd_rx.recv() {
-            run_backend_command(command);
+            match command {
+                BackendWorkerCommand::Run {
+                    task,
+                    deadline,
+                    outcome_tx,
+                } => run_backend_task(task, deadline, outcome_tx),
+                BackendWorkerCommand::Stop {
+                    backend_id,
+                    backend,
+                    backend_handle,
+                    done_tx,
+                } => {
+                    if panic::catch_unwind(AssertUnwindSafe(|| backend_handle.stop())).is_err() {
+                        warn(
+                            "BACKEND",
+                            format!("backend stop panicked for {backend}#{backend_id}"),
+                        );
+                    }
+                    let _ = done_tx.send(());
+                    break;
+                }
+            }
         }
     });
 
@@ -127,6 +165,9 @@ impl BackendExecutor {
         if let Ok(mut registry) = self.workers.lock() {
             registry.clear();
         }
+        if let Ok(mut strikes) = self.assignment_timeout_strikes.lock() {
+            strikes.clear();
+        }
     }
 
     pub(super) fn prune(&self, backends: &[BackendSlot]) {
@@ -136,6 +177,9 @@ impl BackendExecutor {
             .collect::<BTreeSet<_>>();
         if let Ok(mut registry) = self.workers.lock() {
             registry.retain(|backend_key, _| active_keys.contains(backend_key));
+        }
+        if let Ok(mut strikes) = self.assignment_timeout_strikes.lock() {
+            strikes.retain(|backend_key, _| active_keys.contains(backend_key));
         }
     }
 
@@ -147,6 +191,9 @@ impl BackendExecutor {
         let key = backend_worker_key(backend_id, backend_handle);
         if let Ok(mut registry) = self.workers.lock() {
             registry.remove(&key);
+        }
+        if let Ok(mut strikes) = self.assignment_timeout_strikes.lock() {
+            strikes.remove(&key);
         }
     }
 
@@ -176,14 +223,24 @@ impl BackendExecutor {
             return;
         }
 
-        let detached = Arc::clone(&backend);
+        if let Ok(mut strikes) = self.assignment_timeout_strikes.lock() {
+            strikes.remove(&key);
+        }
+
+        let worker_tx = self
+            .workers
+            .lock()
+            .ok()
+            .and_then(|mut registry| registry.remove(&key))
+            .map(|worker| worker.tx);
         let quarantined = Arc::clone(&self.quarantined);
+        let detached = Arc::clone(&backend);
+        let backend_name = backend.name();
+        let worker_tx_for_thread = worker_tx.clone();
         if thread::Builder::new()
             .name("seine-backend-quarantine".to_string())
             .spawn(move || {
-                if panic::catch_unwind(AssertUnwindSafe(|| detached.stop())).is_err() {
-                    warn("BACKEND", "backend stop panicked during async quarantine");
-                }
+                perform_quarantine_stop(backend_id, backend_name, detached, worker_tx_for_thread);
                 if let Ok(mut inflight) = quarantined.lock() {
                     inflight.remove(&key);
                 }
@@ -194,15 +251,57 @@ impl BackendExecutor {
                 "BACKEND",
                 "failed to spawn backend quarantine worker; running synchronous stop fallback",
             );
-            if panic::catch_unwind(AssertUnwindSafe(|| backend.stop())).is_err() {
-                warn(
-                    "BACKEND",
-                    "backend stop panicked during synchronous quarantine fallback",
-                );
-            }
+            perform_quarantine_stop(backend_id, backend_name, backend, worker_tx);
             if let Ok(mut inflight) = self.quarantined.lock() {
                 inflight.remove(&key);
             }
+        }
+    }
+
+    pub(super) fn note_assignment_success(
+        &self,
+        backend_id: BackendInstanceId,
+        backend_handle: &Arc<dyn PowBackend>,
+    ) {
+        let key = backend_worker_key(backend_id, backend_handle);
+        if let Ok(mut strikes) = self.assignment_timeout_strikes.lock() {
+            strikes.remove(&key);
+        }
+    }
+
+    pub(super) fn note_assignment_timeout(
+        &self,
+        backend_id: BackendInstanceId,
+        backend_handle: &Arc<dyn PowBackend>,
+    ) -> AssignmentTimeoutDecision {
+        let key = backend_worker_key(backend_id, backend_handle);
+        let threshold = ASSIGNMENT_TIMEOUT_STRIKES_BEFORE_QUARANTINE;
+        let mut strikes_map = match self.assignment_timeout_strikes.lock() {
+            Ok(map) => map,
+            Err(_) => {
+                return AssignmentTimeoutDecision {
+                    strikes: threshold,
+                    threshold,
+                    should_quarantine: true,
+                };
+            }
+        };
+        let strikes = strikes_map
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let should_quarantine = strikes >= threshold;
+        if should_quarantine {
+            strikes_map.remove(&key);
+        } else {
+            strikes_map.insert(key, strikes);
+        }
+
+        AssignmentTimeoutDecision {
+            strikes,
+            threshold,
+            should_quarantine,
         }
     }
 
@@ -380,13 +479,7 @@ impl BackendExecutor {
     }
 }
 
-fn run_backend_command(command: BackendWorkerCommand) {
-    let BackendWorkerCommand::Run {
-        task,
-        deadline,
-        outcome_tx,
-    } = command;
-
+fn run_backend_task(task: BackendTask, deadline: Instant, outcome_tx: Sender<BackendTaskOutcome>) {
     let BackendTask {
         idx,
         backend_id,
@@ -401,6 +494,48 @@ fn run_backend_command(command: BackendWorkerCommand) {
     let send_result = outcome_tx.send(BackendTaskOutcome { idx, result });
     if send_result.is_err() {
         let _ = backend_handle.request_timeout_interrupt();
+    }
+}
+
+fn perform_quarantine_stop(
+    backend_id: BackendInstanceId,
+    backend: &'static str,
+    backend_handle: Arc<dyn PowBackend>,
+    worker_tx: Option<Sender<BackendWorkerCommand>>,
+) {
+    if let Some(worker_tx) = worker_tx {
+        let (done_tx, done_rx) = bounded::<()>(1);
+        if worker_tx
+            .send(BackendWorkerCommand::Stop {
+                backend_id,
+                backend,
+                backend_handle: Arc::clone(&backend_handle),
+                done_tx,
+            })
+            .is_ok()
+        {
+            if matches!(
+                done_rx.recv_timeout(BACKEND_STOP_ACK_TIMEOUT),
+                Err(RecvTimeoutError::Timeout)
+            ) {
+                warn(
+                    "BACKEND",
+                    format!(
+                        "backend stop is still in progress for {backend}#{backend_id}; detached"
+                    ),
+                );
+            }
+            return;
+        }
+    }
+
+    if panic::catch_unwind(AssertUnwindSafe(|| backend_handle.stop())).is_err() {
+        warn(
+            "BACKEND",
+            format!(
+                "backend stop panicked during synchronous quarantine fallback for {backend}#{backend_id}"
+            ),
+        );
     }
 }
 

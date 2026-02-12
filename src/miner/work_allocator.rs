@@ -30,6 +30,7 @@ struct DispatchFailure {
     backend_id: BackendInstanceId,
     backend: &'static str,
     reason: String,
+    quarantined: bool,
 }
 
 pub(super) fn distribute_work(
@@ -111,13 +112,23 @@ pub(super) fn distribute_work(
                     failure.backend, failure.backend_id, failure.reason
                 ),
             );
-            warn(
-                "BACKEND",
-                format!(
-                    "quarantined {}#{} due to assignment failure",
-                    failure.backend, failure.backend_id
-                ),
-            );
+            if failure.quarantined {
+                warn(
+                    "BACKEND",
+                    format!(
+                        "quarantined {}#{} due to assignment failure",
+                        failure.backend, failure.backend_id
+                    ),
+                );
+            } else {
+                warn(
+                    "BACKEND",
+                    format!(
+                        "keeping {}#{} active; retrying assignment",
+                        failure.backend, failure.backend_id
+                    ),
+                );
+            }
         }
 
         if backends.is_empty() {
@@ -181,7 +192,10 @@ fn dispatch_assignment_tasks(
         let backend = slot.backend.name();
         match outcome_slot.take() {
             Some(outcome) => match outcome.result {
-                Ok(()) => survivors.push((idx, slot)),
+                Ok(()) => {
+                    backend_executor.note_assignment_success(backend_id, &slot.backend);
+                    survivors.push((idx, slot));
+                }
                 Err(err) => {
                     backend_executor.quarantine_backend(backend_id, Arc::clone(&slot.backend));
                     backend_executor.remove_backend_worker(backend_id, &slot.backend);
@@ -189,20 +203,41 @@ fn dispatch_assignment_tasks(
                         backend_id,
                         backend,
                         reason: format!("{err:#}"),
+                        quarantined: true,
                     });
                 }
             },
             None => {
-                backend_executor.quarantine_backend(backend_id, Arc::clone(&slot.backend));
-                backend_executor.remove_backend_worker(backend_id, &slot.backend);
-                failures.push(DispatchFailure {
-                    backend_id,
-                    backend,
-                    reason: format!(
-                        "assignment timed out after {}ms; backend quarantined",
-                        timeout.as_millis()
-                    ),
-                });
+                let timeout_decision =
+                    backend_executor.note_assignment_timeout(backend_id, &slot.backend);
+                if timeout_decision.should_quarantine {
+                    backend_executor.quarantine_backend(backend_id, Arc::clone(&slot.backend));
+                    backend_executor.remove_backend_worker(backend_id, &slot.backend);
+                    failures.push(DispatchFailure {
+                        backend_id,
+                        backend,
+                        reason: format!(
+                            "assignment timed out after {}ms (strike {}/{}); backend quarantined",
+                            timeout.as_millis(),
+                            timeout_decision.strikes,
+                            timeout_decision.threshold,
+                        ),
+                        quarantined: true,
+                    });
+                } else {
+                    failures.push(DispatchFailure {
+                        backend_id,
+                        backend,
+                        reason: format!(
+                            "assignment timed out after {}ms (strike {}/{})",
+                            timeout.as_millis(),
+                            timeout_decision.strikes,
+                            timeout_decision.threshold,
+                        ),
+                        quarantined: false,
+                    });
+                    survivors.push((idx, slot));
+                }
             }
         }
     }

@@ -153,6 +153,10 @@ struct Cli {
     #[arg(long, default_value_t = 250)]
     tip_listener_join_wait_ms: u64,
 
+    /// Maximum time to wait for submit-worker shutdown before detaching.
+    #[arg(long, default_value_t = 2_000)]
+    submit_join_wait_ms: u64,
+
     /// Enable strict per-round quiesce barriers for exact accounting (lower throughput).
     #[arg(long, action = ArgAction::SetTrue)]
     strict_round_accounting: bool,
@@ -245,6 +249,7 @@ pub struct Config {
     pub allow_best_effort_deadlines: bool,
     pub prefetch_wait: Duration,
     pub tip_listener_join_wait: Duration,
+    pub submit_join_wait: Duration,
     pub strict_round_accounting: bool,
     pub start_nonce: u64,
     pub nonce_iters_per_lane: u64,
@@ -289,6 +294,9 @@ impl Config {
         }
         if cli.tip_listener_join_wait_ms == 0 {
             bail!("tip-listener-join-wait-ms must be >= 1");
+        }
+        if cli.submit_join_wait_ms == 0 {
+            bail!("submit-join-wait-ms must be >= 1");
         }
         if cli.strict_round_accounting && cli.relaxed_accounting {
             bail!("cannot use both --strict-round-accounting and --relaxed-accounting");
@@ -342,6 +350,7 @@ impl Config {
             allow_best_effort_deadlines: cli.allow_best_effort_deadlines,
             prefetch_wait: Duration::from_millis(cli.prefetch_wait_ms),
             tip_listener_join_wait: Duration::from_millis(cli.tip_listener_join_wait_ms),
+            submit_join_wait: Duration::from_millis(cli.submit_join_wait_ms),
             strict_round_accounting: cli.strict_round_accounting && !cli.relaxed_accounting,
             start_nonce: cli.start_nonce.unwrap_or_else(|| {
                 if cli.bench {
@@ -606,6 +615,7 @@ mod tests {
             allow_best_effort_deadlines: false,
             prefetch_wait_ms: 250,
             tip_listener_join_wait_ms: 250,
+            submit_join_wait_ms: 2_000,
             strict_round_accounting: false,
             relaxed_accounting: false,
             start_nonce: None,

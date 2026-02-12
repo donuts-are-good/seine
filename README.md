@@ -110,6 +110,7 @@ Run headless/plain logs (no fullscreen TUI):
   - `--events-idle-timeout-secs` (default `90`) bounds one SSE stream request lifetime before reconnect to avoid liveness stalls.
   - `--prefetch-wait-ms` (default `250`) bounds how long mining waits for prefetched templates before falling back to direct fetch.
   - `--tip-listener-join-wait-ms` (default `250`) bounds shutdown wait for SSE listener thread before detaching.
+  - `--submit-join-wait-ms` (default `2000`) bounds shutdown wait for submit worker thread before detaching.
   - Late-solution template retention is timeout-aware (derived from refresh/control/assign/prefetch timing) with time-based eviction and a bounded cache to reduce stale drops during backend lag/spiky tip churn.
   - Deferred solution submission deduplicates by `(epoch, nonce)` across backends and suppresses repeat submit attempts across later rounds.
   - `--cpu-affinity` (`auto` or `off`) controls CPU worker pinning policy for better repeatability on NUMA/SMT hosts.
