@@ -1118,13 +1118,25 @@ fn resolve_next_template(
                 }
             }
             PrefetchOutcome::Unauthorized => {
-                auth_retry.note_failure(
-                    "AUTH",
-                    "auth expired; waiting for new cookie token",
-                    "auth still expired; waiting for new cookie token",
-                    true,
-                );
+                if cfg.token_cookie_path.is_some() {
+                    auth_retry.note_failure(
+                        "AUTH",
+                        "auth expired; waiting for new cookie token",
+                        "auth still expired; waiting for new cookie token",
+                        true,
+                    );
+                } else {
+                    auth_retry.note_failure(
+                        "AUTH",
+                        "auth failed; static --token cannot auto-refresh",
+                        "still waiting for manual token refresh",
+                        true,
+                    );
+                }
                 render_tui_now(tui);
+                if !sleep_with_shutdown(shutdown.as_ref(), TEMPLATE_RETRY_DELAY) {
+                    return None;
+                }
             }
             PrefetchOutcome::Unavailable => {
                 network_retry.note_failure(
@@ -1134,6 +1146,9 @@ fn resolve_next_template(
                     true,
                 );
                 render_tui_now(tui);
+                if !sleep_with_shutdown(shutdown.as_ref(), TEMPLATE_RETRY_DELAY) {
+                    return None;
+                }
             }
         }
     }
