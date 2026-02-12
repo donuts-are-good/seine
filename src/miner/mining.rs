@@ -6,17 +6,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use blocknet_pow_spec::POW_HEADER_BASE_LEN;
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 
-use crate::api::{is_no_wallet_loaded_error, is_unauthorized_error, ApiClient};
+use crate::api::ApiClient;
 use crate::backend::{BackendEvent, MiningSolution};
 use crate::config::Config;
 use crate::types::{
     decode_hex, parse_target, set_block_nonce, template_difficulty, template_height,
-    BlockTemplateResponse,
+    BlockTemplateResponse, SubmitBlockResponse,
 };
 
-use super::auth::{refresh_api_token_from_cookie, TokenRefreshOutcome};
 use super::hash_poll::{build_backend_poll_state, next_backend_poll_deadline};
 use super::mining_tui::{
     init_tui_display, render_tui_now, set_tui_state_label, update_tui, RoundUiView, TuiDisplay,
@@ -28,7 +27,7 @@ use super::runtime::{
 };
 use super::scheduler::NonceScheduler;
 use super::stats::Stats;
-use super::template_prefetch::TemplatePrefetch;
+use super::template_prefetch::{PrefetchOutcome, TemplatePrefetch};
 pub(super) use super::tip::{spawn_tip_listener, TipListener, TipSignal};
 use super::tui::TuiState;
 use super::ui::{error, info, mined, success, warn};
@@ -88,12 +87,185 @@ impl RetryTracker {
     }
 }
 
+struct SubmitRequest {
+    template: BlockTemplateResponse,
+    solution: MiningSolution,
+}
+
+enum SubmitOutcome {
+    Response(SubmitBlockResponse),
+    Error(String),
+}
+
+struct SubmitResult {
+    solution: MiningSolution,
+    outcome: SubmitOutcome,
+}
+
+struct SubmitWorker {
+    handle: Option<thread::JoinHandle<()>>,
+    request_tx: Option<Sender<SubmitRequest>>,
+    result_rx: Receiver<SubmitResult>,
+    done_rx: Receiver<()>,
+}
+
+impl SubmitWorker {
+    fn spawn(client: ApiClient, shutdown: Arc<AtomicBool>) -> Self {
+        let (request_tx, request_rx) = unbounded::<SubmitRequest>();
+        let (result_tx, result_rx) = unbounded::<SubmitResult>();
+        let (done_tx, done_rx) = bounded::<()>(1);
+
+        let handle = thread::spawn(move || {
+            while !shutdown.load(Ordering::Relaxed) {
+                match request_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(request) => {
+                        if result_tx
+                            .send(process_submit_request(&client, request))
+                            .is_err()
+                        {
+                            let _ = done_tx.send(());
+                            return;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+
+            while let Ok(request) = request_rx.try_recv() {
+                if result_tx
+                    .send(process_submit_request(&client, request))
+                    .is_err()
+                {
+                    let _ = done_tx.send(());
+                    return;
+                }
+            }
+            let _ = done_tx.send(());
+        });
+
+        Self {
+            handle: Some(handle),
+            request_tx: Some(request_tx),
+            result_rx,
+            done_rx,
+        }
+    }
+
+    fn submit(&self, template: BlockTemplateResponse, solution: MiningSolution) -> bool {
+        let Some(request_tx) = self.request_tx.as_ref() else {
+            return false;
+        };
+        request_tx
+            .send(SubmitRequest { template, solution })
+            .is_ok()
+    }
+
+    fn drain_results(&self, stats: &Stats, tui: &mut Option<TuiDisplay>) {
+        while let Ok(result) = self.result_rx.try_recv() {
+            handle_submit_result(result, stats, tui);
+        }
+    }
+
+    fn detach(mut self) {
+        self.request_tx = None;
+        if let Some(handle) = self.handle.take() {
+            drop(handle);
+        }
+    }
+
+    fn shutdown_for(&mut self, wait: Duration) -> bool {
+        self.request_tx = None;
+        let wait = wait.max(Duration::from_millis(1));
+        let done = matches!(
+            self.done_rx.recv_timeout(wait),
+            Ok(()) | Err(RecvTimeoutError::Disconnected)
+        );
+
+        if done {
+            if let Some(handle) = self.handle.take() {
+                if handle.join().is_err() {
+                    error("SUBMIT", "submit worker thread panicked");
+                }
+            }
+        } else if let Some(handle) = self.handle.take() {
+            drop(handle);
+        }
+
+        done
+    }
+}
+
+fn process_submit_request(client: &ApiClient, request: SubmitRequest) -> SubmitResult {
+    let template_id = request.template.template_id.clone();
+    let mut solved_block = request.template.block;
+    set_block_nonce(&mut solved_block, request.solution.nonce);
+
+    let outcome = match client.submit_block(
+        &solved_block,
+        template_id.as_deref(),
+        request.solution.nonce,
+    ) {
+        Ok(resp) => SubmitOutcome::Response(resp),
+        Err(err) => SubmitOutcome::Error(format!("{err:#}")),
+    };
+
+    SubmitResult {
+        solution: request.solution,
+        outcome,
+    }
+}
+
+fn handle_submit_result(result: SubmitResult, stats: &Stats, tui: &mut Option<TuiDisplay>) {
+    match result.outcome {
+        SubmitOutcome::Response(resp) => {
+            if resp.accepted {
+                stats.bump_accepted();
+                if let Some(display) = tui.as_mut() {
+                    display.mark_block_found();
+                }
+                let height = resp
+                    .height
+                    .map(|h| h.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let hash = resp.hash.unwrap_or_else(|| "unknown".to_string());
+                mined("SUBMIT", format!("block accepted at height {height}"));
+                mined("SUBMIT", format!("hash {}", compact_hash(&hash)));
+            } else {
+                warn(
+                    "SUBMIT",
+                    format!(
+                        "rejected by daemon epoch={} nonce={} backend={}#{}",
+                        result.solution.epoch,
+                        result.solution.nonce,
+                        result.solution.backend,
+                        result.solution.backend_id
+                    ),
+                );
+            }
+        }
+        SubmitOutcome::Error(message) => {
+            error(
+                "SUBMIT",
+                format!(
+                    "submit failed epoch={} nonce={} backend={}#{}: {}",
+                    result.solution.epoch,
+                    result.solution.nonce,
+                    result.solution.backend,
+                    result.solution.backend_id,
+                    message
+                ),
+            );
+        }
+    }
+}
 struct MiningControlPlane<'a> {
     client: &'a ApiClient,
     cfg: &'a Config,
     shutdown: Arc<AtomicBool>,
     tip_signal: Option<&'a TipSignal>,
     prefetch: Option<TemplatePrefetch>,
+    submit_worker: Option<SubmitWorker>,
 }
 
 struct RoundLoopState {
@@ -129,6 +301,7 @@ impl<'a> MiningControlPlane<'a> {
                 cfg.clone(),
                 Arc::clone(&shutdown),
             )),
+            submit_worker: Some(SubmitWorker::spawn(client.clone(), Arc::clone(&shutdown))),
             shutdown,
             tip_signal,
         }
@@ -138,7 +311,7 @@ impl<'a> MiningControlPlane<'a> {
         &mut self,
         tui: &mut Option<TuiDisplay>,
     ) -> Option<BlockTemplateResponse> {
-        fetch_template_with_retry(self.client, self.cfg, self.shutdown.as_ref(), tui)
+        self.resolve_next_template(tui)
     }
 
     fn spawn_prefetch_if_needed(&mut self) {
@@ -168,39 +341,50 @@ impl<'a> MiningControlPlane<'a> {
         stats: &Stats,
         tui: &mut Option<TuiDisplay>,
     ) {
-        let template_id = template.template_id.clone();
-        let mut solved_block = template.block.clone();
-        set_block_nonce(&mut solved_block, solution.nonce);
-
         stats.bump_submitted();
-        match self
-            .client
-            .submit_block(&solved_block, template_id.as_deref(), solution.nonce)
-        {
-            Ok(resp) => {
-                if resp.accepted {
-                    stats.bump_accepted();
-                    if let Some(display) = tui.as_mut() {
-                        display.mark_block_found();
-                    }
-                    let height = resp
-                        .height
-                        .map(|h| h.to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let hash = resp.hash.unwrap_or_else(|| "unknown".to_string());
-                    mined("SUBMIT", format!("block accepted at height {height}"));
-                    mined("SUBMIT", format!("hash {}", compact_hash(&hash)));
-                } else {
-                    warn("SUBMIT", "rejected by daemon");
-                }
-            }
-            Err(err) => {
-                error("SUBMIT", format!("submit failed: {err:#}"));
-            }
+
+        let queued = self
+            .submit_worker
+            .as_ref()
+            .is_some_and(|worker| worker.submit(template.clone(), solution.clone()));
+        if queued {
+            return;
+        }
+
+        let result = process_submit_request(
+            self.client,
+            SubmitRequest {
+                template: template.clone(),
+                solution,
+            },
+        );
+        handle_submit_result(result, stats, tui);
+    }
+
+    fn drain_submit_results(&self, stats: &Stats, tui: &mut Option<TuiDisplay>) {
+        if let Some(worker) = self.submit_worker.as_ref() {
+            worker.drain_results(stats, tui);
         }
     }
 
-    fn finish(mut self) {
+    fn finish(mut self, stats: &Stats, tui: &mut Option<TuiDisplay>) {
+        if let Some(mut submit_worker) = self.submit_worker.take() {
+            if self.shutdown.load(Ordering::Relaxed) {
+                submit_worker.detach();
+            } else {
+                if !submit_worker.shutdown_for(self.cfg.tip_listener_join_wait) {
+                    warn(
+                        "SUBMIT",
+                        format!(
+                            "submit worker shutdown exceeded {}ms; detached",
+                            self.cfg.tip_listener_join_wait.as_millis()
+                        ),
+                    );
+                }
+                submit_worker.drain_results(stats, tui);
+            }
+        }
+
         if let Some(mut prefetch_task) = self.prefetch.take() {
             if self.shutdown.load(Ordering::Relaxed) {
                 prefetch_task.detach();
@@ -273,6 +457,8 @@ pub(super) fn run_mining_loop(
         if backends.is_empty() {
             bail!("all mining backends are unavailable");
         }
+
+        control_plane.drain_submit_results(&stats, &mut tui);
 
         let header_base = match decode_hex(&template.header_base, "header_base") {
             Ok(v) => v,
@@ -459,6 +645,7 @@ pub(super) fn run_mining_loop(
                 tui: &mut tui,
             },
         );
+        control_plane.drain_submit_results(&stats, &mut tui);
         collect_backend_hashes(
             backends,
             Some(&stats),
@@ -634,7 +821,8 @@ pub(super) fn run_mining_loop(
         );
     }
 
-    control_plane.finish();
+    control_plane.drain_submit_results(&stats, &mut tui);
+    control_plane.finish(&stats, &mut tui);
 
     stats.print();
     info("MINER", "stopped");
@@ -868,37 +1056,90 @@ fn resolve_next_template(
         ));
     }
 
-    if let Some(task) = prefetch.as_mut() {
-        let prefetch_budget = cfg.prefetch_wait.max(Duration::from_millis(1));
-        let prefetch_started = Instant::now();
-        loop {
-            let latest_tip_sequence = current_tip_sequence(tip_signal);
-            task.request_if_idle(latest_tip_sequence);
+    let mut network_retry = RetryTracker::default();
+    let mut auth_retry = RetryTracker::default();
 
-            let remaining = prefetch_budget
-                .saturating_sub(prefetch_started.elapsed())
-                .max(Duration::from_millis(1));
-            let Some((tip_sequence, template)) = task.wait_for_result(remaining) else {
-                break;
-            };
-            let latest_after_wait = current_tip_sequence(tip_signal);
-            if tip_sequence == latest_after_wait {
-                if let Some(template) = template {
-                    return Some(template);
-                }
-                break;
-            }
+    while !shutdown.load(Ordering::Relaxed) {
+        let task = prefetch.as_mut()?;
 
+        let latest_tip_sequence = current_tip_sequence(tip_signal);
+        task.request_if_idle(latest_tip_sequence);
+
+        let wait = cfg.prefetch_wait.max(Duration::from_millis(1));
+        let Some((tip_sequence, outcome)) = task.wait_for_result(wait) else {
+            network_retry.note_failure(
+                "NETWORK",
+                "failed to fetch blocktemplate; retrying",
+                "still failing to fetch blocktemplate; retrying",
+                true,
+            );
+            render_tui_now(tui);
+            continue;
+        };
+
+        let latest_after_wait = current_tip_sequence(tip_signal);
+        if tip_sequence < latest_after_wait {
             task.request_if_idle(latest_after_wait);
-            if prefetch_started.elapsed() >= prefetch_budget {
-                break;
+            continue;
+        }
+
+        match outcome {
+            PrefetchOutcome::Template(template) => {
+                network_retry.note_recovered("NETWORK", "blocktemplate fetch recovered");
+                auth_retry.note_recovered("AUTH", "auth refreshed from cookie");
+                render_tui_now(tui);
+                return Some(*template);
+            }
+            PrefetchOutcome::NoWalletLoaded => {
+                set_tui_state_label(tui, "awaiting-wallet");
+                warn(
+                    "WALLET",
+                    "blocktemplate requires loaded wallet; attempting automatic load",
+                );
+                render_tui_now(tui);
+                match auto_load_wallet(client, cfg, shutdown, tui) {
+                    Ok(true) => continue,
+                    Ok(false) => {
+                        warn(
+                            "WALLET",
+                            "unable to auto-load wallet; use --wallet-password, --wallet-password-file, SEINE_WALLET_PASSWORD, or interactive prompt",
+                        );
+                        render_tui_now(tui);
+                        return None;
+                    }
+                    Err(load_err) => {
+                        error(
+                            "WALLET",
+                            format!("automatic wallet load failed: {load_err:#}"),
+                        );
+                        render_tui_now(tui);
+                        return None;
+                    }
+                }
+            }
+            PrefetchOutcome::Unauthorized => {
+                auth_retry.note_failure(
+                    "AUTH",
+                    "auth expired; waiting for new cookie token",
+                    "auth still expired; waiting for new cookie token",
+                    true,
+                );
+                render_tui_now(tui);
+            }
+            PrefetchOutcome::Unavailable => {
+                network_retry.note_failure(
+                    "NETWORK",
+                    "failed to fetch blocktemplate; retrying",
+                    "still failing to fetch blocktemplate; retrying",
+                    true,
+                );
+                render_tui_now(tui);
             }
         }
     }
 
-    fetch_template_with_retry(client, cfg, shutdown.as_ref(), tui)
+    None
 }
-
 fn handle_mining_backend_event(
     event: BackendEvent,
     epoch: u64,
@@ -1162,103 +1403,6 @@ fn recent_template_cache_size_from_timeouts(
         RECENT_TEMPLATE_CACHE_MIN as u128,
         RECENT_TEMPLATE_CACHE_MAX as u128,
     ) as usize
-}
-
-fn fetch_template_with_retry(
-    client: &ApiClient,
-    cfg: &Config,
-    shutdown: &AtomicBool,
-    tui: &mut Option<TuiDisplay>,
-) -> Option<BlockTemplateResponse> {
-    let mut retry = RetryTracker::default();
-
-    while !shutdown.load(Ordering::Relaxed) {
-        match client.get_block_template() {
-            Ok(template) => {
-                retry.note_recovered("NETWORK", "blocktemplate fetch recovered");
-                render_tui_now(tui);
-                return Some(template);
-            }
-            Err(err) if is_no_wallet_loaded_error(&err) => {
-                set_tui_state_label(tui, "awaiting-wallet");
-                warn(
-                    "WALLET",
-                    "blocktemplate requires loaded wallet; attempting automatic load",
-                );
-                render_tui_now(tui);
-                match auto_load_wallet(client, cfg, shutdown, tui) {
-                    Ok(true) => continue,
-                    Ok(false) => {
-                        warn(
-                            "WALLET",
-                            "unable to auto-load wallet; use --wallet-password, --wallet-password-file, SEINE_WALLET_PASSWORD, or interactive prompt",
-                        );
-                        render_tui_now(tui);
-                        return None;
-                    }
-                    Err(load_err) => {
-                        error(
-                            "WALLET",
-                            format!("automatic wallet load failed: {load_err:#}"),
-                        );
-                        render_tui_now(tui);
-                        return None;
-                    }
-                }
-            }
-            Err(err) if is_unauthorized_error(&err) => {
-                match refresh_api_token_from_cookie(client, cfg.token_cookie_path.as_deref()) {
-                    TokenRefreshOutcome::Refreshed => {
-                        success("AUTH", "auth refreshed from cookie");
-                        render_tui_now(tui);
-                        continue;
-                    }
-                    TokenRefreshOutcome::Unchanged => {
-                        retry.note_failure(
-                            "AUTH",
-                            "auth expired; waiting for new cookie token",
-                            "auth still expired; waiting for new cookie token",
-                            true,
-                        );
-                    }
-                    TokenRefreshOutcome::Unavailable => {
-                        retry.note_failure(
-                            "AUTH",
-                            "auth failed; static --token cannot auto-refresh",
-                            "still waiting for manual token refresh",
-                            true,
-                        );
-                    }
-                    TokenRefreshOutcome::Failed(msg) => {
-                        retry.note_failure(
-                            "AUTH",
-                            &msg,
-                            "failed to refresh auth token from cookie",
-                            true,
-                        );
-                    }
-                }
-                render_tui_now(tui);
-                if !sleep_with_shutdown(shutdown, TEMPLATE_RETRY_DELAY) {
-                    break;
-                }
-            }
-            Err(_) => {
-                retry.note_failure(
-                    "NETWORK",
-                    "failed to fetch blocktemplate; retrying",
-                    "still failing to fetch blocktemplate; retrying",
-                    true,
-                );
-                render_tui_now(tui);
-                if !sleep_with_shutdown(shutdown, TEMPLATE_RETRY_DELAY) {
-                    break;
-                }
-            }
-        }
-    }
-
-    None
 }
 
 fn compact_hash(hash: &str) -> String {

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 
-use crate::api::{is_unauthorized_error, ApiClient};
+use crate::api::{is_no_wallet_loaded_error, is_unauthorized_error, ApiClient};
 use crate::config::Config;
 use crate::types::BlockTemplateResponse;
 
@@ -27,29 +27,41 @@ struct PrefetchRequest {
 }
 
 #[derive(Debug)]
+pub(super) enum PrefetchOutcome {
+    Template(Box<BlockTemplateResponse>),
+    NoWalletLoaded,
+    Unauthorized,
+    Unavailable,
+}
+
+#[derive(Debug)]
 struct PrefetchResult {
     tip_sequence: u64,
-    template: Option<BlockTemplateResponse>,
+    outcome: PrefetchOutcome,
 }
 
 impl TemplatePrefetch {
     pub(super) fn spawn(client: ApiClient, cfg: Config, shutdown: Arc<AtomicBool>) -> Self {
-        let (request_tx, request_rx) = bounded::<PrefetchRequest>(1);
+        let (request_tx, request_rx) = bounded::<PrefetchRequest>(4);
         let (result_tx, result_rx) = unbounded::<PrefetchResult>();
         let (done_tx, done_rx) = bounded::<()>(1);
 
         let handle = thread::spawn(move || {
             while !shutdown.load(Ordering::Relaxed) {
-                let request = match request_rx.recv_timeout(Duration::from_millis(100)) {
+                let mut request = match request_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(request) => request,
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => break,
                 };
-                let template = fetch_template_prefetch_once(&client, &cfg, shutdown.as_ref());
+                while let Ok(next) = request_rx.try_recv() {
+                    request.tip_sequence = request.tip_sequence.max(next.tip_sequence);
+                }
+
+                let outcome = fetch_template_prefetch_once(&client, &cfg, shutdown.as_ref());
                 if result_tx
                     .send(PrefetchResult {
                         tip_sequence: request.tip_sequence,
-                        template,
+                        outcome,
                     })
                     .is_err()
                 {
@@ -106,10 +118,7 @@ impl TemplatePrefetch {
         let _ = self.queue_desired_request();
     }
 
-    pub(super) fn wait_for_result(
-        &mut self,
-        wait: Duration,
-    ) -> Option<(u64, Option<BlockTemplateResponse>)> {
+    pub(super) fn wait_for_result(&mut self, wait: Duration) -> Option<(u64, PrefetchOutcome)> {
         let wait = wait.max(Duration::from_millis(1));
         match self.result_rx.recv_timeout(wait) {
             Ok(mut result) => {
@@ -123,7 +132,7 @@ impl TemplatePrefetch {
                 } else {
                     let _ = self.queue_desired_request();
                 }
-                Some((result.tip_sequence, result.template))
+                Some((result.tip_sequence, result.outcome))
             }
             Err(RecvTimeoutError::Timeout) => {
                 if self.inflight_tip_sequence.is_none() {
@@ -172,31 +181,43 @@ impl TemplatePrefetch {
     }
 }
 
+fn prefetch_request_timeout(cfg: &Config) -> Duration {
+    let min_timeout = Duration::from_millis(200);
+    let burst_timeout = cfg.prefetch_wait.max(min_timeout).saturating_mul(4);
+    burst_timeout.min(cfg.request_timeout.max(min_timeout))
+}
+
 fn fetch_template_prefetch_once(
     client: &ApiClient,
     cfg: &Config,
     shutdown: &AtomicBool,
-) -> Option<BlockTemplateResponse> {
+) -> PrefetchOutcome {
     if shutdown.load(Ordering::Relaxed) {
-        return None;
+        return PrefetchOutcome::Unavailable;
     }
 
-    match client.get_block_template() {
-        Ok(template) => Some(template),
+    let timeout = prefetch_request_timeout(cfg);
+    match client.get_block_template_with_timeout(timeout) {
+        Ok(template) => PrefetchOutcome::Template(Box::new(template)),
+        Err(err) if is_no_wallet_loaded_error(&err) => PrefetchOutcome::NoWalletLoaded,
         Err(err) if is_unauthorized_error(&err) => {
             if matches!(
                 refresh_api_token_from_cookie(client, cfg.token_cookie_path.as_deref()),
                 TokenRefreshOutcome::Refreshed
             ) {
-                client.get_block_template().ok()
+                match client.get_block_template_with_timeout(timeout) {
+                    Ok(template) => PrefetchOutcome::Template(Box::new(template)),
+                    Err(err) if is_no_wallet_loaded_error(&err) => PrefetchOutcome::NoWalletLoaded,
+                    Err(err) if is_unauthorized_error(&err) => PrefetchOutcome::Unauthorized,
+                    Err(_) => PrefetchOutcome::Unavailable,
+                }
             } else {
-                None
+                PrefetchOutcome::Unauthorized
             }
         }
-        Err(_) => None,
+        Err(_) => PrefetchOutcome::Unavailable,
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,13 +299,13 @@ mod tests {
         result_tx
             .send(PrefetchResult {
                 tip_sequence: 5,
-                template: None,
+                outcome: PrefetchOutcome::Unavailable,
             })
             .expect("first result should enqueue");
         result_tx
             .send(PrefetchResult {
                 tip_sequence: 7,
-                template: None,
+                outcome: PrefetchOutcome::Unavailable,
             })
             .expect("second result should enqueue");
 

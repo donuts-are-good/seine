@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use crossbeam_channel::{bounded, RecvTimeoutError, Sender, TrySendError};
 
-use crate::backend::{BackendInstanceId, PowBackend, WorkAssignment};
+use crate::backend::{BackendCallStatus, BackendInstanceId, PowBackend, WorkAssignment};
 
 use super::ui::warn;
 use super::BackendSlot;
@@ -237,9 +237,6 @@ impl BackendExecutor {
             std::iter::repeat_with(|| None).take(outcomes_len).collect();
         let mut task_contexts = BTreeMap::<usize, TimeoutTaskContext>::new();
         let (outcome_tx, outcome_rx) = bounded::<BackendTaskOutcome>(expected.max(1));
-        let recv_deadline = Instant::now()
-            .checked_add(timeout)
-            .unwrap_or_else(Instant::now);
 
         for task in tasks {
             let backend_id = task.backend_id;
@@ -247,7 +244,9 @@ impl BackendExecutor {
             let action = task.kind.action_label();
             let backend_handle = Arc::clone(&task.backend_handle);
             let idx = task.idx;
-            let task_deadline = recv_deadline;
+            let task_deadline = Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(Instant::now);
             task_contexts.insert(
                 idx,
                 TimeoutTaskContext {
@@ -304,11 +303,8 @@ impl BackendExecutor {
         let mut pending = expected_indices.clone();
         while !pending.is_empty() {
             let now = Instant::now();
-            if now >= recv_deadline {
-                break;
-            }
 
-            let mut next_deadline = recv_deadline;
+            let mut next_deadline: Option<Instant> = None;
             let mut expired = Vec::new();
             for idx in &pending {
                 let Some(context) = task_contexts.get(idx) else {
@@ -318,15 +314,18 @@ impl BackendExecutor {
                 if now >= context.deadline {
                     expired.push(*idx);
                 } else {
-                    next_deadline = next_deadline.min(context.deadline);
+                    next_deadline = Some(
+                        next_deadline
+                            .map_or(context.deadline, |current| current.min(context.deadline)),
+                    );
                 }
             }
             for idx in expired {
                 pending.remove(&idx);
             }
-            if pending.is_empty() {
+            let Some(next_deadline) = next_deadline else {
                 break;
-            }
+            };
 
             let wait_for = next_deadline
                 .saturating_duration_since(now)
@@ -405,6 +404,9 @@ fn run_backend_command(command: BackendWorkerCommand) {
     }
 }
 
+const NONBLOCKING_BACKOFF_MIN: Duration = Duration::from_micros(50);
+const NONBLOCKING_BACKOFF_MAX: Duration = Duration::from_millis(1);
+
 fn run_backend_call(
     backend_handle: Arc<dyn PowBackend>,
     kind: BackendTaskKind,
@@ -414,15 +416,66 @@ fn run_backend_call(
         return Err(anyhow!("task deadline elapsed before backend call"));
     }
     match panic::catch_unwind(AssertUnwindSafe(|| match kind {
-        BackendTaskKind::Assign(work) => backend_handle.assign_work_with_deadline(&work, deadline),
-        BackendTaskKind::AssignBatch(batch) => {
-            backend_handle.assign_work_batch_with_deadline(&batch, deadline)
-        }
-        BackendTaskKind::Cancel => backend_handle.cancel_work_with_deadline(deadline),
-        BackendTaskKind::Fence => backend_handle.fence_with_deadline(deadline),
+        BackendTaskKind::Assign(work) => run_nonblocking_until_deadline(
+            deadline,
+            || backend_handle.assign_work_batch_nonblocking(std::slice::from_ref(&work)),
+            "assignment deadline elapsed before backend accepted work",
+        ),
+        BackendTaskKind::AssignBatch(batch) => run_nonblocking_until_deadline(
+            deadline,
+            || backend_handle.assign_work_batch_nonblocking(&batch),
+            "assignment deadline elapsed before backend accepted work",
+        ),
+        BackendTaskKind::Cancel => run_nonblocking_until_deadline(
+            deadline,
+            || backend_handle.cancel_work_nonblocking(),
+            "cancel deadline elapsed before backend acknowledged cancel",
+        ),
+        BackendTaskKind::Fence => run_nonblocking_until_deadline(
+            deadline,
+            || backend_handle.fence_nonblocking(),
+            "fence deadline elapsed before backend acknowledged fence",
+        ),
     })) {
         Ok(result) => result,
         Err(_) => Err(anyhow!("backend task panicked")),
+    }
+}
+
+fn run_nonblocking_until_deadline<F>(
+    deadline: Instant,
+    mut op: F,
+    timeout_message: &'static str,
+) -> Result<()>
+where
+    F: FnMut() -> Result<BackendCallStatus>,
+{
+    let mut backoff = NONBLOCKING_BACKOFF_MIN;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(anyhow!(timeout_message));
+        }
+
+        match op()? {
+            BackendCallStatus::Complete => {
+                if Instant::now() > deadline {
+                    return Err(anyhow!(timeout_message));
+                }
+                return Ok(());
+            }
+            BackendCallStatus::Pending => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(anyhow!(timeout_message));
+                }
+                let wait = deadline
+                    .saturating_duration_since(now)
+                    .min(backoff)
+                    .max(Duration::from_micros(10));
+                thread::sleep(wait);
+                backoff = backoff.saturating_mul(2).min(NONBLOCKING_BACKOFF_MAX);
+            }
+        }
     }
 }
 
@@ -431,11 +484,11 @@ mod tests {
     use super::*;
     use crossbeam_channel::Sender;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
-    use crate::backend::{BackendEvent, NonceChunk, PowBackend, WorkTemplate};
+    use crate::backend::{BackendCallStatus, BackendEvent, NonceChunk, PowBackend, WorkTemplate};
 
     struct NoopBackend;
 
@@ -707,19 +760,21 @@ mod tests {
         );
     }
 
-    struct DeadlineCaptureBackend {
-        deadlines: Arc<Mutex<Vec<Instant>>>,
+    struct PendingThenCompleteBackend {
+        pending: AtomicUsize,
     }
 
-    impl DeadlineCaptureBackend {
-        fn new(deadlines: Arc<Mutex<Vec<Instant>>>) -> Self {
-            Self { deadlines }
+    impl PendingThenCompleteBackend {
+        fn new(pending: usize) -> Self {
+            Self {
+                pending: AtomicUsize::new(pending),
+            }
         }
     }
 
-    impl PowBackend for DeadlineCaptureBackend {
+    impl PowBackend for PendingThenCompleteBackend {
         fn name(&self) -> &'static str {
-            "deadline-capture"
+            "pending-assign"
         }
 
         fn lanes(&self) -> usize {
@@ -740,31 +795,34 @@ mod tests {
             Ok(())
         }
 
-        fn assign_work_with_deadline(
+        fn assign_work_batch_nonblocking(
             &self,
-            _work: &WorkAssignment,
-            deadline: Instant,
-        ) -> Result<()> {
-            self.deadlines
-                .lock()
-                .expect("deadline capture lock should not be poisoned")
-                .push(deadline);
-            Ok(())
+            _work: &[WorkAssignment],
+        ) -> Result<BackendCallStatus> {
+            let mut pending = self.pending.load(Ordering::Acquire);
+            loop {
+                if pending == 0 {
+                    return Ok(BackendCallStatus::Complete);
+                }
+                match self.pending.compare_exchange(
+                    pending,
+                    pending - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return Ok(BackendCallStatus::Pending),
+                    Err(observed) => pending = observed,
+                }
+            }
         }
     }
 
     #[test]
-    fn dispatch_uses_shared_deadline_for_all_tasks() {
+    fn dispatch_retries_pending_nonblocking_assignment_until_complete() {
         let executor = BackendExecutor::new();
-        let first_deadlines = Arc::new(Mutex::new(Vec::new()));
-        let second_deadlines = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(PendingThenCompleteBackend::new(3)) as Arc<dyn PowBackend>;
 
-        let first = Arc::new(DeadlineCaptureBackend::new(Arc::clone(&first_deadlines)))
-            as Arc<dyn PowBackend>;
-        let second = Arc::new(DeadlineCaptureBackend::new(Arc::clone(&second_deadlines)))
-            as Arc<dyn PowBackend>;
-
-        let work = || WorkAssignment {
+        let work = WorkAssignment {
             template: Arc::new(WorkTemplate {
                 work_id: 1,
                 epoch: 1,
@@ -779,38 +837,18 @@ mod tests {
         };
 
         let outcomes = executor.dispatch_backend_tasks(
-            vec![
-                BackendTask {
-                    idx: 0,
-                    backend_id: 1,
-                    backend: "deadline-capture",
-                    backend_handle: first,
-                    kind: BackendTaskKind::Assign(work()),
-                },
-                BackendTask {
-                    idx: 1,
-                    backend_id: 2,
-                    backend: "deadline-capture",
-                    backend_handle: second,
-                    kind: BackendTaskKind::Assign(work()),
-                },
-            ],
+            vec![BackendTask {
+                idx: 0,
+                backend_id: 1,
+                backend: "pending-assign",
+                backend_handle: backend,
+                kind: BackendTaskKind::Assign(work),
+            }],
             Duration::from_millis(25),
         );
 
         assert!(outcomes[0]
             .as_ref()
             .is_some_and(|outcome| outcome.result.is_ok()));
-        assert!(outcomes[1]
-            .as_ref()
-            .is_some_and(|outcome| outcome.result.is_ok()));
-
-        let first_deadline = first_deadlines
-            .lock()
-            .expect("deadline capture lock should not be poisoned")[0];
-        let second_deadline = second_deadlines
-            .lock()
-            .expect("deadline capture lock should not be poisoned")[0];
-        assert_eq!(first_deadline, second_deadline);
     }
 }

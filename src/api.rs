@@ -112,10 +112,25 @@ impl ApiClient {
         Ok(true)
     }
 
+    #[allow(dead_code)]
     pub fn get_block_template(&self) -> Result<BlockTemplateResponse> {
         let url = format!("{}/api/mining/blocktemplate", self.base_url);
         let resp = self
             .with_auth(self.json_client.get(url))?
+            .send()
+            .context("request to blocktemplate endpoint failed")?;
+
+        decode_json_response(resp, "blocktemplate")
+    }
+
+    pub fn get_block_template_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<BlockTemplateResponse> {
+        let timeout = timeout.max(Duration::from_millis(1));
+        let url = format!("{}/api/mining/blocktemplate", self.base_url);
+        let resp = self
+            .with_auth(self.json_client.get(url).timeout(timeout))?
             .send()
             .context("request to blocktemplate endpoint failed")?;
 

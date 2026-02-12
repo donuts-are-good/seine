@@ -245,6 +245,13 @@ impl PreemptionGranularity {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[allow(dead_code)]
+pub enum BackendCallStatus {
+    Complete,
+    Pending,
+}
+
 pub trait PowBackend: Send + Sync {
     fn name(&self) -> &'static str;
 
@@ -268,6 +275,7 @@ pub trait PowBackend: Send + Sync {
     ///
     /// Default behavior executes the assignment call then reports timeout if the
     /// backend did not return before the deadline.
+    #[allow(dead_code)]
     fn assign_work_with_deadline(&self, work: &WorkAssignment, deadline: Instant) -> Result<()> {
         self.assign_work(work.clone())?;
         if Instant::now() > deadline {
@@ -309,6 +317,7 @@ pub trait PowBackend: Send + Sync {
     ///
     /// Default behavior executes the assignment call then reports timeout if the
     /// backend did not return before the deadline.
+    #[allow(dead_code)]
     fn assign_work_batch_with_deadline(
         &self,
         work: &[WorkAssignment],
@@ -332,6 +341,28 @@ pub trait PowBackend: Send + Sync {
         }
     }
 
+    /// Optional non-blocking dispatch hook for future high-throughput backends.
+    ///
+    /// Backends can return `Pending` to indicate the request has not been accepted yet
+    /// (for example queue-pressure on persistent GPU schedulers). Runtime will retry
+    /// until the task deadline elapses.
+    fn assign_work_batch_nonblocking(&self, work: &[WorkAssignment]) -> Result<BackendCallStatus> {
+        self.assign_work_batch(work)?;
+        Ok(BackendCallStatus::Complete)
+    }
+
+    /// Optional non-blocking cancel hook for future high-throughput backends.
+    fn cancel_work_nonblocking(&self) -> Result<BackendCallStatus> {
+        self.cancel_work()?;
+        Ok(BackendCallStatus::Complete)
+    }
+
+    /// Optional non-blocking fence hook for future high-throughput backends.
+    fn fence_nonblocking(&self) -> Result<BackendCallStatus> {
+        self.fence()?;
+        Ok(BackendCallStatus::Complete)
+    }
+
     /// Request the backend to stop processing the current assignment.
     fn cancel_work(&self) -> Result<()> {
         Ok(())
@@ -348,6 +379,7 @@ pub trait PowBackend: Send + Sync {
     /// Request backend cancellation before a soft deadline.
     ///
     /// Default behavior executes cancel then reports timeout if call returns late.
+    #[allow(dead_code)]
     fn cancel_work_with_deadline(&self, deadline: Instant) -> Result<()> {
         self.cancel_work()?;
         if Instant::now() > deadline {
@@ -369,6 +401,7 @@ pub trait PowBackend: Send + Sync {
     /// Wait for backend quiesce/fence before a soft deadline.
     ///
     /// Default behavior executes fence then reports timeout if call returns late.
+    #[allow(dead_code)]
     fn fence_with_deadline(&self, deadline: Instant) -> Result<()> {
         self.fence()?;
         if Instant::now() > deadline {

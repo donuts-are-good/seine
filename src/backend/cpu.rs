@@ -736,6 +736,7 @@ fn wait_for_idle(shared: &Shared) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn wait_for_idle_until(shared: &Shared, deadline: Instant) -> Result<()> {
     if shared.active_workers.load(Ordering::Acquire) == 0 {
         return Ok(());

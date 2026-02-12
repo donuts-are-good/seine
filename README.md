@@ -7,6 +7,9 @@ Current status:
 - NVIDIA backend: scaffolded interface only (not implemented yet).
 - Runtime architecture: supports multiple backends in one process with persistent workers, configurable bounded backend event queues with lossless `Solution` delivery and deduplicated backend `Error` events (prevents multi-thread error storms from stalling worker teardown), coalesced tip notifications (deduped across SSE reconnects), template prefetch overlap to reduce round-boundary idle, and optional strict quiesce barriers for round-accurate hash accounting.
   - Backend assignment/control dispatch now runs through one shared per-backend task executor with panic capture and timeout quarantine to avoid duplicated control paths and extra thread churn.
+  - Backend dispatch deadlines are now scoped per task dispatch (not one shared batch deadline) to avoid false timeout quarantine as backend counts grow.
+  - Mining control flow no longer performs direct template/submit HTTP calls; dedicated template-prefetch and submit workers own network I/O so scheduler/control loops stay responsive under network jitter.
+  - `PowBackend` now exposes optional non-blocking assign/cancel/fence hooks (`*_nonblocking`) for future persistent-kernel GPU backends that need queue-pressure signaling.
   - Runtime assigns disjoint nonce chunks per backend per round (backend-local scheduling inside each chunk) so CPU and future GPU implementations can iterate independently without nonce overlap.
   - Runtime supports batched per-backend work assignment via backend queue-depth hints (`max_inflight_assignments`) so future GPU backends can overlap control and kernel scheduling.
   - Backends explicitly advertise deadline semantics (`cooperative` vs `best-effort`) so timeout behavior is visible before mixing heterogeneous devices.
