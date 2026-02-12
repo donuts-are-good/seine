@@ -17,8 +17,8 @@ pub mod nvidia {
     use crossbeam_channel::Sender;
 
     use super::{
-        BackendCapabilities, BackendEvent, BackendInstanceId, BenchBackend, PowBackend,
-        PreemptionGranularity, WorkAssignment,
+        BackendCapabilities, BackendEvent, BackendInstanceId, BenchBackend, DeadlineSupport,
+        PowBackend, PreemptionGranularity, WorkAssignment,
     };
 
     pub struct NvidiaBackend {
@@ -84,6 +84,7 @@ pub mod nvidia {
                 preferred_iters_per_lane: Some(1),
                 preferred_hash_poll_interval: Some(Duration::from_millis(50)),
                 max_inflight_assignments: 2,
+                deadline_support: DeadlineSupport::BestEffort,
             }
         }
 
@@ -153,6 +154,23 @@ pub struct BackendTelemetry {
     pub inflight_assignment_micros: u64,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DeadlineSupport {
+    /// Backend operations are expected to obey deadline-aware APIs directly.
+    Cooperative,
+    /// Runtime can enforce watchdog timeouts, but backend calls may complete late.
+    BestEffort,
+}
+
+impl DeadlineSupport {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Cooperative => "cooperative",
+            Self::BestEffort => "best-effort",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct BackendCapabilities {
     /// Preferred iterations per lane for one assignment chunk.
@@ -164,6 +182,8 @@ pub struct BackendCapabilities {
     /// Maximum number of in-flight assignments this backend can queue efficiently.
     /// Runtime may split one reservation into this many chunks for dispatch.
     pub max_inflight_assignments: u32,
+    /// Contract for deadline-aware backend calls.
+    pub deadline_support: DeadlineSupport,
 }
 
 impl Default for BackendCapabilities {
@@ -172,6 +192,7 @@ impl Default for BackendCapabilities {
             preferred_iters_per_lane: None,
             preferred_hash_poll_interval: None,
             max_inflight_assignments: 1,
+            deadline_support: DeadlineSupport::BestEffort,
         }
     }
 }

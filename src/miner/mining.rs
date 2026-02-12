@@ -589,26 +589,28 @@ pub(super) fn run_mining_loop(
         control_plane.spawn_prefetch_if_needed();
 
         let round_start = Instant::now();
-        let mut round_state = run_round_event_loop(
+        let mut round_runtime = RoundRuntime {
             cfg,
-            shutdown.as_ref(),
+            shutdown: shutdown.as_ref(),
             backends,
             backend_events,
             tip_signal,
-            &stats,
-            &mut tui,
-            &mut last_stats_print,
+            stats: &stats,
+            tui: &mut tui,
+            last_stats_print: &mut last_stats_print,
+            nonce_scheduler: &mut nonce_scheduler,
+            backend_weights: &backend_weights,
+        };
+        let mut round_state = round_runtime.run(RoundInput {
             epoch,
             work_id,
             stop_at,
             round_start,
-            &height,
-            &difficulty,
-            &mut nonce_scheduler,
-            &header_base,
+            height: &height,
+            difficulty: &difficulty,
+            header_base: &header_base,
             target,
-            &backend_weights,
-        )?;
+        })?;
 
         if cfg.strict_round_accounting {
             let _ =
@@ -735,184 +737,196 @@ pub(super) fn run_mining_loop(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_round_event_loop(
-    cfg: &Config,
-    shutdown: &AtomicBool,
-    backends: &mut Vec<BackendSlot>,
-    backend_events: &Receiver<BackendEvent>,
-    tip_signal: Option<&TipSignal>,
-    stats: &Stats,
-    tui: &mut Option<TuiDisplay>,
-    last_stats_print: &mut Instant,
+struct RoundInput<'a> {
     epoch: u64,
     work_id: u64,
     stop_at: Instant,
     round_start: Instant,
-    height: &str,
-    difficulty: &str,
-    nonce_scheduler: &mut NonceScheduler,
-    header_base: &Arc<[u8]>,
+    height: &'a str,
+    difficulty: &'a str,
+    header_base: &'a Arc<[u8]>,
     target: [u8; 32],
-    backend_weights: &BTreeMap<u64, f64>,
-) -> Result<RoundLoopState> {
-    let mut solved: Option<MiningSolution> = None;
-    let mut stale_tip_event = false;
-    let mut round_hashes = 0u64;
-    let mut round_backend_hashes = BTreeMap::new();
-    let mut round_backend_telemetry = BTreeMap::new();
-    let mut topology_changed = false;
-    let mut hash_poll_interval =
-        super::effective_hash_poll_interval(backends, cfg.hash_poll_interval);
-    let mut next_hash_poll_at = Instant::now() + hash_poll_interval;
-    update_tui(
-        tui,
-        stats,
-        RoundUiView {
-            backends,
-            round_backend_hashes: &round_backend_hashes,
-            round_hashes,
-            round_start,
-            height,
-            difficulty,
-            epoch,
-            state_label: "working",
-        },
-    );
+}
 
-    while !shutdown.load(Ordering::Relaxed)
-        && Instant::now() < stop_at
-        && solved.is_none()
-        && !stale_tip_event
-    {
-        let now = Instant::now();
-        if now >= next_hash_poll_at {
-            collect_backend_hashes(
-                backends,
-                Some(stats),
-                &mut round_hashes,
-                Some(&mut round_backend_hashes),
-                Some(&mut round_backend_telemetry),
-            );
-            next_hash_poll_at = now + hash_poll_interval;
-            update_tui(
-                tui,
-                stats,
-                RoundUiView {
-                    backends,
-                    round_backend_hashes: &round_backend_hashes,
-                    round_hashes,
-                    round_start,
-                    height,
-                    difficulty,
-                    epoch,
-                    state_label: "working",
-                },
-            );
-        }
+struct RoundRuntime<'a> {
+    cfg: &'a Config,
+    shutdown: &'a AtomicBool,
+    backends: &'a mut Vec<BackendSlot>,
+    backend_events: &'a Receiver<BackendEvent>,
+    tip_signal: Option<&'a TipSignal>,
+    stats: &'a Stats,
+    tui: &'a mut Option<TuiDisplay>,
+    last_stats_print: &'a mut Instant,
+    nonce_scheduler: &'a mut NonceScheduler,
+    backend_weights: &'a BTreeMap<u64, f64>,
+}
 
-        maybe_print_stats(stats, last_stats_print, cfg.stats_interval, tui.is_none());
-
-        if tip_signal.is_some_and(TipSignal::take_stale) {
-            stale_tip_event = true;
-            update_tui(
-                tui,
-                stats,
-                RoundUiView {
-                    backends,
-                    round_backend_hashes: &round_backend_hashes,
-                    round_hashes,
-                    round_start,
-                    height,
-                    difficulty,
-                    epoch,
-                    state_label: "stale-tip",
-                },
-            );
-            continue;
-        }
-
-        let wait_for = next_event_wait(
-            stop_at,
-            *last_stats_print,
-            cfg.stats_interval,
-            next_hash_poll_at,
+impl<'a> RoundRuntime<'a> {
+    fn run(&mut self, input: RoundInput<'_>) -> Result<RoundLoopState> {
+        let mut solved: Option<MiningSolution> = None;
+        let mut stale_tip_event = false;
+        let mut round_hashes = 0u64;
+        let mut round_backend_hashes = BTreeMap::new();
+        let mut round_backend_telemetry = BTreeMap::new();
+        let mut topology_changed = false;
+        let mut hash_poll_interval =
+            super::effective_hash_poll_interval(self.backends, self.cfg.hash_poll_interval);
+        let mut next_hash_poll_at = Instant::now() + hash_poll_interval;
+        update_tui(
+            self.tui,
+            self.stats,
+            RoundUiView {
+                backends: self.backends,
+                round_backend_hashes: &round_backend_hashes,
+                round_hashes,
+                round_start: input.round_start,
+                height: input.height,
+                difficulty: input.difficulty,
+                epoch: input.epoch,
+                state_label: "working",
+            },
         );
 
-        crossbeam_channel::select! {
-            recv(backend_events) -> event => {
-                let event = event.map_err(|_| anyhow!("backend event channel closed"))?;
-                if handle_mining_backend_event(event, epoch, &mut solved, backends)?
-                    == BackendEventAction::TopologyChanged
-                {
-                    topology_changed = true;
-                }
-            }
-            default(wait_for) => {}
-        }
-
-        if topology_changed
-            && !shutdown.load(Ordering::Relaxed)
+        while !self.shutdown.load(Ordering::Relaxed)
+            && Instant::now() < input.stop_at
             && solved.is_none()
             && !stale_tip_event
-            && Instant::now() < stop_at
-            && !backends.is_empty()
         {
-            let reservation = nonce_scheduler.reserve(total_lanes(backends));
-            warn(
-                "BACKEND",
-                format!(
-                    "topology change; redistributing e={} id={} backends={}",
-                    epoch,
-                    work_id,
-                    super::backend_names(backends),
-                ),
-            );
-            let additional_span = distribute_work(
-                backends,
-                super::DistributeWorkOptions {
-                    epoch,
-                    work_id,
-                    header_base: Arc::clone(header_base),
-                    target,
-                    reservation,
-                    stop_at,
-                    assignment_timeout: cfg.backend_assign_timeout,
-                    backend_weights: work_distribution_weights(
-                        cfg.work_allocation,
-                        backend_weights,
-                    ),
-                },
-            )?;
-            nonce_scheduler.consume_additional_span(additional_span);
-            hash_poll_interval =
-                super::effective_hash_poll_interval(backends, cfg.hash_poll_interval);
-            next_hash_poll_at = Instant::now() + hash_poll_interval;
-            topology_changed = false;
-            update_tui(
-                tui,
-                stats,
-                RoundUiView {
-                    backends,
-                    round_backend_hashes: &round_backend_hashes,
-                    round_hashes,
-                    round_start,
-                    height,
-                    difficulty,
-                    epoch,
-                    state_label: "rebalanced",
-                },
-            );
-        }
-    }
+            let now = Instant::now();
+            if now >= next_hash_poll_at {
+                collect_backend_hashes(
+                    self.backends,
+                    Some(self.stats),
+                    &mut round_hashes,
+                    Some(&mut round_backend_hashes),
+                    Some(&mut round_backend_telemetry),
+                );
+                next_hash_poll_at = now + hash_poll_interval;
+                update_tui(
+                    self.tui,
+                    self.stats,
+                    RoundUiView {
+                        backends: self.backends,
+                        round_backend_hashes: &round_backend_hashes,
+                        round_hashes,
+                        round_start: input.round_start,
+                        height: input.height,
+                        difficulty: input.difficulty,
+                        epoch: input.epoch,
+                        state_label: "working",
+                    },
+                );
+            }
 
-    Ok(RoundLoopState {
-        solved,
-        stale_tip_event,
-        round_hashes,
-        round_backend_hashes,
-        round_backend_telemetry,
-    })
+            maybe_print_stats(
+                self.stats,
+                self.last_stats_print,
+                self.cfg.stats_interval,
+                self.tui.is_none(),
+            );
+
+            if self.tip_signal.is_some_and(TipSignal::take_stale) {
+                stale_tip_event = true;
+                update_tui(
+                    self.tui,
+                    self.stats,
+                    RoundUiView {
+                        backends: self.backends,
+                        round_backend_hashes: &round_backend_hashes,
+                        round_hashes,
+                        round_start: input.round_start,
+                        height: input.height,
+                        difficulty: input.difficulty,
+                        epoch: input.epoch,
+                        state_label: "stale-tip",
+                    },
+                );
+                continue;
+            }
+
+            let wait_for = next_event_wait(
+                input.stop_at,
+                *self.last_stats_print,
+                self.cfg.stats_interval,
+                next_hash_poll_at,
+            );
+
+            crossbeam_channel::select! {
+                recv(self.backend_events) -> event => {
+                    let event = event.map_err(|_| anyhow!("backend event channel closed"))?;
+                    if handle_mining_backend_event(event, input.epoch, &mut solved, self.backends)?
+                        == BackendEventAction::TopologyChanged
+                    {
+                        topology_changed = true;
+                    }
+                }
+                default(wait_for) => {}
+            }
+
+            if topology_changed
+                && !self.shutdown.load(Ordering::Relaxed)
+                && solved.is_none()
+                && !stale_tip_event
+                && Instant::now() < input.stop_at
+                && !self.backends.is_empty()
+            {
+                let reservation = self.nonce_scheduler.reserve(total_lanes(self.backends));
+                warn(
+                    "BACKEND",
+                    format!(
+                        "topology change; redistributing e={} id={} backends={}",
+                        input.epoch,
+                        input.work_id,
+                        super::backend_names(self.backends),
+                    ),
+                );
+                let additional_span = distribute_work(
+                    self.backends,
+                    super::DistributeWorkOptions {
+                        epoch: input.epoch,
+                        work_id: input.work_id,
+                        header_base: Arc::clone(input.header_base),
+                        target: input.target,
+                        reservation,
+                        stop_at: input.stop_at,
+                        assignment_timeout: self.cfg.backend_assign_timeout,
+                        backend_weights: work_distribution_weights(
+                            self.cfg.work_allocation,
+                            self.backend_weights,
+                        ),
+                    },
+                )?;
+                self.nonce_scheduler
+                    .consume_additional_span(additional_span);
+                hash_poll_interval =
+                    super::effective_hash_poll_interval(self.backends, self.cfg.hash_poll_interval);
+                next_hash_poll_at = Instant::now() + hash_poll_interval;
+                topology_changed = false;
+                update_tui(
+                    self.tui,
+                    self.stats,
+                    RoundUiView {
+                        backends: self.backends,
+                        round_backend_hashes: &round_backend_hashes,
+                        round_hashes,
+                        round_start: input.round_start,
+                        height: input.height,
+                        difficulty: input.difficulty,
+                        epoch: input.epoch,
+                        state_label: "rebalanced",
+                    },
+                );
+            }
+        }
+
+        Ok(RoundLoopState {
+            solved,
+            stale_tip_event,
+            round_hashes,
+            round_backend_hashes,
+            round_backend_telemetry,
+        })
+    }
 }
 
 struct TemplatePrefetch {

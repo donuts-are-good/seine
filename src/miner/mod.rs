@@ -1,6 +1,7 @@
 mod auth;
 mod backend_control;
 mod bench;
+mod dispatch_pool;
 mod mining;
 mod scheduler;
 mod stats;
@@ -23,8 +24,8 @@ use crate::api::ApiClient;
 use crate::backend::cpu::CpuBackend;
 use crate::backend::nvidia::NvidiaBackend;
 use crate::backend::{
-    BackendEvent, BackendInstanceId, BackendTelemetry, NonceChunk, PowBackend,
-    PreemptionGranularity, WorkAssignment, WORK_ID_MAX,
+    BackendEvent, BackendInstanceId, BackendTelemetry, DeadlineSupport, PowBackend,
+    PreemptionGranularity, WORK_ID_MAX,
 };
 use crate::config::{BackendKind, Config, UiMode, WorkAllocation};
 use scheduler::NonceReservation;
@@ -166,6 +167,26 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
                 format!(
                     "strict accounting fence latency depends on backend preemption ({})",
                     constrained.join(", ")
+                ),
+            );
+        }
+        let best_effort_deadlines: Vec<String> = backends
+            .iter()
+            .filter_map(|slot| {
+                let capabilities = slot.backend.capabilities();
+                if capabilities.deadline_support == DeadlineSupport::BestEffort {
+                    Some(format!("{}#{}", slot.backend.name(), slot.id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !best_effort_deadlines.is_empty() {
+            warn(
+                "MINER",
+                format!(
+                    "deadline enforcement is best-effort for {}",
+                    best_effort_deadlines.join(", ")
                 ),
             );
         }
@@ -358,6 +379,7 @@ fn distribute_work(
     work_allocator::distribute_work(backends, options)
 }
 
+#[cfg(test)]
 fn compute_backend_nonce_counts(
     backends: &[BackendSlot],
     max_iters_per_lane: u64,
@@ -545,13 +567,15 @@ fn backend_chunk_profiles(backends: &[BackendSlot], default_iters_per_lane: u64)
                 .preferred_hash_poll_interval
                 .map(|d| format!("{}ms", d.as_millis()))
                 .unwrap_or_else(|| "none".to_string());
+            let deadline_support = capabilities.deadline_support.describe();
             format!(
-                "{}#{}={} iters/lane inflight={} poll_hint={}",
+                "{}#{}={} iters/lane inflight={} poll_hint={} deadline={}",
                 slot.backend.name(),
                 slot.id,
                 hinted,
                 inflight,
                 poll_hint,
+                deadline_support,
             )
         })
         .collect::<Vec<_>>()
@@ -681,6 +705,7 @@ fn next_work_id(next_id: &mut u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{NonceChunk, WorkAssignment};
     use anyhow::anyhow;
     use blocknet_pow_spec::POW_HEADER_BASE_LEN;
     use crossbeam_channel::Sender;
@@ -706,6 +731,7 @@ mod tests {
         preferred_iters_per_lane: Option<u64>,
         preferred_hash_poll_interval: Option<Duration>,
         max_inflight_assignments: u32,
+        assign_delay: Option<Duration>,
     }
 
     impl MockBackend {
@@ -717,6 +743,7 @@ mod tests {
                 preferred_iters_per_lane: None,
                 preferred_hash_poll_interval: None,
                 max_inflight_assignments: 1,
+                assign_delay: None,
             }
         }
 
@@ -732,6 +759,11 @@ mod tests {
 
         fn with_max_inflight_assignments(mut self, max_inflight_assignments: u32) -> Self {
             self.max_inflight_assignments = max_inflight_assignments.max(1);
+            self
+        }
+
+        fn with_assign_delay(mut self, assign_delay: Duration) -> Self {
+            self.assign_delay = Some(assign_delay);
             self
         }
     }
@@ -761,6 +793,9 @@ mod tests {
         }
 
         fn assign_work(&self, work: WorkAssignment) -> Result<()> {
+            if let Some(delay) = self.assign_delay {
+                std::thread::sleep(delay);
+            }
             self.state.assign_calls.fetch_add(1, Ordering::Relaxed);
             if self.state.fail_next_assign.swap(false, Ordering::AcqRel) {
                 return Err(anyhow!("injected assign failure"));
@@ -796,6 +831,7 @@ mod tests {
                 preferred_iters_per_lane: self.preferred_iters_per_lane,
                 preferred_hash_poll_interval: self.preferred_hash_poll_interval,
                 max_inflight_assignments: self.max_inflight_assignments.max(1),
+                deadline_support: crate::backend::DeadlineSupport::Cooperative,
             }
         }
     }
@@ -962,6 +998,48 @@ mod tests {
         assert_eq!(chunks[2].nonce_count, 3);
         assert_eq!(chunks[3].start_nonce, 209);
         assert_eq!(chunks[3].nonce_count, 3);
+    }
+
+    #[test]
+    fn distribute_work_timeout_cleanup_stops_backend_after_late_completion() {
+        let slow_state = Arc::new(MockState::default());
+        let mut backends = vec![slot(
+            9,
+            1,
+            Box::new(
+                MockBackend::new("cpu", 1, Arc::clone(&slow_state))
+                    .with_assign_delay(Duration::from_millis(50)),
+            ),
+        )];
+
+        let err = distribute_work(
+            &mut backends,
+            DistributeWorkOptions {
+                epoch: 1,
+                work_id: 1,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                target: [0xFF; 32],
+                reservation: NonceReservation {
+                    start_nonce: 10,
+                    max_iters_per_lane: 1,
+                    reserved_span: 1,
+                },
+                stop_at: Instant::now() + Duration::from_secs(1),
+                assignment_timeout: Duration::from_millis(5),
+                backend_weights: None,
+            },
+        )
+        .expect_err("timeout should quarantine the only backend");
+        assert!(format!("{err:#}").contains("all mining backends are unavailable"));
+
+        let stop_deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < stop_deadline {
+            if slow_state.stop_calls.load(Ordering::Relaxed) > 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed-out backend should be stopped once late dispatch completes");
     }
 
     #[test]

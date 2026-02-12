@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
@@ -9,7 +8,8 @@ use crate::backend::{BackendEvent, BackendInstanceId};
 
 use super::ui::{error, info, warn};
 use super::{
-    backend_names, remove_backend_by_id, BackendSlot, RuntimeBackendEventAction, RuntimeMode,
+    backend_names, dispatch_pool, remove_backend_by_id, BackendSlot, RuntimeBackendEventAction,
+    RuntimeMode,
 };
 
 type BackendFailureMap = BTreeMap<BackendInstanceId, (&'static str, Vec<String>)>;
@@ -281,6 +281,8 @@ fn run_backend_control_phase(
     let timeout = timeout.max(Duration::from_millis(1));
     let expected = slots.len();
     let mut metadata = Vec::with_capacity(expected);
+    let mut outcomes: Vec<Option<BackendControlOutcome>> =
+        std::iter::repeat_with(|| None).take(expected).collect();
     let (outcome_tx, outcome_rx) = bounded::<BackendControlOutcome>(expected.max(1));
 
     for (idx, slot) in slots.into_iter().enumerate() {
@@ -289,7 +291,7 @@ fn run_backend_control_phase(
         metadata.push((backend_id, backend));
 
         let outcome_tx = outcome_tx.clone();
-        thread::spawn(move || {
+        dispatch_pool::submit(Box::new(move || {
             let started = Instant::now();
             let deadline = started + timeout;
             let result = match phase {
@@ -297,19 +299,21 @@ fn run_backend_control_phase(
                 BackendControlPhase::Fence => slot.backend.fence_with_deadline(deadline),
             };
             let elapsed = started.elapsed();
-            let _ = outcome_tx.send(BackendControlOutcome {
+            let send_result = outcome_tx.send(BackendControlOutcome {
                 idx,
                 slot,
                 elapsed,
                 result,
             });
-        });
+            if let Err(send_err) = send_result {
+                let mut dropped = send_err.0;
+                dropped.slot.backend.stop();
+            }
+        }));
     }
     drop(outcome_tx);
 
     let deadline = Instant::now() + timeout;
-    let mut outcomes: Vec<Option<BackendControlOutcome>> =
-        std::iter::repeat_with(|| None).take(expected).collect();
     let mut received = 0usize;
     while received < expected {
         let now = Instant::now();
@@ -327,6 +331,13 @@ fn run_backend_control_phase(
             Err(RecvTimeoutError::Timeout) => break,
             Err(RecvTimeoutError::Disconnected) => break,
         }
+    }
+    while let Ok(outcome) = outcome_rx.try_recv() {
+        let outcome_idx = outcome.idx;
+        if outcomes[outcome_idx].is_none() {
+            received = received.saturating_add(1);
+        }
+        outcomes[outcome_idx] = Some(outcome);
     }
 
     let mut survivors = Vec::new();

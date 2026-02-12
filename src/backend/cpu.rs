@@ -10,7 +10,8 @@ use crossbeam_channel::{SendTimeoutError, Sender};
 
 use crate::backend::{
     BackendCapabilities, BackendEvent, BackendInstanceId, BackendTelemetry, BenchBackend,
-    MiningSolution, PowBackend, PreemptionGranularity, WorkAssignment, WORK_ID_MAX,
+    DeadlineSupport, MiningSolution, PowBackend, PreemptionGranularity, WorkAssignment,
+    WORK_ID_MAX,
 };
 use crate::config::CpuAffinityMode;
 use crate::types::hash_meets_target;
@@ -266,6 +267,25 @@ impl PowBackend for CpuBackend {
         Ok(())
     }
 
+    fn assign_work_batch_with_deadline(
+        &self,
+        work: &[WorkAssignment],
+        deadline: Instant,
+    ) -> Result<()> {
+        if Instant::now() >= deadline {
+            return Err(anyhow!("assignment deadline elapsed before dispatch"));
+        }
+        self.assign_work_batch(work)?;
+        let now = Instant::now();
+        if now > deadline {
+            return Err(anyhow!(
+                "assignment call exceeded deadline by {}ms",
+                now.saturating_duration_since(deadline).as_millis()
+            ));
+        }
+        Ok(())
+    }
+
     fn cancel_work(&self) -> Result<()> {
         if !self.shared.started.load(Ordering::SeqCst) {
             return Ok(());
@@ -273,11 +293,26 @@ impl PowBackend for CpuBackend {
         request_work_pause(&self.shared)
     }
 
+    fn cancel_work_with_deadline(&self, deadline: Instant) -> Result<()> {
+        if !self.shared.started.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        request_work_pause(&self.shared)?;
+        wait_for_idle_until(&self.shared, deadline)
+    }
+
     fn fence(&self) -> Result<()> {
         if !self.shared.started.load(Ordering::SeqCst) {
             return Ok(());
         }
         wait_for_idle(&self.shared)
+    }
+
+    fn fence_with_deadline(&self, deadline: Instant) -> Result<()> {
+        if !self.shared.started.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        wait_for_idle_until(&self.shared, deadline)
     }
 
     fn take_hashes(&self) -> u64 {
@@ -335,6 +370,7 @@ impl PowBackend for CpuBackend {
             preferred_iters_per_lane: None,
             preferred_hash_poll_interval: Some(HASH_FLUSH_INTERVAL),
             max_inflight_assignments: 1,
+            deadline_support: DeadlineSupport::Cooperative,
         }
     }
 
@@ -622,6 +658,41 @@ fn wait_for_idle(shared: &Shared) -> Result<()> {
             .idle_cv
             .wait(idle_guard)
             .map_err(|_| anyhow!("CPU idle lock poisoned"))?;
+    }
+    Ok(())
+}
+
+fn wait_for_idle_until(shared: &Shared, deadline: Instant) -> Result<()> {
+    if shared.active_workers.load(Ordering::Acquire) == 0 {
+        return Ok(());
+    }
+
+    let mut idle_guard = shared
+        .idle_lock
+        .lock()
+        .map_err(|_| anyhow!("CPU idle lock poisoned"))?;
+    while shared.active_workers.load(Ordering::Acquire) != 0 {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(anyhow!(
+                "idle wait exceeded deadline by {}ms",
+                now.saturating_duration_since(deadline).as_millis()
+            ));
+        }
+        let wait_for = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(10));
+        let (next_guard, wait_result) = shared
+            .idle_cv
+            .wait_timeout(idle_guard, wait_for)
+            .map_err(|_| anyhow!("CPU idle lock poisoned"))?;
+        idle_guard = next_guard;
+        if wait_result.timed_out()
+            && shared.active_workers.load(Ordering::Acquire) != 0
+            && Instant::now() >= deadline
+        {
+            return Err(anyhow!("idle wait timed out"));
+        }
     }
     Ok(())
 }
@@ -962,5 +1033,35 @@ mod tests {
             .lock()
             .expect("assignment_started_at lock should not be poisoned")
             .is_some());
+    }
+
+    #[test]
+    fn fence_with_deadline_times_out_when_workers_stay_active() {
+        let backend = CpuBackend::new(1, CpuAffinityMode::Off);
+        backend.shared.started.store(true, Ordering::Release);
+        backend.shared.active_workers.store(1, Ordering::Release);
+
+        let err = backend
+            .fence_with_deadline(Instant::now() + Duration::from_millis(5))
+            .expect_err("fence should time out when workers never become idle");
+        assert!(format!("{err:#}").contains("idle wait"));
+
+        backend.shared.active_workers.store(0, Ordering::Release);
+        backend.shared.idle_cv.notify_all();
+    }
+
+    #[test]
+    fn cancel_with_deadline_times_out_when_workers_stay_active() {
+        let backend = CpuBackend::new(1, CpuAffinityMode::Off);
+        backend.shared.started.store(true, Ordering::Release);
+        backend.shared.active_workers.store(1, Ordering::Release);
+
+        let err = backend
+            .cancel_work_with_deadline(Instant::now() + Duration::from_millis(5))
+            .expect_err("cancel should time out when workers never become idle");
+        assert!(format!("{err:#}").contains("idle wait"));
+
+        backend.shared.active_workers.store(0, Ordering::Release);
+        backend.shared.idle_cv.notify_all();
     }
 }

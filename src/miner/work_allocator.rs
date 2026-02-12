@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
@@ -9,7 +8,7 @@ use crossbeam_channel::{bounded, RecvTimeoutError};
 use crate::backend::{BackendInstanceId, NonceChunk, WorkAssignment, WorkTemplate};
 
 use super::ui::warn;
-use super::{backend_names, total_lanes, BackendSlot, DistributeWorkOptions};
+use super::{backend_names, dispatch_pool, total_lanes, BackendSlot, DistributeWorkOptions};
 
 struct DispatchTask {
     idx: usize,
@@ -126,6 +125,8 @@ fn dispatch_assignment_tasks(
     let timeout = timeout.max(Duration::from_millis(1));
     let expected = tasks.len();
     let mut metadata = Vec::with_capacity(expected);
+    let mut outcomes: Vec<Option<DispatchOutcome>> =
+        std::iter::repeat_with(|| None).take(expected).collect();
     let (outcome_tx, outcome_rx) = bounded::<DispatchOutcome>(expected.max(1));
 
     for task in tasks {
@@ -134,7 +135,7 @@ fn dispatch_assignment_tasks(
         metadata.push((task.idx, backend_id, backend));
 
         let outcome_tx = outcome_tx.clone();
-        thread::spawn(move || {
+        dispatch_pool::submit(Box::new(move || {
             let slot = task.slot;
             let started = Instant::now();
             let deadline = started + timeout;
@@ -142,7 +143,7 @@ fn dispatch_assignment_tasks(
                 .backend
                 .assign_work_batch_with_deadline(&task.batch, deadline);
             let elapsed = started.elapsed();
-            let _ = outcome_tx.send(DispatchOutcome {
+            let send_result = outcome_tx.send(DispatchOutcome {
                 idx: task.idx,
                 slot,
                 backend_id,
@@ -150,14 +151,16 @@ fn dispatch_assignment_tasks(
                 elapsed,
                 result,
             });
-        });
+            if let Err(send_err) = send_result {
+                let mut dropped = send_err.0;
+                dropped.slot.backend.stop();
+            }
+        }));
     }
     drop(outcome_tx);
 
     let deadline = Instant::now() + timeout;
-    let mut outcomes: Vec<Option<DispatchOutcome>> =
-        std::iter::repeat_with(|| None).take(expected).collect();
-    let mut received = 0usize;
+    let mut received = outcomes.iter().filter(|outcome| outcome.is_some()).count();
     while received < expected {
         let now = Instant::now();
         if now >= deadline {
@@ -175,6 +178,13 @@ fn dispatch_assignment_tasks(
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+    while let Ok(outcome) = outcome_rx.try_recv() {
+        let outcome_idx = outcome.idx;
+        if outcomes[outcome_idx].is_none() {
+            received = received.saturating_add(1);
+        }
+        outcomes[outcome_idx] = Some(outcome);
+    }
 
     let mut survivors = Vec::new();
     let mut failures = Vec::new();
@@ -185,8 +195,8 @@ fn dispatch_assignment_tasks(
         }
     }
 
-    for idx in 0..expected {
-        match outcomes[idx].take() {
+    for (idx, outcome_slot) in outcomes.iter_mut().enumerate().take(expected) {
+        match outcome_slot.take() {
             Some(mut outcome) => {
                 if outcome.elapsed > timeout {
                     outcome.slot.backend.stop();
