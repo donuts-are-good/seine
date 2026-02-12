@@ -70,6 +70,7 @@ const RETRY_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const RECENT_TEMPLATE_CACHE_MIN: usize = 16;
 const RECENT_TEMPLATE_CACHE_MAX: usize = 512;
 const RECENT_TEMPLATE_CACHE_HEADROOM_ROUNDS: usize = 4;
+const RECENT_SUBMITTED_SOLUTIONS_CAPACITY: usize = 4096;
 static PROMPT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
@@ -153,6 +154,12 @@ struct RoundLoopState {
     round_hashes: u64,
     round_backend_hashes: BTreeMap<u64, u64>,
     round_backend_telemetry: BTreeMap<u64, BackendRoundTelemetry>,
+}
+
+struct RecentTemplateEntry {
+    epoch: u64,
+    recorded_at: Instant,
+    template: BlockTemplateResponse,
 }
 
 impl TuiDisplay {
@@ -501,9 +508,12 @@ pub(super) fn run_mining_loop(
     let mut tui = init_tui_display(tui_state, Arc::clone(&shutdown));
     let mut backend_weights = seed_backend_weights(backends);
     let mut control_plane = MiningControlPlane::new(client, cfg, Arc::clone(&shutdown), tip_signal);
+    let recent_template_retention = recent_template_retention(cfg);
     let recent_template_cache_size = recent_template_cache_size(cfg);
-    let mut recent_templates = VecDeque::<(u64, BlockTemplateResponse)>::new();
+    let mut recent_templates = VecDeque::<RecentTemplateEntry>::new();
     let mut deferred_solutions = Vec::<MiningSolution>::new();
+    let mut submitted_solution_keys = HashSet::<(u64, u64)>::new();
+    let mut submitted_solution_order = VecDeque::<(u64, u64)>::new();
 
     let mut template = match control_plane.fetch_initial_template(&mut tui) {
         Some(t) => t,
@@ -517,8 +527,9 @@ pub(super) fn run_mining_loop(
     info(
         "MINER",
         format!(
-            "template-history | {} epochs (timeout-aware)",
-            recent_template_cache_size
+            "template-history | max={} retention={}s",
+            recent_template_cache_size,
+            recent_template_retention.as_secs_f64()
         ),
     );
 
@@ -680,7 +691,22 @@ pub(super) fn run_mining_loop(
             backend_executor,
         )?;
         if let Some(solution) = pending_solution.take() {
-            control_plane.submit_solution(&template, solution.clone(), &stats, &mut tui);
+            if already_submitted_solution(&submitted_solution_keys, &solution) {
+                warn(
+                    "SUBMIT",
+                    format!(
+                        "skipping duplicate solution epoch={} nonce={}",
+                        solution.epoch, solution.nonce
+                    ),
+                );
+            } else {
+                control_plane.submit_solution(&template, solution.clone(), &stats, &mut tui);
+                remember_submitted_solution(
+                    &mut submitted_solution_order,
+                    &mut submitted_solution_keys,
+                    &solution,
+                );
+            }
             submitted_solution = Some(solution);
         }
         drop_solution_from_deferred(&mut deferred_solutions, submitted_solution.as_ref());
@@ -690,6 +716,8 @@ pub(super) fn run_mining_loop(
             &template,
             &recent_templates,
             &mut deferred_solutions,
+            &mut submitted_solution_order,
+            &mut submitted_solution_keys,
             &stats,
             &mut tui,
         );
@@ -803,6 +831,7 @@ pub(super) fn run_mining_loop(
             &mut recent_templates,
             epoch,
             template,
+            recent_template_retention,
             recent_template_cache_size,
         );
         template = next_template;
@@ -834,7 +863,22 @@ pub(super) fn run_mining_loop(
             ),
         }
         if let Some(solution) = final_pending_solution.as_ref() {
-            control_plane.submit_solution(&template, solution.clone(), &stats, &mut tui);
+            if already_submitted_solution(&submitted_solution_keys, solution) {
+                warn(
+                    "SUBMIT",
+                    format!(
+                        "skipping duplicate solution epoch={} nonce={}",
+                        solution.epoch, solution.nonce
+                    ),
+                );
+            } else {
+                control_plane.submit_solution(&template, solution.clone(), &stats, &mut tui);
+                remember_submitted_solution(
+                    &mut submitted_solution_order,
+                    &mut submitted_solution_keys,
+                    solution,
+                );
+            }
         }
         drop_solution_from_deferred(&mut deferred_solutions, final_pending_solution.as_ref());
         submit_deferred_solutions(
@@ -843,6 +887,8 @@ pub(super) fn run_mining_loop(
             &template,
             &recent_templates,
             &mut deferred_solutions,
+            &mut submitted_solution_order,
+            &mut submitted_solution_keys,
             &stats,
             &mut tui,
         );
@@ -1261,8 +1307,10 @@ fn submit_deferred_solutions(
     control_plane: &MiningControlPlane<'_>,
     current_epoch: u64,
     current_template: &BlockTemplateResponse,
-    recent_templates: &VecDeque<(u64, BlockTemplateResponse)>,
+    recent_templates: &VecDeque<RecentTemplateEntry>,
     deferred_solutions: &mut Vec<MiningSolution>,
+    submitted_solution_order: &mut VecDeque<(u64, u64)>,
+    submitted_solution_keys: &mut HashSet<(u64, u64)>,
     stats: &Stats,
     tui: &mut Option<TuiDisplay>,
 ) {
@@ -1273,6 +1321,9 @@ fn submit_deferred_solutions(
     let mut queued = Vec::new();
     std::mem::swap(&mut queued, deferred_solutions);
     for solution in dedupe_queued_solutions(queued) {
+        if already_submitted_solution(submitted_solution_keys, &solution) {
+            continue;
+        }
         let Some(template) = template_for_solution_epoch(
             current_epoch,
             current_template,
@@ -1288,7 +1339,8 @@ fn submit_deferred_solutions(
             );
             continue;
         };
-        control_plane.submit_solution(template, solution, stats, tui);
+        control_plane.submit_solution(template, solution.clone(), stats, tui);
+        remember_submitted_solution(submitted_solution_order, submitted_solution_keys, &solution);
     }
 }
 
@@ -1319,30 +1371,66 @@ fn drop_solution_from_deferred(
 fn template_for_solution_epoch<'a>(
     current_epoch: u64,
     current_template: &'a BlockTemplateResponse,
-    recent_templates: &'a VecDeque<(u64, BlockTemplateResponse)>,
+    recent_templates: &'a VecDeque<RecentTemplateEntry>,
     solution_epoch: u64,
 ) -> Option<&'a BlockTemplateResponse> {
     if solution_epoch == current_epoch {
         return Some(current_template);
     }
-    for (epoch, template) in recent_templates.iter().rev() {
-        if *epoch == solution_epoch {
-            return Some(template);
+    for entry in recent_templates.iter().rev() {
+        if entry.epoch == solution_epoch {
+            return Some(&entry.template);
         }
     }
     None
 }
 
 fn remember_recent_template(
-    recent_templates: &mut VecDeque<(u64, BlockTemplateResponse)>,
+    recent_templates: &mut VecDeque<RecentTemplateEntry>,
     epoch: u64,
     template: BlockTemplateResponse,
+    retention: Duration,
     max_entries: usize,
 ) {
+    let retention = retention.max(Duration::from_millis(1));
     let max_entries = max_entries.max(1);
-    recent_templates.push_back((epoch, template));
-    while recent_templates.len() > max_entries {
+    let now = Instant::now();
+    recent_templates.push_back(RecentTemplateEntry {
+        epoch,
+        recorded_at: now,
+        template,
+    });
+    while let Some(front) = recent_templates.front() {
+        let over_capacity = recent_templates.len() > max_entries;
+        let stale_by_age = now.saturating_duration_since(front.recorded_at) > retention;
+        if !over_capacity && !stale_by_age {
+            break;
+        }
         recent_templates.pop_front();
+    }
+}
+
+fn already_submitted_solution(
+    submitted_solution_keys: &HashSet<(u64, u64)>,
+    solution: &MiningSolution,
+) -> bool {
+    submitted_solution_keys.contains(&(solution.epoch, solution.nonce))
+}
+
+fn remember_submitted_solution(
+    submitted_solution_order: &mut VecDeque<(u64, u64)>,
+    submitted_solution_keys: &mut HashSet<(u64, u64)>,
+    solution: &MiningSolution,
+) {
+    let key = (solution.epoch, solution.nonce);
+    if !submitted_solution_keys.insert(key) {
+        return;
+    }
+    submitted_solution_order.push_back(key);
+    while submitted_solution_order.len() > RECENT_SUBMITTED_SOLUTIONS_CAPACITY {
+        if let Some(expired) = submitted_solution_order.pop_front() {
+            submitted_solution_keys.remove(&expired);
+        }
     }
 }
 
@@ -1353,6 +1441,28 @@ fn recent_template_cache_size(cfg: &Config) -> usize {
         cfg.backend_assign_timeout,
         cfg.prefetch_wait,
     )
+}
+
+fn recent_template_retention(cfg: &Config) -> Duration {
+    recent_template_retention_from_timeouts(
+        cfg.refresh_interval,
+        cfg.backend_control_timeout,
+        cfg.backend_assign_timeout,
+        cfg.prefetch_wait,
+    )
+}
+
+fn recent_template_retention_from_timeouts(
+    refresh_interval: Duration,
+    backend_control_timeout: Duration,
+    backend_assign_timeout: Duration,
+    prefetch_wait: Duration,
+) -> Duration {
+    let refresh_interval = refresh_interval.max(Duration::from_millis(1));
+    refresh_interval
+        .saturating_add(backend_control_timeout)
+        .saturating_add(backend_assign_timeout)
+        .saturating_add(prefetch_wait)
 }
 
 fn recent_template_cache_size_from_timeouts(
@@ -1969,7 +2079,11 @@ mod tests {
         let current = sample_template("curr");
         let previous = sample_template("prev");
         let mut recent = VecDeque::new();
-        recent.push_back((9, previous));
+        recent.push_back(RecentTemplateEntry {
+            epoch: 9,
+            recorded_at: Instant::now(),
+            template: previous,
+        });
 
         assert!(template_for_solution_epoch(10, &current, &recent, 10).is_some());
         assert!(template_for_solution_epoch(10, &current, &recent, 9).is_some());
@@ -1981,15 +2095,41 @@ mod tests {
         let max_entries = 6usize;
         let mut recent = VecDeque::new();
         for epoch in 1..=(max_entries as u64 + 2) {
-            remember_recent_template(&mut recent, epoch, sample_template("tmpl"), max_entries);
+            remember_recent_template(
+                &mut recent,
+                epoch,
+                sample_template("tmpl"),
+                Duration::from_secs(60),
+                max_entries,
+            );
         }
 
         assert_eq!(recent.len(), max_entries);
-        assert_eq!(recent.front().map(|entry| entry.0), Some(3));
+        assert_eq!(recent.front().map(|entry| entry.epoch), Some(3));
         assert_eq!(
-            recent.back().map(|entry| entry.0),
+            recent.back().map(|entry| entry.epoch),
             Some(max_entries as u64 + 2)
         );
+    }
+
+    #[test]
+    fn remember_recent_template_evicts_by_age() {
+        let mut recent = VecDeque::new();
+        recent.push_back(RecentTemplateEntry {
+            epoch: 1,
+            recorded_at: Instant::now() - Duration::from_secs(10),
+            template: sample_template("old"),
+        });
+        remember_recent_template(
+            &mut recent,
+            2,
+            sample_template("new"),
+            Duration::from_secs(1),
+            64,
+        );
+
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent.front().map(|entry| entry.epoch), Some(2));
     }
 
     #[test]
@@ -2017,6 +2157,42 @@ mod tests {
             Duration::from_secs(60),
         );
         assert_eq!(capped_entries, RECENT_TEMPLATE_CACHE_MAX);
+    }
+
+    #[test]
+    fn submitted_solution_cache_is_cross_backend_and_bounded() {
+        let mut order = VecDeque::new();
+        let mut keys = HashSet::new();
+        let solution = MiningSolution {
+            epoch: 9,
+            nonce: 42,
+            backend_id: 1,
+            backend: "cpu",
+        };
+        let cross_backend = MiningSolution {
+            epoch: 9,
+            nonce: 42,
+            backend_id: 2,
+            backend: "cpu",
+        };
+
+        remember_submitted_solution(&mut order, &mut keys, &solution);
+        assert!(already_submitted_solution(&keys, &solution));
+        assert!(already_submitted_solution(&keys, &cross_backend));
+
+        for idx in 0..(RECENT_SUBMITTED_SOLUTIONS_CAPACITY + 1) {
+            let entry = MiningSolution {
+                epoch: 100 + idx as u64,
+                nonce: idx as u64,
+                backend_id: 1,
+                backend: "cpu",
+            };
+            remember_submitted_solution(&mut order, &mut keys, &entry);
+        }
+
+        assert_eq!(order.len(), RECENT_SUBMITTED_SOLUTIONS_CAPACITY);
+        assert_eq!(keys.len(), RECENT_SUBMITTED_SOLUTIONS_CAPACITY);
+        assert!(!already_submitted_solution(&keys, &solution));
     }
 
     #[test]
