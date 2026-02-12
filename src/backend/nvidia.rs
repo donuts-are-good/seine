@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{bail, Result};
 use crossbeam_channel::Sender;
@@ -9,14 +9,14 @@ use crate::backend::{
 };
 
 pub struct NvidiaBackend {
-    _instance_id: BackendInstanceId,
+    _instance_id: AtomicU64,
     device_index: Option<u32>,
 }
 
 impl NvidiaBackend {
     pub fn new(device_index: Option<u32>) -> Self {
         Self {
-            _instance_id: 0,
+            _instance_id: AtomicU64::new(0),
             device_index,
         }
     }
@@ -31,13 +31,13 @@ impl PowBackend for NvidiaBackend {
         1
     }
 
-    fn set_instance_id(&mut self, id: BackendInstanceId) {
-        self._instance_id = id;
+    fn set_instance_id(&self, id: BackendInstanceId) {
+        self._instance_id.store(id, Ordering::Release);
     }
 
-    fn set_event_sink(&mut self, _sink: Sender<BackendEvent>) {}
+    fn set_event_sink(&self, _sink: Sender<BackendEvent>) {}
 
-    fn start(&mut self) -> Result<()> {
+    fn start(&self) -> Result<()> {
         if let Some(device_index) = self.device_index {
             bail!(
                 "NVIDIA backend device {} is scaffolded but not implemented yet",
@@ -48,7 +48,7 @@ impl PowBackend for NvidiaBackend {
         }
     }
 
-    fn stop(&mut self) {}
+    fn stop(&self) {}
 
     fn assign_work(&self, _work: WorkAssignment) -> Result<()> {
         Ok(())

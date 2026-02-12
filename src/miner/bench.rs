@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -151,7 +152,7 @@ pub(super) fn run_benchmark(cfg: &Config, shutdown: &AtomicBool) -> Result<()> {
 fn run_kernel_benchmark(
     cfg: &Config,
     shutdown: &AtomicBool,
-    backends: Vec<Box<dyn PowBackend>>,
+    backends: Vec<Arc<dyn PowBackend>>,
 ) -> Result<()> {
     let mut iter = backends.into_iter();
     let backend = iter
@@ -254,7 +255,7 @@ fn run_kernel_benchmark(
 fn run_worker_benchmark(
     cfg: &Config,
     shutdown: &AtomicBool,
-    instances: Vec<Box<dyn PowBackend>>,
+    instances: Vec<Arc<dyn PowBackend>>,
     restart_each_round: bool,
 ) -> Result<()> {
     let (mut backends, backend_events) = activate_backends(instances, cfg.backend_event_capacity)?;

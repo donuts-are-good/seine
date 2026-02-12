@@ -38,7 +38,7 @@ const MIN_EVENT_WAIT: Duration = Duration::from_millis(1);
 
 struct BackendSlot {
     id: BackendInstanceId,
-    backend: Box<dyn PowBackend>,
+    backend: Arc<dyn PowBackend>,
     lanes: u64,
 }
 
@@ -288,29 +288,29 @@ fn build_tui_state(
     tui_state
 }
 
-fn build_backend_instances(cfg: &Config) -> Vec<Box<dyn PowBackend>> {
+fn build_backend_instances(cfg: &Config) -> Vec<Arc<dyn PowBackend>> {
     cfg.backend_specs
         .iter()
         .map(|backend_spec| match backend_spec.kind {
             BackendKind::Cpu => {
-                Box::new(CpuBackend::new(cfg.threads, cfg.cpu_affinity)) as Box<dyn PowBackend>
+                Arc::new(CpuBackend::new(cfg.threads, cfg.cpu_affinity)) as Arc<dyn PowBackend>
             }
             BackendKind::Nvidia => {
-                Box::new(NvidiaBackend::new(backend_spec.device_index)) as Box<dyn PowBackend>
+                Arc::new(NvidiaBackend::new(backend_spec.device_index)) as Arc<dyn PowBackend>
             }
         })
         .collect()
 }
 
 fn activate_backends(
-    mut backends: Vec<Box<dyn PowBackend>>,
+    mut backends: Vec<Arc<dyn PowBackend>>,
     event_capacity: usize,
 ) -> Result<(Vec<BackendSlot>, Receiver<BackendEvent>)> {
     let mut active = Vec::new();
     let (event_tx, event_rx) = bounded::<BackendEvent>(event_capacity.max(1));
     let mut next_backend_id: BackendInstanceId = 1;
 
-    for mut backend in backends.drain(..) {
+    for backend in backends.drain(..) {
         let backend_id = next_backend_id;
         next_backend_id = next_backend_id.saturating_add(1);
         let backend_name = backend.name();
@@ -385,7 +385,7 @@ fn start_backend_slots(backends: &mut Vec<BackendSlot>) -> Result<()> {
     }
 
     for idx in failed_indices.into_iter().rev() {
-        let mut slot = backends.remove(idx);
+        let slot = backends.remove(idx);
         let backend_name = slot.backend.name();
         let backend_id = slot.id;
         slot.backend.stop();
@@ -405,6 +405,8 @@ fn stop_backend_slots(backends: &mut [BackendSlot]) {
     for slot in backends {
         slot.backend.stop();
     }
+    work_allocator::clear_assign_workers();
+    backend_control::clear_backend_control_workers();
 }
 
 fn distribute_work(
@@ -524,8 +526,10 @@ fn remove_backend_by_id(backends: &mut Vec<BackendSlot>, backend_id: BackendInst
         return false;
     };
 
-    let mut slot = backends.remove(idx);
+    let slot = backends.remove(idx);
     slot.backend.stop();
+    work_allocator::prune_assign_workers(backends);
+    backend_control::prune_backend_control_workers(backends);
     true
 }
 
@@ -852,18 +856,18 @@ mod tests {
             self.lanes
         }
 
-        fn set_instance_id(&mut self, _id: BackendInstanceId) {}
+        fn set_instance_id(&self, _id: BackendInstanceId) {}
 
-        fn set_event_sink(&mut self, _sink: Sender<BackendEvent>) {}
+        fn set_event_sink(&self, _sink: Sender<BackendEvent>) {}
 
-        fn start(&mut self) -> Result<()> {
+        fn start(&self) -> Result<()> {
             if self.state.fail_start.load(Ordering::Acquire) {
                 return Err(anyhow!("injected start failure"));
             }
             Ok(())
         }
 
-        fn stop(&mut self) {
+        fn stop(&self) {
             self.state.stop_calls.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -919,8 +923,21 @@ mod tests {
         }
     }
 
-    fn slot(id: BackendInstanceId, lanes: u64, backend: Box<dyn PowBackend>) -> BackendSlot {
+    fn slot(id: BackendInstanceId, lanes: u64, backend: Arc<dyn PowBackend>) -> BackendSlot {
         BackendSlot { id, backend, lanes }
+    }
+
+    fn wait_for_stop_call(state: &MockState, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if state.stop_calls.load(Ordering::Relaxed) > 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -949,12 +966,12 @@ mod tests {
             slot(
                 11,
                 1,
-                Box::new(MockBackend::new("nvidia", 1, Arc::clone(&first_state))),
+                Arc::new(MockBackend::new("nvidia", 1, Arc::clone(&first_state))),
             ),
             slot(
                 22,
                 1,
-                Box::new(MockBackend::new("nvidia", 1, Arc::clone(&second_state))),
+                Arc::new(MockBackend::new("nvidia", 1, Arc::clone(&second_state))),
             ),
         ];
         assert!(remove_backend_by_id(&mut backends, 22));
@@ -975,17 +992,17 @@ mod tests {
             slot(
                 1,
                 2,
-                Box::new(MockBackend::new("cpu", 2, Arc::clone(&first_state))),
+                Arc::new(MockBackend::new("cpu", 2, Arc::clone(&first_state))),
             ),
             slot(
                 2,
                 1,
-                Box::new(MockBackend::new("nvidia", 1, Arc::clone(&failed_state))),
+                Arc::new(MockBackend::new("nvidia", 1, Arc::clone(&failed_state))),
             ),
             slot(
                 3,
                 1,
-                Box::new(MockBackend::new("nvidia", 1, Arc::clone(&third_state))),
+                Arc::new(MockBackend::new("nvidia", 1, Arc::clone(&third_state))),
             ),
         ];
         let additional_span = distribute_work(
@@ -1028,7 +1045,10 @@ mod tests {
         assert_eq!(first_chunk.nonce_count, 20);
         assert_eq!(third_chunk.start_nonce, 160);
         assert_eq!(third_chunk.nonce_count, 10);
-        assert_eq!(failed_state.stop_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            wait_for_stop_call(&failed_state, Duration::from_millis(250)),
+            "failing backend should be quarantined"
+        );
     }
 
     #[test]
@@ -1037,7 +1057,7 @@ mod tests {
         let mut backends = vec![slot(
             7,
             1,
-            Box::new(
+            Arc::new(
                 MockBackend::new("nvidia", 1, Arc::clone(&state))
                     .with_preferred_iters_per_lane(12)
                     .with_max_inflight_assignments(4),
@@ -1089,7 +1109,7 @@ mod tests {
         let mut backends = vec![slot(
             9,
             1,
-            Box::new(
+            Arc::new(
                 MockBackend::new("cpu", 1, Arc::clone(&slow_state))
                     .with_assign_delay(Duration::from_millis(50)),
             ),
@@ -1115,14 +1135,10 @@ mod tests {
         .expect_err("timeout should quarantine the only backend");
         assert!(format!("{err:#}").contains("all mining backends are unavailable"));
 
-        let stop_deadline = Instant::now() + Duration::from_millis(250);
-        while Instant::now() < stop_deadline {
-            if slow_state.stop_calls.load(Ordering::Relaxed) > 0 {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("timed-out backend should be stopped once late dispatch completes");
+        assert!(
+            wait_for_stop_call(&slow_state, Duration::from_millis(250)),
+            "timed-out backend should be stopped once late dispatch completes"
+        );
     }
 
     #[test]
@@ -1136,17 +1152,17 @@ mod tests {
             slot(
                 1,
                 2,
-                Box::new(MockBackend::new("cpu", 2, Arc::clone(&first_state))),
+                Arc::new(MockBackend::new("cpu", 2, Arc::clone(&first_state))),
             ),
             slot(
                 2,
                 1,
-                Box::new(MockBackend::new("nvidia", 1, Arc::clone(&panic_state))),
+                Arc::new(MockBackend::new("nvidia", 1, Arc::clone(&panic_state))),
             ),
             slot(
                 3,
                 1,
-                Box::new(MockBackend::new("nvidia", 1, Arc::clone(&third_state))),
+                Arc::new(MockBackend::new("nvidia", 1, Arc::clone(&third_state))),
             ),
         ];
 
@@ -1173,7 +1189,10 @@ mod tests {
         assert_eq!(backends.len(), 2);
         assert_eq!(backends[0].id, 1);
         assert_eq!(backends[1].id, 3);
-        assert_eq!(panic_state.stop_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            wait_for_stop_call(&panic_state, Duration::from_millis(250)),
+            "panicking backend should be quarantined"
+        );
     }
 
     #[test]
@@ -1182,9 +1201,9 @@ mod tests {
         let healthy_state = Arc::new(MockState::default());
         failed_state.fail_start.store(true, Ordering::Relaxed);
 
-        let instances: Vec<Box<dyn PowBackend>> = vec![
-            Box::new(MockBackend::new("cpu", 1, Arc::clone(&failed_state))),
-            Box::new(MockBackend::new("cpu", 1, Arc::clone(&healthy_state))),
+        let instances: Vec<Arc<dyn PowBackend>> = vec![
+            Arc::new(MockBackend::new("cpu", 1, Arc::clone(&failed_state))),
+            Arc::new(MockBackend::new("cpu", 1, Arc::clone(&healthy_state))),
         ];
 
         let (active, _events) = activate_backends(instances, 16)
@@ -1205,12 +1224,12 @@ mod tests {
             slot(
                 1,
                 1,
-                Box::new(MockBackend::new("cpu", 1, Arc::clone(&failed_state))),
+                Arc::new(MockBackend::new("cpu", 1, Arc::clone(&failed_state))),
             ),
             slot(
                 2,
                 1,
-                Box::new(MockBackend::new("cpu", 1, Arc::clone(&healthy_state))),
+                Arc::new(MockBackend::new("cpu", 1, Arc::clone(&healthy_state))),
             ),
         ];
 
@@ -1230,12 +1249,12 @@ mod tests {
             slot(
                 1,
                 2,
-                Box::new(MockBackend::new("cpu", 2, Arc::clone(&state_a))),
+                Arc::new(MockBackend::new("cpu", 2, Arc::clone(&state_a))),
             ),
             slot(
                 2,
                 1,
-                Box::new(MockBackend::new("cpu", 1, Arc::clone(&state_b))),
+                Arc::new(MockBackend::new("cpu", 1, Arc::clone(&state_b))),
             ),
         ];
 
@@ -1251,7 +1270,7 @@ mod tests {
             slot(
                 1,
                 2,
-                Box::new(
+                Arc::new(
                     MockBackend::new("cpu", 2, Arc::clone(&state_a))
                         .with_preferred_iters_per_lane(4),
                 ),
@@ -1259,7 +1278,7 @@ mod tests {
             slot(
                 2,
                 1,
-                Box::new(
+                Arc::new(
                     MockBackend::new("nvidia", 1, Arc::clone(&state_b))
                         .with_preferred_iters_per_lane(16),
                 ),
@@ -1278,12 +1297,12 @@ mod tests {
             slot(
                 10,
                 2,
-                Box::new(MockBackend::new("cpu", 2, Arc::clone(&state_a))),
+                Arc::new(MockBackend::new("cpu", 2, Arc::clone(&state_a))),
             ),
             slot(
                 20,
                 2,
-                Box::new(MockBackend::new("cpu", 2, Arc::clone(&state_b))),
+                Arc::new(MockBackend::new("cpu", 2, Arc::clone(&state_b))),
             ),
         ];
         let mut weights = BTreeMap::new();
@@ -1305,7 +1324,7 @@ mod tests {
             slot(
                 1,
                 1,
-                Box::new(
+                Arc::new(
                     MockBackend::new("cpu", 1, Arc::clone(&state_a))
                         .with_preferred_hash_poll_interval(Duration::from_millis(50)),
                 ),
@@ -1313,7 +1332,7 @@ mod tests {
             slot(
                 2,
                 1,
-                Box::new(MockBackend::new("cpu", 1, Arc::clone(&state_b))),
+                Arc::new(MockBackend::new("cpu", 1, Arc::clone(&state_b))),
             ),
         ];
 
@@ -1352,15 +1371,15 @@ mod tests {
             1
         }
 
-        fn set_instance_id(&mut self, _id: BackendInstanceId) {}
+        fn set_instance_id(&self, _id: BackendInstanceId) {}
 
-        fn set_event_sink(&mut self, _sink: Sender<BackendEvent>) {}
+        fn set_event_sink(&self, _sink: Sender<BackendEvent>) {}
 
-        fn start(&mut self) -> Result<()> {
+        fn start(&self) -> Result<()> {
             Ok(())
         }
 
-        fn stop(&mut self) {}
+        fn stop(&self) {}
 
         fn assign_work(&self, _work: WorkAssignment) -> Result<()> {
             Ok(())
@@ -1384,12 +1403,12 @@ mod tests {
             slot(
                 1,
                 1,
-                Box::new(QuiesceMockBackend::new("cpu-a", Arc::clone(&trace))),
+                Arc::new(QuiesceMockBackend::new("cpu-a", Arc::clone(&trace))),
             ),
             slot(
                 2,
                 1,
-                Box::new(QuiesceMockBackend::new("cpu-b", Arc::clone(&trace))),
+                Arc::new(QuiesceMockBackend::new("cpu-b", Arc::clone(&trace))),
             ),
         ];
 
@@ -1462,15 +1481,15 @@ mod tests {
             1
         }
 
-        fn set_instance_id(&mut self, _id: BackendInstanceId) {}
+        fn set_instance_id(&self, _id: BackendInstanceId) {}
 
-        fn set_event_sink(&mut self, _sink: Sender<BackendEvent>) {}
+        fn set_event_sink(&self, _sink: Sender<BackendEvent>) {}
 
-        fn start(&mut self) -> Result<()> {
+        fn start(&self) -> Result<()> {
             Ok(())
         }
 
-        fn stop(&mut self) {
+        fn stop(&self) {
             self.stop_calls.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -1527,15 +1546,15 @@ mod tests {
             1
         }
 
-        fn set_instance_id(&mut self, _id: BackendInstanceId) {}
+        fn set_instance_id(&self, _id: BackendInstanceId) {}
 
-        fn set_event_sink(&mut self, _sink: Sender<BackendEvent>) {}
+        fn set_event_sink(&self, _sink: Sender<BackendEvent>) {}
 
-        fn start(&mut self) -> Result<()> {
+        fn start(&self) -> Result<()> {
             Ok(())
         }
 
-        fn stop(&mut self) {
+        fn stop(&self) {
             self.stop_calls.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -1568,7 +1587,7 @@ mod tests {
             slot(
                 1,
                 1,
-                Box::new(ControlFailBackend::new(
+                Arc::new(ControlFailBackend::new(
                     "cpu-a",
                     false,
                     true,
@@ -1578,7 +1597,7 @@ mod tests {
             slot(
                 2,
                 1,
-                Box::new(ControlFailBackend::new(
+                Arc::new(ControlFailBackend::new(
                     "cpu-b",
                     false,
                     false,
@@ -1606,7 +1625,7 @@ mod tests {
             slot(
                 1,
                 1,
-                Box::new(ControlPanicBackend::new(
+                Arc::new(ControlPanicBackend::new(
                     "cpu-a",
                     false,
                     true,
@@ -1616,7 +1635,7 @@ mod tests {
             slot(
                 2,
                 1,
-                Box::new(ControlPanicBackend::new(
+                Arc::new(ControlPanicBackend::new(
                     "cpu-b",
                     false,
                     false,

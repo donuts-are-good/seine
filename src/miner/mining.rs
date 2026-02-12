@@ -17,7 +17,7 @@ use crate::api::{
     is_no_wallet_loaded_error, is_unauthorized_error, is_wallet_already_loaded_error, ApiClient,
 };
 use crate::backend::{BackendEvent, MiningSolution};
-use crate::config::{Config, WorkAllocation};
+use crate::config::Config;
 use crate::types::{
     decode_hex, parse_target, set_block_nonce, template_difficulty, template_height,
     BlockTemplateResponse,
@@ -376,9 +376,13 @@ impl<'a> MiningControlPlane<'a> {
         Self {
             client,
             cfg,
+            prefetch: Some(TemplatePrefetch::spawn(
+                client.clone(),
+                cfg.clone(),
+                Arc::clone(&shutdown),
+            )),
             shutdown,
             tip_signal,
-            prefetch: None,
         }
     }
 
@@ -390,13 +394,8 @@ impl<'a> MiningControlPlane<'a> {
     }
 
     fn spawn_prefetch_if_needed(&mut self) {
-        if self.prefetch.is_none() {
-            self.prefetch = Some(TemplatePrefetch::spawn(
-                self.client.clone(),
-                self.cfg.clone(),
-                Arc::clone(&self.shutdown),
-                current_tip_sequence(self.tip_signal),
-            ));
+        if let Some(prefetch) = self.prefetch.as_mut() {
+            prefetch.request_if_idle(current_tip_sequence(self.tip_signal));
         }
     }
 
@@ -454,11 +453,17 @@ impl<'a> MiningControlPlane<'a> {
     }
 
     fn finish(mut self) {
-        if let Some(prefetch_task) = self.prefetch.take() {
+        if let Some(mut prefetch_task) = self.prefetch.take() {
             if self.shutdown.load(Ordering::Relaxed) {
                 prefetch_task.detach();
-            } else {
-                let _ = prefetch_task.join_for(self.cfg.prefetch_wait);
+            } else if !prefetch_task.shutdown_for(self.cfg.prefetch_wait) {
+                warn(
+                    "TEMPLATE",
+                    format!(
+                        "prefetch worker shutdown exceeded {}ms; detached",
+                        self.cfg.prefetch_wait.as_millis()
+                    ),
+                );
             }
         }
     }
@@ -606,6 +611,11 @@ pub(super) fn run_mining_loop(
             header_base: &header_base,
             target,
         })?;
+        let mut submitted_solution = None;
+        if let Some(solution) = round_state.solved.take() {
+            control_plane.submit_solution(&template, solution.clone(), &stats, &mut tui);
+            submitted_solution = Some(solution);
+        }
 
         if cfg.strict_round_accounting {
             let _ =
@@ -616,6 +626,12 @@ pub(super) fn run_mining_loop(
         }
         let _ =
             drain_mining_backend_events(backend_events, epoch, &mut round_state.solved, backends)?;
+        if submitted_solution.is_none() {
+            if let Some(solution) = round_state.solved.take() {
+                control_plane.submit_solution(&template, solution.clone(), &stats, &mut tui);
+                submitted_solution = Some(solution);
+            }
+        }
         collect_backend_hashes(
             backends,
             Some(&stats),
@@ -626,7 +642,7 @@ pub(super) fn run_mining_loop(
         round_state.stale_tip_event |= tip_signal.is_some_and(TipSignal::take_stale);
         let round_end_reason = if shutdown.load(Ordering::Relaxed) {
             RoundEndReason::Shutdown
-        } else if round_state.solved.is_some() {
+        } else if submitted_solution.is_some() {
             RoundEndReason::Solved
         } else if round_state.stale_tip_event {
             RoundEndReason::StaleTip
@@ -651,7 +667,7 @@ pub(super) fn run_mining_loop(
             info("BACKEND", format!("telemetry | {telemetry_line}"));
         }
 
-        if let Some(solution) = round_state.solved {
+        if let Some(solution) = submitted_solution {
             update_tui(
                 &mut tui,
                 &stats,
@@ -675,7 +691,6 @@ pub(super) fn run_mining_loop(
                     solution.backend_id,
                 ),
             );
-            control_plane.submit_solution(&template, solution, &stats, &mut tui);
         } else if round_state.stale_tip_event {
             update_tui(
                 &mut tui,
@@ -927,48 +942,120 @@ impl<'a> RoundRuntime<'a> {
 
 struct TemplatePrefetch {
     handle: Option<JoinHandle<()>>,
-    result_rx: Receiver<Option<BlockTemplateResponse>>,
+    request_tx: Option<Sender<PrefetchRequest>>,
+    result_rx: Receiver<PrefetchResult>,
+    done_rx: Receiver<()>,
+    pending_tip_sequence: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PrefetchRequest {
     tip_sequence: u64,
 }
 
+#[derive(Debug)]
+struct PrefetchResult {
+    tip_sequence: u64,
+    template: Option<BlockTemplateResponse>,
+}
+
 impl TemplatePrefetch {
-    fn spawn(client: ApiClient, cfg: Config, shutdown: Arc<AtomicBool>, tip_sequence: u64) -> Self {
-        let (result_tx, result_rx) = bounded(1);
+    fn spawn(client: ApiClient, cfg: Config, shutdown: Arc<AtomicBool>) -> Self {
+        let (request_tx, request_rx) = bounded::<PrefetchRequest>(1);
+        let (result_tx, result_rx) = bounded::<PrefetchResult>(1);
+        let (done_tx, done_rx) = bounded::<()>(1);
+
         let handle = thread::spawn(move || {
-            let template = fetch_template_prefetch_once(&client, &cfg, shutdown.as_ref());
-            let _ = result_tx.send(template);
+            while !shutdown.load(Ordering::Relaxed) {
+                let request = match request_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(request) => request,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                };
+                let template = fetch_template_prefetch_once(&client, &cfg, shutdown.as_ref());
+                if result_tx
+                    .send(PrefetchResult {
+                        tip_sequence: request.tip_sequence,
+                        template,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let _ = done_tx.send(());
         });
+
         Self {
             handle: Some(handle),
+            request_tx: Some(request_tx),
             result_rx,
-            tip_sequence,
+            done_rx,
+            pending_tip_sequence: None,
+        }
+    }
+
+    fn request_if_idle(&mut self, tip_sequence: u64) {
+        if self.pending_tip_sequence.is_some() {
+            return;
+        }
+        let Some(request_tx) = self.request_tx.as_ref() else {
+            return;
+        };
+        match request_tx.try_send(PrefetchRequest { tip_sequence }) {
+            Ok(()) => {
+                self.pending_tip_sequence = Some(tip_sequence);
+            }
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                self.request_tx = None;
+                self.pending_tip_sequence = None;
+            }
+        }
+    }
+
+    fn wait_for_result(&mut self, wait: Duration) -> Option<PrefetchResult> {
+        let wait = wait.max(Duration::from_millis(1));
+        match self.result_rx.recv_timeout(wait) {
+            Ok(result) => {
+                self.pending_tip_sequence = None;
+                Some(result)
+            }
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => {
+                self.pending_tip_sequence = None;
+                None
+            }
         }
     }
 
     fn detach(mut self) {
+        self.request_tx = None;
         if let Some(handle) = self.handle.take() {
             drop(handle);
         }
     }
 
-    fn join_for(mut self, wait: Duration) -> Option<Option<BlockTemplateResponse>> {
+    fn shutdown_for(&mut self, wait: Duration) -> bool {
+        self.pending_tip_sequence = None;
+        self.request_tx = None;
         let wait = wait.max(Duration::from_millis(1));
-        let received = match self.result_rx.recv_timeout(wait) {
-            Ok(template) => Some(template),
-            Err(RecvTimeoutError::Timeout) => None,
-            Err(RecvTimeoutError::Disconnected) => Some(None),
-        };
+        let done = matches!(
+            self.done_rx.recv_timeout(wait),
+            Ok(()) | Err(RecvTimeoutError::Disconnected)
+        );
 
-        if let Some(handle) = self.handle.take() {
-            if received.is_some() {
+        if done {
+            if let Some(handle) = self.handle.take() {
                 if handle.join().is_err() {
                     error("TEMPLATE", "prefetch thread panicked");
                 }
-            } else {
-                drop(handle);
             }
+        } else if let Some(handle) = self.handle.take() {
+            drop(handle);
         }
-        received
+
+        done
     }
 }
 
@@ -987,13 +1074,25 @@ fn resolve_next_template(
         return None;
     }
 
-    if let Some(task) = prefetch.take() {
-        let spawned_tip_sequence = task.tip_sequence;
-        let prefetched_template = task.join_for(cfg.prefetch_wait).flatten();
+    if prefetch.is_none() {
+        *prefetch = Some(TemplatePrefetch::spawn(
+            client.clone(),
+            cfg.clone(),
+            Arc::clone(shutdown),
+        ));
+    }
+
+    if let Some(task) = prefetch.as_mut() {
         let latest_tip_sequence = current_tip_sequence(tip_signal);
-        if spawned_tip_sequence == latest_tip_sequence {
-            if let Some(template) = prefetched_template {
-                return Some(template);
+        if task.pending_tip_sequence.is_none() {
+            task.request_if_idle(latest_tip_sequence);
+        }
+
+        if let Some(prefetched) = task.wait_for_result(cfg.prefetch_wait) {
+            if prefetched.tip_sequence == latest_tip_sequence {
+                if let Some(template) = prefetched.template {
+                    return Some(template);
+                }
             }
         }
     }
@@ -1364,6 +1463,7 @@ mod tests {
 
     use super::*;
     use crate::backend::{BackendInstanceId, PowBackend, WorkAssignment};
+    use crate::config::WorkAllocation;
     use anyhow::Result;
 
     struct NoopBackend {
@@ -1385,15 +1485,15 @@ mod tests {
             1
         }
 
-        fn set_instance_id(&mut self, _id: BackendInstanceId) {}
+        fn set_instance_id(&self, _id: BackendInstanceId) {}
 
-        fn set_event_sink(&mut self, _sink: Sender<BackendEvent>) {}
+        fn set_event_sink(&self, _sink: Sender<BackendEvent>) {}
 
-        fn start(&mut self) -> Result<()> {
+        fn start(&self) -> Result<()> {
             Ok(())
         }
 
-        fn stop(&mut self) {}
+        fn stop(&self) {}
 
         fn assign_work(&self, _work: WorkAssignment) -> Result<()> {
             Ok(())
@@ -1428,12 +1528,12 @@ mod tests {
         let mut backends = vec![
             BackendSlot {
                 id: 1,
-                backend: Box::new(NoopBackend::new("cpu")),
+                backend: Arc::new(NoopBackend::new("cpu")),
                 lanes: 1,
             },
             BackendSlot {
                 id: 2,
-                backend: Box::new(NoopBackend::new("cpu")),
+                backend: Arc::new(NoopBackend::new("cpu")),
                 lanes: 1,
             },
         ];
@@ -1468,12 +1568,12 @@ mod tests {
         let backends = vec![
             BackendSlot {
                 id: 1,
-                backend: Box::new(NoopBackend::new("cpu")),
+                backend: Arc::new(NoopBackend::new("cpu")),
                 lanes: 1,
             },
             BackendSlot {
                 id: 2,
-                backend: Box::new(NoopBackend::new("cpu")),
+                backend: Arc::new(NoopBackend::new("cpu")),
                 lanes: 1,
             },
         ];
@@ -1501,7 +1601,7 @@ mod tests {
     fn adaptive_weight_update_uses_solved_rounds_with_lower_gain() {
         let backends = vec![BackendSlot {
             id: 7,
-            backend: Box::new(NoopBackend::new("cpu")),
+            backend: Arc::new(NoopBackend::new("cpu")),
             lanes: 1,
         }];
         let mut weights = seed_backend_weights(&backends);
@@ -1527,7 +1627,7 @@ mod tests {
     fn adaptive_weight_update_keeps_sub_one_throughput_signal() {
         let backends = vec![BackendSlot {
             id: 5,
-            backend: Box::new(NoopBackend::new("cpu")),
+            backend: Arc::new(NoopBackend::new("cpu")),
             lanes: 1,
         }];
         let mut weights = seed_backend_weights(&backends);
@@ -1555,7 +1655,7 @@ mod tests {
     fn static_weight_update_resets_to_lane_weights() {
         let backends = vec![BackendSlot {
             id: 9,
-            backend: Box::new(NoopBackend::new("cpu")),
+            backend: Arc::new(NoopBackend::new("cpu")),
             lanes: 3,
         }];
         let mut weights = BTreeMap::new();

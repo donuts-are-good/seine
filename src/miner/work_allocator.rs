@@ -7,22 +7,21 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 use crossbeam_channel::{bounded, unbounded, RecvTimeoutError, Sender};
 
-use crate::backend::{BackendInstanceId, NonceChunk, WorkAssignment, WorkTemplate};
+use crate::backend::{BackendInstanceId, NonceChunk, PowBackend, WorkAssignment, WorkTemplate};
 
 use super::ui::warn;
 use super::{backend_capabilities, backend_names, total_lanes, BackendSlot, DistributeWorkOptions};
 
 struct DispatchTask {
     idx: usize,
-    slot: BackendSlot,
+    backend_id: BackendInstanceId,
+    backend: &'static str,
+    backend_handle: Arc<dyn PowBackend>,
     batch: Vec<WorkAssignment>,
 }
 
 struct DispatchOutcome {
     idx: usize,
-    slot: BackendSlot,
-    backend_id: BackendInstanceId,
-    backend: &'static str,
     elapsed: Duration,
     result: Result<()>,
 }
@@ -95,8 +94,8 @@ fn dispatch_to_assign_worker(
     timeout: Duration,
     outcome_tx: Sender<DispatchOutcome>,
 ) -> std::result::Result<(), DispatchTask> {
-    let backend_id = task.slot.id;
-    let backend = task.slot.backend.name();
+    let backend_id = task.backend_id;
+    let backend = task.backend;
     let Some(worker_tx) = worker_sender_for_backend(backend_id, backend) else {
         return Err(task);
     };
@@ -116,6 +115,39 @@ fn dispatch_to_assign_worker(
                 AssignWorkerCommand::Run { task, .. } => Err(task),
             }
         }
+    }
+}
+
+pub(super) fn clear_assign_workers() {
+    if let Ok(mut registry) = assign_worker_registry().lock() {
+        registry.clear();
+    }
+}
+
+pub(super) fn prune_assign_workers(backends: &[BackendSlot]) {
+    let active_ids = backends
+        .iter()
+        .map(|slot| slot.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Ok(mut registry) = assign_worker_registry().lock() {
+        registry.retain(|backend_id, _| active_ids.contains(backend_id));
+    }
+}
+
+fn remove_assign_worker(backend_id: BackendInstanceId) {
+    if let Ok(mut registry) = assign_worker_registry().lock() {
+        registry.remove(&backend_id);
+    }
+}
+
+fn quarantine_backend(backend: Arc<dyn PowBackend>) {
+    let detached = Arc::clone(&backend);
+    if thread::Builder::new()
+        .name("seine-backend-quarantine".to_string())
+        .spawn(move || detached.stop())
+        .is_err()
+    {
+        backend.stop();
     }
 }
 
@@ -148,6 +180,7 @@ pub(super) fn distribute_work(
 
         let mut chunk_start = attempt_start_nonce;
         let mut dispatch_tasks = Vec::with_capacity(backends.len());
+        let mut slots_by_idx = Vec::with_capacity(backends.len());
         for (idx, slot) in std::mem::take(backends).into_iter().enumerate() {
             let nonce_count = *nonce_counts.get(idx).unwrap_or(&slot.lanes.max(1));
             let batch = build_assignment_batch(
@@ -157,13 +190,21 @@ pub(super) fn distribute_work(
                 backend_capabilities(&slot).max_inflight_assignments,
             );
 
-            dispatch_tasks.push(DispatchTask { idx, slot, batch });
+            dispatch_tasks.push(DispatchTask {
+                idx,
+                backend_id: slot.id,
+                backend: slot.backend.name(),
+                backend_handle: Arc::clone(&slot.backend),
+                batch,
+            });
+            slots_by_idx.push(Some(slot));
             chunk_start = chunk_start.wrapping_add(nonce_count);
         }
 
         let (survivors, failures) =
-            dispatch_assignment_tasks(dispatch_tasks, options.assignment_timeout);
+            dispatch_assignment_tasks(dispatch_tasks, slots_by_idx, options.assignment_timeout);
         *backends = survivors;
+        prune_assign_workers(backends);
 
         if failures.is_empty() {
             return Ok(total_span_consumed.saturating_sub(options.reservation.reserved_span));
@@ -204,6 +245,7 @@ pub(super) fn distribute_work(
 
 fn dispatch_assignment_tasks(
     tasks: Vec<DispatchTask>,
+    mut slots_by_idx: Vec<Option<BackendSlot>>,
     timeout: Duration,
 ) -> (Vec<BackendSlot>, Vec<DispatchFailure>) {
     if tasks.is_empty() {
@@ -211,19 +253,15 @@ fn dispatch_assignment_tasks(
     }
 
     let timeout = timeout.max(Duration::from_millis(1));
-    let expected = tasks.len();
-    let mut metadata_by_idx = vec![(0u64, "unknown"); expected];
+    let expected = tasks.len().max(slots_by_idx.len());
+    if slots_by_idx.len() < expected {
+        slots_by_idx.resize_with(expected, || None);
+    }
     let mut outcomes: Vec<Option<DispatchOutcome>> =
         std::iter::repeat_with(|| None).take(expected).collect();
     let (outcome_tx, outcome_rx) = bounded::<DispatchOutcome>(expected.max(1));
 
     for task in tasks {
-        let idx = task.idx;
-        let backend_id = task.slot.id;
-        let backend = task.slot.backend.name();
-        if idx < metadata_by_idx.len() {
-            metadata_by_idx[idx] = (backend_id, backend);
-        }
         if let Err(task) = dispatch_to_assign_worker(task, timeout, outcome_tx.clone()) {
             run_assignment_task(task, timeout, outcome_tx.clone());
         }
@@ -261,13 +299,19 @@ fn dispatch_assignment_tasks(
     let mut failures = Vec::new();
 
     for (idx, outcome_slot) in outcomes.iter_mut().enumerate().take(expected) {
+        let Some(slot) = slots_by_idx.get_mut(idx).and_then(Option::take) else {
+            continue;
+        };
+        let backend_id = slot.id;
+        let backend = slot.backend.name();
         match outcome_slot.take() {
-            Some(mut outcome) => {
+            Some(outcome) => {
                 if outcome.elapsed > timeout {
-                    outcome.slot.backend.stop();
+                    quarantine_backend(Arc::clone(&slot.backend));
+                    remove_assign_worker(backend_id);
                     failures.push(DispatchFailure {
-                        backend_id: outcome.backend_id,
-                        backend: outcome.backend,
+                        backend_id,
+                        backend,
                         reason: format!(
                             "assignment timed out after {}ms (limit={}ms)",
                             outcome.elapsed.as_millis(),
@@ -278,25 +322,26 @@ fn dispatch_assignment_tasks(
                 }
 
                 match outcome.result {
-                    Ok(()) => survivors.push((idx, outcome.slot)),
+                    Ok(()) => survivors.push((idx, slot)),
                     Err(err) => {
-                        outcome.slot.backend.stop();
+                        quarantine_backend(Arc::clone(&slot.backend));
+                        remove_assign_worker(backend_id);
                         failures.push(DispatchFailure {
-                            backend_id: outcome.backend_id,
-                            backend: outcome.backend,
+                            backend_id,
+                            backend,
                             reason: format!("{err:#}"),
                         });
                     }
                 }
             }
             None => {
-                let (backend_id, backend) =
-                    metadata_by_idx.get(idx).copied().unwrap_or((0, "unknown"));
+                quarantine_backend(Arc::clone(&slot.backend));
+                remove_assign_worker(backend_id);
                 failures.push(DispatchFailure {
                     backend_id,
                     backend,
                     reason: format!(
-                        "assignment timed out after {}ms; backend detached",
+                        "assignment timed out after {}ms; backend quarantined",
                         timeout.as_millis()
                     ),
                 });
@@ -319,14 +364,17 @@ fn run_assignment_task(
     timeout: Duration,
     outcome_tx: crossbeam_channel::Sender<DispatchOutcome>,
 ) {
-    let DispatchTask { idx, slot, batch } = task;
-    let backend_id = slot.id;
-    let backend = slot.backend.name();
+    let DispatchTask {
+        idx,
+        backend_id: _,
+        backend: _,
+        backend_handle,
+        batch,
+    } = task;
     let started = Instant::now();
     let deadline = started + timeout;
     let result = match panic::catch_unwind(AssertUnwindSafe(|| {
-        slot.backend
-            .assign_work_batch_with_deadline(&batch, deadline)
+        backend_handle.assign_work_batch_with_deadline(&batch, deadline)
     })) {
         Ok(result) => result,
         Err(_) => Err(anyhow!("assignment task panicked")),
@@ -335,15 +383,11 @@ fn run_assignment_task(
 
     let send_result = outcome_tx.send(DispatchOutcome {
         idx,
-        slot,
-        backend_id,
-        backend,
         elapsed,
         result,
     });
-    if let Err(send_err) = send_result {
-        let mut dropped = send_err.0;
-        dropped.slot.backend.stop();
+    if send_result.is_err() {
+        quarantine_backend(backend_handle);
     }
 }
 

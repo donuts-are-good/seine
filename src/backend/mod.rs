@@ -10,7 +10,7 @@ pub mod cpu;
 pub mod nvidia;
 #[cfg(not(feature = "nvidia"))]
 pub mod nvidia {
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
     use anyhow::{bail, Result};
@@ -22,14 +22,14 @@ pub mod nvidia {
     };
 
     pub struct NvidiaBackend {
-        _instance_id: BackendInstanceId,
+        _instance_id: AtomicU64,
         _device_index: Option<u32>,
     }
 
     impl NvidiaBackend {
         pub fn new(device_index: Option<u32>) -> Self {
             Self {
-                _instance_id: 0,
+                _instance_id: AtomicU64::new(0),
                 _device_index: device_index,
             }
         }
@@ -44,13 +44,13 @@ pub mod nvidia {
             1
         }
 
-        fn set_instance_id(&mut self, id: BackendInstanceId) {
-            self._instance_id = id;
+        fn set_instance_id(&self, id: BackendInstanceId) {
+            self._instance_id.store(id, Ordering::Release);
         }
 
-        fn set_event_sink(&mut self, _sink: Sender<BackendEvent>) {}
+        fn set_event_sink(&self, _sink: Sender<BackendEvent>) {}
 
-        fn start(&mut self) -> Result<()> {
+        fn start(&self) -> Result<()> {
             if let Some(device_index) = self._device_index {
                 bail!(
                     "NVIDIA backend device {} is disabled in this build (rebuild with --features nvidia)",
@@ -61,7 +61,7 @@ pub mod nvidia {
             }
         }
 
-        fn stop(&mut self) {}
+        fn stop(&self) {}
 
         fn assign_work(&self, _work: WorkAssignment) -> Result<()> {
             Ok(())
@@ -240,18 +240,18 @@ impl PreemptionGranularity {
     }
 }
 
-pub trait PowBackend: Send {
+pub trait PowBackend: Send + Sync {
     fn name(&self) -> &'static str;
 
     fn lanes(&self) -> usize;
 
-    fn set_instance_id(&mut self, id: BackendInstanceId);
+    fn set_instance_id(&self, id: BackendInstanceId);
 
-    fn set_event_sink(&mut self, sink: Sender<BackendEvent>);
+    fn set_event_sink(&self, sink: Sender<BackendEvent>);
 
-    fn start(&mut self) -> Result<()>;
+    fn start(&self) -> Result<()>;
 
-    fn stop(&mut self);
+    fn stop(&self);
 
     /// Assign exactly one work chunk.
     ///

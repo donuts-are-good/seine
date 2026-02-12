@@ -76,7 +76,7 @@ pub struct CpuBackend {
     threads: usize,
     affinity_mode: CpuAffinityMode,
     shared: Arc<Shared>,
-    worker_handles: Vec<JoinHandle<()>>,
+    worker_handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl CpuBackend {
@@ -111,7 +111,7 @@ impl CpuBackend {
                 dropped_events: AtomicU64::new(0),
                 event_sink: RwLock::new(None),
             }),
-            worker_handles: Vec::new(),
+            worker_handles: Mutex::new(Vec::new()),
         }
     }
 }
@@ -125,17 +125,17 @@ impl PowBackend for CpuBackend {
         self.threads.max(1)
     }
 
-    fn set_instance_id(&mut self, id: BackendInstanceId) {
+    fn set_instance_id(&self, id: BackendInstanceId) {
         self.shared.instance_id.store(id, Ordering::Release);
     }
 
-    fn set_event_sink(&mut self, sink: Sender<BackendEvent>) {
+    fn set_event_sink(&self, sink: Sender<BackendEvent>) {
         if let Ok(mut slot) = self.shared.event_sink.write() {
             *slot = Some(sink);
         }
     }
 
-    fn start(&mut self) -> Result<()> {
+    fn start(&self) -> Result<()> {
         if self.shared.started.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
@@ -178,13 +178,21 @@ impl PowBackend for CpuBackend {
             CpuAffinityMode::Auto => core_affinity::get_core_ids().filter(|ids| !ids.is_empty()),
         };
 
+        let mut handles = match self.worker_handles.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                self.shared.started.store(false, Ordering::SeqCst);
+                return Err(anyhow!("CPU worker handle lock poisoned"));
+            }
+        };
+        handles.clear();
         for thread_idx in 0..self.threads.max(1) {
             let shared = Arc::clone(&self.shared);
             let core_id = core_ids
                 .as_ref()
                 .and_then(|ids| ids.get(thread_idx % ids.len()))
                 .copied();
-            self.worker_handles.push(thread::spawn(move || {
+            handles.push(thread::spawn(move || {
                 cpu_worker_loop(shared, thread_idx, core_id)
             }));
         }
@@ -192,7 +200,7 @@ impl PowBackend for CpuBackend {
         Ok(())
     }
 
-    fn stop(&mut self) {
+    fn stop(&self) {
         if !self.shared.started.swap(false, Ordering::SeqCst) {
             return;
         }
@@ -201,7 +209,11 @@ impl PowBackend for CpuBackend {
         let _ = wait_for_idle(&self.shared);
         maybe_finalize_assignment(&self.shared);
 
-        for handle in self.worker_handles.drain(..) {
+        let handles = match self.worker_handles.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(_) => Vec::new(),
+        };
+        for handle in handles {
             let _ = handle.join();
         }
 
@@ -916,7 +928,7 @@ mod tests {
 
     #[test]
     fn error_event_retries_until_queue_capacity_is_available() {
-        let mut backend = CpuBackend::new(1, CpuAffinityMode::Off);
+        let backend = CpuBackend::new(1, CpuAffinityMode::Off);
         backend.shared.started.store(true, Ordering::Release);
         backend.set_instance_id(7);
         let (event_tx, event_rx) = crossbeam_channel::bounded(1);

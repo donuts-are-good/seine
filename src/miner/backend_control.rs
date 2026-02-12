@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 
-use crate::backend::{BackendEvent, BackendInstanceId};
+use crate::backend::{BackendEvent, BackendInstanceId, PowBackend};
 
 use super::ui::{error, info, warn};
 use super::{
@@ -15,6 +15,7 @@ use super::{
 };
 
 type BackendFailureMap = BTreeMap<BackendInstanceId, (&'static str, Vec<String>)>;
+type BackendControlDispatchError = (usize, BackendInstanceId, &'static str, Arc<dyn PowBackend>);
 
 pub(super) fn cancel_backend_slots(
     backends: &mut Vec<BackendSlot>,
@@ -185,6 +186,7 @@ fn control_backend_slots(
     }
 
     *backends = survivors;
+    prune_backend_control_workers(backends);
 
     if failures.is_empty() {
         return Ok(RuntimeBackendEventAction::None);
@@ -266,7 +268,6 @@ impl BackendControlPhase {
 
 struct BackendControlOutcome {
     idx: usize,
-    slot: BackendSlot,
     elapsed: Duration,
     result: Result<()>,
 }
@@ -274,7 +275,9 @@ struct BackendControlOutcome {
 enum BackendControlCommand {
     Run {
         idx: usize,
-        slot: BackendSlot,
+        backend_id: BackendInstanceId,
+        backend: &'static str,
+        backend_handle: Arc<dyn PowBackend>,
         phase: BackendControlPhase,
         timeout: Duration,
         outcome_tx: Sender<BackendControlOutcome>,
@@ -305,11 +308,21 @@ fn spawn_backend_control_worker(
             match command {
                 BackendControlCommand::Run {
                     idx,
-                    slot,
+                    backend_id,
+                    backend,
+                    backend_handle,
                     phase,
                     timeout,
                     outcome_tx,
-                } => run_backend_control_task(idx, slot, phase, timeout, outcome_tx),
+                } => run_backend_control_task(
+                    idx,
+                    backend_id,
+                    backend,
+                    backend_handle,
+                    phase,
+                    timeout,
+                    outcome_tx,
+                ),
             }
         }
     });
@@ -334,22 +347,57 @@ fn worker_sender_for_backend_control(
     Some(sender)
 }
 
+pub(super) fn clear_backend_control_workers() {
+    if let Ok(mut registry) = backend_control_worker_registry().lock() {
+        registry.clear();
+    }
+}
+
+pub(super) fn prune_backend_control_workers(backends: &[BackendSlot]) {
+    let active_ids = backends
+        .iter()
+        .map(|slot| slot.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Ok(mut registry) = backend_control_worker_registry().lock() {
+        registry.retain(|backend_id, _| active_ids.contains(backend_id));
+    }
+}
+
+fn remove_backend_control_worker(backend_id: BackendInstanceId) {
+    if let Ok(mut registry) = backend_control_worker_registry().lock() {
+        registry.remove(&backend_id);
+    }
+}
+
+fn quarantine_backend(backend: Arc<dyn PowBackend>) {
+    let detached = Arc::clone(&backend);
+    if thread::Builder::new()
+        .name("seine-backend-quarantine".to_string())
+        .spawn(move || detached.stop())
+        .is_err()
+    {
+        backend.stop();
+    }
+}
+
 fn dispatch_backend_control_task(
     idx: usize,
-    slot: BackendSlot,
+    backend_id: BackendInstanceId,
+    backend: &'static str,
+    backend_handle: Arc<dyn PowBackend>,
     phase: BackendControlPhase,
     timeout: Duration,
     outcome_tx: Sender<BackendControlOutcome>,
-) -> std::result::Result<(), (usize, BackendSlot)> {
-    let backend_id = slot.id;
-    let backend = slot.backend.name();
+) -> std::result::Result<(), BackendControlDispatchError> {
     let Some(worker_tx) = worker_sender_for_backend_control(backend_id, backend) else {
-        return Err((idx, slot));
+        return Err((idx, backend_id, backend, backend_handle));
     };
 
     let command = BackendControlCommand::Run {
         idx,
-        slot,
+        backend_id,
+        backend,
+        backend_handle,
         phase,
         timeout,
         outcome_tx,
@@ -361,7 +409,13 @@ fn dispatch_backend_control_task(
                 registry.remove(&backend_id);
             }
             match send_err.0 {
-                BackendControlCommand::Run { idx, slot, .. } => Err((idx, slot)),
+                BackendControlCommand::Run {
+                    idx,
+                    backend_id,
+                    backend,
+                    backend_handle,
+                    ..
+                } => Err((idx, backend_id, backend, backend_handle)),
             }
         }
     }
@@ -378,21 +432,36 @@ fn run_backend_control_phase(
 
     let timeout = timeout.max(Duration::from_millis(1));
     let expected = slots.len();
-    let mut metadata_by_idx = vec![(0u64, "unknown"); expected];
+    let mut slots_by_idx: Vec<Option<BackendSlot>> = slots.into_iter().map(Some).collect();
     let mut outcomes: Vec<Option<BackendControlOutcome>> =
         std::iter::repeat_with(|| None).take(expected).collect();
     let (outcome_tx, outcome_rx) = bounded::<BackendControlOutcome>(expected.max(1));
 
-    for (idx, slot) in slots.into_iter().enumerate() {
+    for (idx, slot_opt) in slots_by_idx.iter().enumerate().take(expected) {
+        let Some(slot) = slot_opt.as_ref() else {
+            continue;
+        };
         let backend_id = slot.id;
         let backend = slot.backend.name();
-        if idx < metadata_by_idx.len() {
-            metadata_by_idx[idx] = (backend_id, backend);
-        }
-        if let Err((idx, slot)) =
-            dispatch_backend_control_task(idx, slot, phase, timeout, outcome_tx.clone())
-        {
-            run_backend_control_task(idx, slot, phase, timeout, outcome_tx.clone());
+        let backend_handle = Arc::clone(&slot.backend);
+        if let Err((idx, backend_id, backend, backend_handle)) = dispatch_backend_control_task(
+            idx,
+            backend_id,
+            backend,
+            Arc::clone(&backend_handle),
+            phase,
+            timeout,
+            outcome_tx.clone(),
+        ) {
+            run_backend_control_task(
+                idx,
+                backend_id,
+                backend,
+                backend_handle,
+                phase,
+                timeout,
+                outcome_tx.clone(),
+            );
         }
     }
     drop(outcome_tx);
@@ -428,12 +497,17 @@ fn run_backend_control_phase(
     let mut failures = BackendFailureMap::new();
     let action_label = phase.action_label();
 
-    for idx in 0..expected {
-        let (backend_id, backend) = metadata_by_idx[idx];
-        match outcomes[idx].take() {
-            Some(mut outcome) => {
+    for (idx, outcome_slot) in outcomes.iter_mut().enumerate().take(expected) {
+        let Some(slot) = slots_by_idx.get_mut(idx).and_then(Option::take) else {
+            continue;
+        };
+        let backend_id = slot.id;
+        let backend = slot.backend.name();
+        match outcome_slot.take() {
+            Some(outcome) => {
                 if outcome.elapsed > timeout {
-                    outcome.slot.backend.stop();
+                    quarantine_backend(Arc::clone(&slot.backend));
+                    remove_backend_control_worker(backend_id);
                     failures
                         .entry(backend_id)
                         .or_insert_with(|| (backend, Vec::new()))
@@ -447,9 +521,10 @@ fn run_backend_control_phase(
                 }
 
                 match outcome.result {
-                    Ok(()) => survivors.push((idx, outcome.slot)),
+                    Ok(()) => survivors.push((idx, slot)),
                     Err(err) => {
-                        outcome.slot.backend.stop();
+                        slot.backend.stop();
+                        remove_backend_control_worker(backend_id);
                         failures
                             .entry(backend_id)
                             .or_insert_with(|| (backend, Vec::new()))
@@ -459,12 +534,14 @@ fn run_backend_control_phase(
                 }
             }
             None => {
+                quarantine_backend(Arc::clone(&slot.backend));
+                remove_backend_control_worker(backend_id);
                 failures
                     .entry(backend_id)
                     .or_insert_with(|| (backend, Vec::new()))
                     .1
                     .push(format!(
-                        "{action_label} timed out after {}ms; backend detached",
+                        "{action_label} timed out after {}ms; backend quarantined",
                         timeout.as_millis()
                     ));
             }
@@ -483,7 +560,9 @@ fn run_backend_control_phase(
 
 fn run_backend_control_task(
     idx: usize,
-    slot: BackendSlot,
+    _backend_id: BackendInstanceId,
+    _backend: &'static str,
+    backend_handle: Arc<dyn PowBackend>,
     phase: BackendControlPhase,
     timeout: Duration,
     outcome_tx: crossbeam_channel::Sender<BackendControlOutcome>,
@@ -491,8 +570,8 @@ fn run_backend_control_task(
     let started = Instant::now();
     let deadline = started + timeout;
     let result = match panic::catch_unwind(AssertUnwindSafe(|| match phase {
-        BackendControlPhase::Cancel => slot.backend.cancel_work_with_deadline(deadline),
-        BackendControlPhase::Fence => slot.backend.fence_with_deadline(deadline),
+        BackendControlPhase::Cancel => backend_handle.cancel_work_with_deadline(deadline),
+        BackendControlPhase::Fence => backend_handle.fence_with_deadline(deadline),
     })) {
         Ok(result) => result,
         Err(_) => Err(anyhow!("{} task panicked", phase.action_label())),
@@ -500,13 +579,11 @@ fn run_backend_control_task(
     let elapsed = started.elapsed();
     let send_result = outcome_tx.send(BackendControlOutcome {
         idx,
-        slot,
         elapsed,
         result,
     });
-    if let Err(send_err) = send_result {
-        let mut dropped = send_err.0;
-        dropped.slot.backend.stop();
+    if send_result.is_err() {
+        quarantine_backend(backend_handle);
     }
 }
 
