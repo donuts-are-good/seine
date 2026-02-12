@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
+use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 
 use crate::api::{is_unauthorized_error, ApiClient};
 use crate::config::Config;
@@ -34,7 +34,7 @@ struct PrefetchResult {
 impl TemplatePrefetch {
     pub(super) fn spawn(client: ApiClient, cfg: Config, shutdown: Arc<AtomicBool>) -> Self {
         let (request_tx, request_rx) = bounded::<PrefetchRequest>(1);
-        let (result_tx, result_rx) = bounded::<PrefetchResult>(1);
+        let (result_tx, result_rx) = unbounded::<PrefetchResult>();
         let (done_tx, done_rx) = bounded::<()>(1);
 
         let handle = thread::spawn(move || {
@@ -99,7 +99,10 @@ impl TemplatePrefetch {
     ) -> Option<(u64, Option<BlockTemplateResponse>)> {
         let wait = wait.max(Duration::from_millis(1));
         match self.result_rx.recv_timeout(wait) {
-            Ok(result) => {
+            Ok(mut result) => {
+                while let Ok(next) = self.result_rx.try_recv() {
+                    result = next;
+                }
                 self.pending_tip_sequence = None;
                 Some((result.tip_sequence, result.template))
             }
@@ -197,7 +200,7 @@ mod tests {
         request_tx
             .try_send(PrefetchRequest { tip_sequence: 1 })
             .expect("prefill request channel should succeed");
-        let (_result_tx, result_rx) = bounded::<PrefetchResult>(1);
+        let (_result_tx, result_rx) = unbounded::<PrefetchResult>();
         let (_done_tx, done_rx) = bounded::<()>(1);
         let mut prefetch = TemplatePrefetch {
             handle: None,
@@ -209,5 +212,38 @@ mod tests {
 
         prefetch.request_if_idle(2);
         assert_eq!(prefetch.pending_tip_sequence, Some(2));
+    }
+
+    #[test]
+    fn wait_for_result_returns_latest_available_prefetch() {
+        let (request_tx, _request_rx) = bounded::<PrefetchRequest>(1);
+        let (result_tx, result_rx) = unbounded::<PrefetchResult>();
+        let (_done_tx, done_rx) = bounded::<()>(1);
+        let mut prefetch = TemplatePrefetch {
+            handle: None,
+            request_tx: Some(request_tx),
+            result_rx,
+            done_rx,
+            pending_tip_sequence: Some(7),
+        };
+
+        result_tx
+            .send(PrefetchResult {
+                tip_sequence: 5,
+                template: None,
+            })
+            .expect("first result should enqueue");
+        result_tx
+            .send(PrefetchResult {
+                tip_sequence: 7,
+                template: None,
+            })
+            .expect("second result should enqueue");
+
+        let result = prefetch
+            .wait_for_result(Duration::from_millis(1))
+            .expect("a prefetched result should be returned");
+        assert_eq!(result.0, 7);
+        assert!(prefetch.pending_tip_sequence.is_none());
     }
 }

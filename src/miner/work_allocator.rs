@@ -37,7 +37,8 @@ pub(super) fn distribute_work(
     options: DistributeWorkOptions<'_>,
 ) -> Result<u64> {
     let mut attempt_start_nonce = options.reservation.start_nonce;
-    let mut total_span_consumed = 0u64;
+    let mut additional_span_consumed = 0u64;
+    let mut first_attempt = true;
     loop {
         if backends.is_empty() {
             bail!("all mining backends are unavailable");
@@ -50,7 +51,12 @@ pub(super) fn distribute_work(
         );
         let total_lanes = total_lanes(backends);
         let attempt_span = nonce_counts.iter().copied().sum::<u64>().max(total_lanes);
-        total_span_consumed = total_span_consumed.wrapping_add(attempt_span);
+        let attempt_additional = if first_attempt {
+            attempt_span.saturating_sub(options.reservation.reserved_span)
+        } else {
+            attempt_span
+        };
+        additional_span_consumed = additional_span_consumed.saturating_add(attempt_additional);
         let template = Arc::new(WorkTemplate {
             work_id: options.work_id,
             epoch: options.epoch,
@@ -89,7 +95,7 @@ pub(super) fn distribute_work(
         backend_executor::prune_backend_workers(backends);
 
         if failures.is_empty() {
-            return Ok(total_span_consumed.saturating_sub(options.reservation.reserved_span));
+            return Ok(additional_span_consumed);
         }
 
         for failure in failures {
@@ -113,6 +119,7 @@ pub(super) fn distribute_work(
             bail!("all mining backends are unavailable after assignment failure");
         }
 
+        first_attempt = false;
         attempt_start_nonce = attempt_start_nonce.wrapping_add(attempt_span);
         warn(
             "BACKEND",

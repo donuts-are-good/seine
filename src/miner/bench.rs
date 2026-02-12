@@ -15,7 +15,6 @@ use sysinfo::System;
 use crate::backend::{BackendEvent, BackendInstanceId, DeadlineSupport, PowBackend};
 use crate::config::{BenchBaselinePolicy, BenchKind, Config, CpuAffinityMode, WorkAllocation};
 
-use super::round_control::{redistribute_for_topology_change, TopologyRedistributionOptions};
 use super::runtime::{
     seed_backend_weights, update_backend_weights, work_distribution_weights, RoundEndReason,
     WeightUpdateInputs,
@@ -24,10 +23,9 @@ use super::scheduler::NonceScheduler;
 use super::stats::{format_hashrate, median};
 use super::ui::{info, startup_banner, success, warn};
 use super::{
-    activate_backends, backend_name_list, backend_names, collect_backend_hashes, distribute_work,
-    format_round_backend_telemetry, next_work_id, quiesce_backend_slots, start_backend_slots,
-    stop_backend_slots, total_lanes, BackendRoundTelemetry, BackendSlot, RuntimeBackendEventAction,
-    RuntimeMode, MIN_EVENT_WAIT,
+    activate_backends, collect_backend_hashes, distribute_work, format_round_backend_telemetry,
+    next_work_id, quiesce_backend_slots, start_backend_slots, stop_backend_slots, total_lanes,
+    BackendRoundTelemetry, BackendSlot, RuntimeBackendEventAction, RuntimeMode, MIN_EVENT_WAIT,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +138,14 @@ struct BenchEnvironment {
     available_memory_bytes: u64,
     cgroup_total_memory_bytes: Option<u64>,
     cgroup_free_memory_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerBenchmarkIdentity {
+    backend_ids: BTreeSet<BackendInstanceId>,
+    backends: Vec<String>,
+    preemption: Vec<String>,
+    total_lanes: u64,
 }
 
 type BackendEventAction = RuntimeBackendEventAction;
@@ -267,6 +273,48 @@ fn run_kernel_benchmark(
     )
 }
 
+fn worker_benchmark_identity(backends: &[BackendSlot]) -> WorkerBenchmarkIdentity {
+    WorkerBenchmarkIdentity {
+        backend_ids: backends.iter().map(|slot| slot.id).collect(),
+        backends: backends
+            .iter()
+            .map(|slot| format!("{}#{}", slot.backend.name(), slot.id))
+            .collect(),
+        preemption: backends
+            .iter()
+            .map(|slot| {
+                format!(
+                    "{}#{}={}",
+                    slot.backend.name(),
+                    slot.id,
+                    slot.backend.preemption_granularity().describe()
+                )
+            })
+            .collect(),
+        total_lanes: total_lanes(backends),
+    }
+}
+
+fn ensure_worker_topology_identity(
+    backends: &[BackendSlot],
+    identity: &WorkerBenchmarkIdentity,
+    context: &str,
+) -> Result<()> {
+    let current_ids = backends.iter().map(|slot| slot.id).collect::<BTreeSet<_>>();
+    if current_ids == identity.backend_ids {
+        return Ok(());
+    }
+    let current = backends
+        .iter()
+        .map(|slot| format!("{}#{}", slot.backend.name(), slot.id))
+        .collect::<Vec<_>>();
+    bail!(
+        "benchmark aborted: backend topology changed during {context} (expected={} current={})",
+        identity.backends.join(","),
+        current.join(",")
+    )
+}
+
 fn run_worker_benchmark(
     cfg: &Config,
     shutdown: &AtomicBool,
@@ -275,6 +323,7 @@ fn run_worker_benchmark(
 ) -> Result<()> {
     let (mut backends, backend_events) = activate_backends(instances, cfg.backend_event_capacity)?;
     super::enforce_deadline_policy(&mut backends, cfg.allow_best_effort_deadlines)?;
+    let identity = worker_benchmark_identity(&backends);
     let bench_kind = if restart_each_round {
         "end_to_end"
     } else {
@@ -286,9 +335,9 @@ fn run_worker_benchmark(
     let lines = vec![
         ("Mode", "benchmark".to_string()),
         ("Kind", bench_kind.to_string()),
-        ("Backends", backend_names(&backends)),
-        ("Preemption", super::backend_preemption_profiles(&backends)),
-        ("Lanes", total_lanes(&backends).to_string()),
+        ("Backends", identity.backends.join(",")),
+        ("Preemption", identity.preemption.join(", ")),
+        ("Lanes", identity.total_lanes.to_string()),
         ("Rounds", cfg.bench_rounds.to_string()),
         ("Seconds/Round", cfg.bench_secs.to_string()),
         (
@@ -343,6 +392,7 @@ fn run_worker_benchmark(
         &mut backends,
         &backend_events,
         restart_each_round,
+        &identity,
     );
     stop_backend_slots(&mut backends);
     result
@@ -354,6 +404,7 @@ fn run_worker_benchmark_inner(
     backends: &mut Vec<BackendSlot>,
     backend_events: &Receiver<BackendEvent>,
     restart_each_round: bool,
+    identity: &WorkerBenchmarkIdentity,
 ) -> Result<()> {
     let impossible_target = [0u8; 32];
     let mut runs = Vec::with_capacity(cfg.bench_rounds as usize);
@@ -362,6 +413,7 @@ fn run_worker_benchmark_inner(
     let mut work_id_cursor = 1u64;
     let mut scheduler = NonceScheduler::new(cfg.start_nonce, cfg.nonce_iters_per_lane);
     let mut backend_weights = seed_backend_weights(backends);
+    ensure_worker_topology_identity(backends, identity, "benchmark setup")?;
 
     for round in 0..cfg.bench_rounds {
         if shutdown.load(Ordering::Relaxed) {
@@ -373,6 +425,7 @@ fn run_worker_benchmark_inner(
 
         if restart_each_round {
             start_backend_slots(backends)?;
+            ensure_worker_topology_identity(backends, identity, "backend restart")?;
         }
 
         epoch = epoch.wrapping_add(1).max(1);
@@ -400,8 +453,7 @@ fn run_worker_benchmark_inner(
         let mut round_hashes = 0u64;
         let mut round_backend_hashes = BTreeMap::new();
         let mut round_backend_telemetry = BTreeMap::new();
-        let mut topology_changed = false;
-        let mut hash_poll_interval =
+        let hash_poll_interval =
             super::effective_hash_poll_interval(backends, cfg.hash_poll_interval);
         let mut next_hash_poll_at = Instant::now() + hash_poll_interval;
         while Instant::now() < stop_at && !shutdown.load(Ordering::Relaxed) {
@@ -428,44 +480,14 @@ fn run_worker_benchmark_inner(
                     if handle_benchmark_backend_event(event, epoch, backends)?
                         == BackendEventAction::TopologyChanged
                     {
-                        topology_changed = true;
+                        ensure_worker_topology_identity(
+                            backends,
+                            identity,
+                            &format!("round {}", round + 1),
+                        )?;
                     }
                 }
                 default(wait_for) => {}
-            }
-
-            if topology_changed
-                && !shutdown.load(Ordering::Relaxed)
-                && Instant::now() < stop_at
-                && !backends.is_empty()
-            {
-                redistribute_for_topology_change(
-                    backends,
-                    TopologyRedistributionOptions {
-                        epoch,
-                        work_id,
-                        header_base: Arc::clone(&header_base),
-                        target: impossible_target,
-                        stop_at,
-                        assignment_timeout: cfg.backend_assign_timeout,
-                        control_timeout: cfg.backend_control_timeout,
-                        mode: RuntimeMode::Bench,
-                        work_allocation: cfg.work_allocation,
-                        backend_weights: work_distribution_weights(
-                            cfg.work_allocation,
-                            &backend_weights,
-                        ),
-                        nonce_scheduler: &mut scheduler,
-                        log_tag: "BENCH",
-                    },
-                )?;
-                if backends.is_empty() {
-                    break;
-                }
-                hash_poll_interval =
-                    super::effective_hash_poll_interval(backends, cfg.hash_poll_interval);
-                next_hash_poll_at = Instant::now() + hash_poll_interval;
-                topology_changed = false;
             }
         }
 
@@ -484,7 +506,15 @@ fn run_worker_benchmark_inner(
             .as_secs_f64()
             .max(0.001);
         let fence_start = Instant::now();
-        let _ = quiesce_backend_slots(backends, RuntimeMode::Bench, cfg.backend_control_timeout)?;
+        if quiesce_backend_slots(backends, RuntimeMode::Bench, cfg.backend_control_timeout)?
+            == BackendEventAction::TopologyChanged
+        {
+            ensure_worker_topology_identity(
+                backends,
+                identity,
+                &format!("round {} fence", round + 1),
+            )?;
+        }
         let fence_elapsed = fence_start.elapsed().as_secs_f64();
         let mut late_hashes = 0u64;
         let mut late_backend_hashes = BTreeMap::new();
@@ -496,7 +526,15 @@ fn run_worker_benchmark_inner(
             Some(&mut late_backend_hashes),
             Some(&mut late_backend_telemetry),
         );
-        drain_benchmark_backend_events(backend_events, epoch, backends)?;
+        if drain_benchmark_backend_events(backend_events, epoch, backends)?
+            == BackendEventAction::TopologyChanged
+        {
+            ensure_worker_topology_identity(
+                backends,
+                identity,
+                &format!("round {} event drain", round + 1),
+            )?;
+        }
 
         for (backend_id, hashes) in late_backend_hashes {
             let entry = round_backend_hashes.entry(backend_id).or_insert(0);
@@ -582,19 +620,9 @@ fn run_worker_benchmark_inner(
             } else {
                 "backend".to_string()
             },
-            backends: backend_name_list(backends),
-            preemption: backends
-                .iter()
-                .map(|slot| {
-                    format!(
-                        "{}#{}={}",
-                        slot.backend.name(),
-                        slot.id,
-                        slot.backend.preemption_granularity().describe()
-                    )
-                })
-                .collect(),
-            total_lanes: total_lanes(backends),
+            backends: identity.backends.clone(),
+            preemption: identity.preemption.clone(),
+            total_lanes: identity.total_lanes,
             cpu_threads: cfg.threads,
             bench_secs: cfg.bench_secs,
             rounds: runs.len() as u32,
@@ -1390,5 +1418,62 @@ mod tests {
 
         let rendered = format_bench_backend_hashrate(&backends, &round_backend_hashes, 1.0);
         assert!(rendered.contains("noop#7=0.000 H/s"), "{rendered}");
+    }
+
+    #[test]
+    fn worker_topology_identity_tracks_initial_backend_set() {
+        let backends = vec![
+            BackendSlot {
+                id: 2,
+                backend: Arc::new(NoopBackend),
+                lanes: 1,
+            },
+            BackendSlot {
+                id: 9,
+                backend: Arc::new(NoopBackend),
+                lanes: 2,
+            },
+        ];
+
+        let identity = worker_benchmark_identity(&backends);
+        assert_eq!(
+            identity.backends,
+            vec!["noop#2".to_string(), "noop#9".to_string()]
+        );
+        assert_eq!(
+            identity.preemption,
+            vec!["noop#2=unknown", "noop#9=unknown"]
+        );
+        assert_eq!(identity.total_lanes, 3);
+        assert_eq!(
+            identity.backend_ids,
+            [2u64, 9u64].into_iter().collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn topology_identity_validation_fails_when_backend_is_removed() {
+        let expected = vec![
+            BackendSlot {
+                id: 2,
+                backend: Arc::new(NoopBackend),
+                lanes: 1,
+            },
+            BackendSlot {
+                id: 9,
+                backend: Arc::new(NoopBackend),
+                lanes: 1,
+            },
+        ];
+        let current = vec![BackendSlot {
+            id: 2,
+            backend: Arc::new(NoopBackend),
+            lanes: 1,
+        }];
+        let identity = worker_benchmark_identity(&expected);
+
+        let err = ensure_worker_topology_identity(&current, &identity, "round 1")
+            .expect_err("topology mismatch should fail benchmark");
+        assert!(format!("{err:#}").contains("topology changed"));
     }
 }

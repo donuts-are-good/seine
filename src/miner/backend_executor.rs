@@ -215,7 +215,7 @@ pub(super) fn dispatch_backend_tasks(
     let mut outcomes: Vec<Option<BackendTaskOutcome>> =
         std::iter::repeat_with(|| None).take(outcomes_len).collect();
     let (outcome_tx, outcome_rx) = bounded::<BackendTaskOutcome>(expected.max(1));
-    let deadline = Instant::now() + timeout;
+    let mut recv_deadline = Instant::now();
 
     for task in tasks {
         let backend_id = task.backend_id;
@@ -223,6 +223,12 @@ pub(super) fn dispatch_backend_tasks(
         let action = task.kind.action_label();
         let backend_handle = Arc::clone(&task.backend_handle);
         let idx = task.idx;
+        let task_deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        if task_deadline > recv_deadline {
+            recv_deadline = task_deadline;
+        }
         let Some(worker_tx) = worker_sender_for_backend(backend_id, backend, &backend_handle)
         else {
             let _ = outcome_tx.send(BackendTaskOutcome {
@@ -236,7 +242,7 @@ pub(super) fn dispatch_backend_tasks(
 
         let command = BackendWorkerCommand::Run {
             task,
-            deadline,
+            deadline: task_deadline,
             outcome_tx: outcome_tx.clone(),
         };
         match worker_tx.try_send(command) {
@@ -268,10 +274,10 @@ pub(super) fn dispatch_backend_tasks(
     let mut received = 0usize;
     while received < expected {
         let now = Instant::now();
-        if now >= deadline {
+        if now >= recv_deadline {
             break;
         }
-        match outcome_rx.recv_timeout(deadline.saturating_duration_since(now)) {
+        match outcome_rx.recv_timeout(recv_deadline.saturating_duration_since(now)) {
             Ok(outcome) => {
                 let outcome_idx = outcome.idx;
                 if expected_indices.contains(&outcome_idx) && outcomes[outcome_idx].is_none() {
