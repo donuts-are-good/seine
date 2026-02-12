@@ -143,6 +143,7 @@ struct BenchEnvironment {
 #[derive(Debug, Clone)]
 struct WorkerBenchmarkIdentity {
     backend_ids: BTreeSet<BackendInstanceId>,
+    backend_lanes: BTreeMap<BackendInstanceId, u64>,
     backends: Vec<String>,
     preemption: Vec<String>,
     total_lanes: u64,
@@ -276,6 +277,7 @@ fn run_kernel_benchmark(
 fn worker_benchmark_identity(backends: &[BackendSlot]) -> WorkerBenchmarkIdentity {
     WorkerBenchmarkIdentity {
         backend_ids: backends.iter().map(|slot| slot.id).collect(),
+        backend_lanes: backends.iter().map(|slot| (slot.id, slot.lanes)).collect(),
         backends: backends
             .iter()
             .map(|slot| format!("{}#{}", slot.backend.name(), slot.id))
@@ -301,17 +303,41 @@ fn ensure_worker_topology_identity(
     context: &str,
 ) -> Result<()> {
     let current_ids = backends.iter().map(|slot| slot.id).collect::<BTreeSet<_>>();
-    if current_ids == identity.backend_ids {
-        return Ok(());
-    }
-    let current = backends
+    let current_lanes = backends
+        .iter()
+        .map(|slot| (slot.id, slot.lanes))
+        .collect::<BTreeMap<_, _>>();
+    let current_backends = backends
         .iter()
         .map(|slot| format!("{}#{}", slot.backend.name(), slot.id))
         .collect::<Vec<_>>();
+    let current_preemption = backends
+        .iter()
+        .map(|slot| {
+            format!(
+                "{}#{}={}",
+                slot.backend.name(),
+                slot.id,
+                slot.backend.preemption_granularity().describe()
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if current_ids == identity.backend_ids
+        && current_lanes == identity.backend_lanes
+        && current_backends == identity.backends
+        && current_preemption == identity.preemption
+    {
+        return Ok(());
+    }
     bail!(
-        "benchmark aborted: backend topology changed during {context} (expected={} current={})",
+        "benchmark aborted: backend topology changed during {context} (expected_backends={} current_backends={} expected_lanes={:?} current_lanes={:?} expected_preemption={} current_preemption={})",
         identity.backends.join(","),
-        current.join(",")
+        current_backends.join(","),
+        identity.backend_lanes,
+        current_lanes,
+        identity.preemption.join(","),
+        current_preemption.join(",")
     )
 }
 
@@ -1475,5 +1501,26 @@ mod tests {
         let err = ensure_worker_topology_identity(&current, &identity, "round 1")
             .expect_err("topology mismatch should fail benchmark");
         assert!(format!("{err:#}").contains("topology changed"));
+    }
+
+    #[test]
+    fn topology_identity_validation_fails_when_lane_shape_changes() {
+        let expected = vec![BackendSlot {
+            id: 2,
+            backend: Arc::new(NoopBackend),
+            lanes: 2,
+        }];
+        let current = vec![BackendSlot {
+            id: 2,
+            backend: Arc::new(NoopBackend),
+            lanes: 1,
+        }];
+        let identity = worker_benchmark_identity(&expected);
+
+        let err = ensure_worker_topology_identity(&current, &identity, "round 1")
+            .expect_err("lane mismatch should fail benchmark");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("expected_lanes"));
+        assert!(rendered.contains("current_lanes"));
     }
 }
