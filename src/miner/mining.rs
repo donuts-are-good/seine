@@ -309,6 +309,21 @@ impl TuiDisplay {
             s.block_found_ticks.push(elapsed);
         }
     }
+
+    fn render_now(&mut self) {
+        if let Ok(locked) = self.state.lock() {
+            let _ = self.renderer.render(&locked);
+        }
+        self.last_render = Instant::now();
+    }
+
+    fn set_state_and_render(&mut self, state_label: &str) {
+        if let Ok(mut s) = self.state.lock() {
+            s.state = state_label.to_string();
+        }
+        self.last_state_label = state_label.to_string();
+        self.render_now();
+    }
 }
 
 impl Drop for TuiDisplay {
@@ -340,6 +355,18 @@ fn init_tui_display(tui_state: Option<TuiState>, shutdown: Arc<AtomicBool>) -> O
 fn update_tui(tui: &mut Option<TuiDisplay>, stats: &Stats, view: RoundUiView<'_>) {
     if let Some(display) = tui.as_mut() {
         display.update(stats, view);
+    }
+}
+
+fn render_tui_now(tui: &mut Option<TuiDisplay>) {
+    if let Some(display) = tui.as_mut() {
+        display.render_now();
+    }
+}
+
+fn set_tui_state_label(tui: &mut Option<TuiDisplay>, state_label: &str) {
+    if let Some(display) = tui.as_mut() {
+        display.set_state_and_render(state_label);
     }
 }
 
@@ -391,7 +418,7 @@ pub(super) fn run_mining_loop(
     let mut prefetch: Option<TemplatePrefetch> = None;
     let mut tui = init_tui_display(tui_state, Arc::clone(&shutdown));
 
-    let mut template = match fetch_template_with_retry(client, cfg, shutdown.as_ref()) {
+    let mut template = match fetch_template_with_retry(client, cfg, shutdown.as_ref(), &mut tui) {
         Some(t) => t,
         None => {
             stats.print();
@@ -413,9 +440,14 @@ pub(super) fn run_mining_loop(
                 if !sleep_with_shutdown(shutdown.as_ref(), TEMPLATE_RETRY_DELAY) {
                     break;
                 }
-                let Some(next_template) =
-                    resolve_next_template(&mut prefetch, client, cfg, &shutdown, tip_signal)
-                else {
+                let Some(next_template) = resolve_next_template(
+                    &mut prefetch,
+                    client,
+                    cfg,
+                    &shutdown,
+                    tip_signal,
+                    &mut tui,
+                ) else {
                     break;
                 };
                 template = next_template;
@@ -436,7 +468,7 @@ pub(super) fn run_mining_loop(
                 break;
             }
             let Some(next_template) =
-                resolve_next_template(&mut prefetch, client, cfg, &shutdown, tip_signal)
+                resolve_next_template(&mut prefetch, client, cfg, &shutdown, tip_signal, &mut tui)
             else {
                 break;
             };
@@ -451,9 +483,14 @@ pub(super) fn run_mining_loop(
                 if !sleep_with_shutdown(shutdown.as_ref(), TEMPLATE_RETRY_DELAY) {
                     break;
                 }
-                let Some(next_template) =
-                    resolve_next_template(&mut prefetch, client, cfg, &shutdown, tip_signal)
-                else {
+                let Some(next_template) = resolve_next_template(
+                    &mut prefetch,
+                    client,
+                    cfg,
+                    &shutdown,
+                    tip_signal,
+                    &mut tui,
+                ) else {
                     break;
                 };
                 template = next_template;
@@ -754,7 +791,7 @@ pub(super) fn run_mining_loop(
         }
 
         let Some(next_template) =
-            resolve_next_template(&mut prefetch, client, cfg, &shutdown, tip_signal)
+            resolve_next_template(&mut prefetch, client, cfg, &shutdown, tip_signal, &mut tui)
         else {
             break;
         };
@@ -782,7 +819,7 @@ struct TemplatePrefetch {
 impl TemplatePrefetch {
     fn spawn(client: ApiClient, cfg: Config, shutdown: Arc<AtomicBool>, tip_sequence: u64) -> Self {
         let handle =
-            thread::spawn(move || fetch_template_with_retry(&client, &cfg, shutdown.as_ref()));
+            thread::spawn(move || fetch_template_prefetch_once(&client, &cfg, shutdown.as_ref()));
         Self {
             handle,
             tip_sequence,
@@ -810,6 +847,7 @@ fn resolve_next_template(
     cfg: &Config,
     shutdown: &Arc<AtomicBool>,
     tip_signal: Option<&TipSignal>,
+    tui: &mut Option<TuiDisplay>,
 ) -> Option<BlockTemplateResponse> {
     if shutdown.load(Ordering::Relaxed) {
         if let Some(task) = prefetch.take() {
@@ -829,7 +867,7 @@ fn resolve_next_template(
         }
     }
 
-    fetch_template_with_retry(client, cfg, shutdown.as_ref())
+    fetch_template_with_retry(client, cfg, shutdown.as_ref(), tui)
 }
 
 fn handle_mining_backend_event(
@@ -1048,6 +1086,7 @@ fn fetch_template_with_retry(
     client: &ApiClient,
     cfg: &Config,
     shutdown: &AtomicBool,
+    tui: &mut Option<TuiDisplay>,
 ) -> Option<BlockTemplateResponse> {
     let mut retry = RetryTracker::default();
 
@@ -1055,20 +1094,24 @@ fn fetch_template_with_retry(
         match client.get_block_template() {
             Ok(template) => {
                 retry.note_recovered("NETWORK", "blocktemplate fetch recovered");
+                render_tui_now(tui);
                 return Some(template);
             }
             Err(err) if is_no_wallet_loaded_error(&err) => {
+                set_tui_state_label(tui, "awaiting-wallet");
                 warn(
                     "WALLET",
                     "blocktemplate requires loaded wallet; attempting automatic load",
                 );
-                match auto_load_wallet(client, cfg, shutdown) {
+                render_tui_now(tui);
+                match auto_load_wallet(client, cfg, shutdown, tui) {
                     Ok(true) => continue,
                     Ok(false) => {
                         warn(
                             "WALLET",
                             "unable to auto-load wallet; use --wallet-password, --wallet-password-file, SEINE_WALLET_PASSWORD, or interactive prompt",
                         );
+                        render_tui_now(tui);
                         return None;
                     }
                     Err(load_err) => {
@@ -1076,6 +1119,7 @@ fn fetch_template_with_retry(
                             "WALLET",
                             format!("automatic wallet load failed: {load_err:#}"),
                         );
+                        render_tui_now(tui);
                         return None;
                     }
                 }
@@ -1084,6 +1128,7 @@ fn fetch_template_with_retry(
                 match refresh_api_token_from_cookie(client, cfg.token_cookie_path.as_deref()) {
                     TokenRefreshOutcome::Refreshed => {
                         success("AUTH", "auth refreshed from cookie");
+                        render_tui_now(tui);
                         continue;
                     }
                     TokenRefreshOutcome::Unchanged => {
@@ -1111,6 +1156,7 @@ fn fetch_template_with_retry(
                         );
                     }
                 }
+                render_tui_now(tui);
                 if !sleep_with_shutdown(shutdown, TEMPLATE_RETRY_DELAY) {
                     break;
                 }
@@ -1122,6 +1168,7 @@ fn fetch_template_with_retry(
                     "still failing to fetch blocktemplate; retrying",
                     true,
                 );
+                render_tui_now(tui);
                 if !sleep_with_shutdown(shutdown, TEMPLATE_RETRY_DELAY) {
                     break;
                 }
@@ -1130,6 +1177,31 @@ fn fetch_template_with_retry(
     }
 
     None
+}
+
+fn fetch_template_prefetch_once(
+    client: &ApiClient,
+    cfg: &Config,
+    shutdown: &AtomicBool,
+) -> Option<BlockTemplateResponse> {
+    if shutdown.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    match client.get_block_template() {
+        Ok(template) => Some(template),
+        Err(err) if is_unauthorized_error(&err) => {
+            if matches!(
+                refresh_api_token_from_cookie(client, cfg.token_cookie_path.as_deref()),
+                TokenRefreshOutcome::Refreshed
+            ) {
+                client.get_block_template().ok()
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
 }
 
 fn refresh_api_token_from_cookie(
@@ -1214,11 +1286,22 @@ fn sleep_with_shutdown(shutdown: &AtomicBool, duration: Duration) -> bool {
     false
 }
 
-fn auto_load_wallet(client: &ApiClient, cfg: &Config, shutdown: &AtomicBool) -> Result<bool> {
+fn auto_load_wallet(
+    client: &ApiClient,
+    cfg: &Config,
+    shutdown: &AtomicBool,
+    tui: &mut Option<TuiDisplay>,
+) -> Result<bool> {
     const MAX_PROMPT_ATTEMPTS: u32 = 3;
 
-    let Some((mut password, source)) = resolve_wallet_password(cfg)? else {
-        return Ok(false);
+    let (mut password, source) = match resolve_wallet_password(cfg)? {
+        Some((password, source)) => (password, source),
+        None => {
+            let Some(password) = prompt_wallet_password(tui)? else {
+                return Ok(false);
+            };
+            (password, WalletPasswordSource::Prompt)
+        }
     };
     let mut prompt_attempt = 1u32;
 
@@ -1243,8 +1326,9 @@ fn auto_load_wallet(client: &ApiClient, cfg: &Config, shutdown: &AtomicBool) -> 
                     && prompt_attempt < MAX_PROMPT_ATTEMPTS =>
             {
                 warn("WALLET", format!("load failed: {err:#}"));
+                render_tui_now(tui);
                 prompt_attempt += 1;
-                let Some(next_password) = prompt_wallet_password()? else {
+                let Some(next_password) = prompt_wallet_password(tui)? else {
                     return Ok(false);
                 };
                 password.clear();
@@ -1289,10 +1373,6 @@ fn resolve_wallet_password(cfg: &Config) -> Result<Option<(String, WalletPasswor
         }
     }
 
-    if let Some(password) = prompt_wallet_password()? {
-        return Ok(Some((password, WalletPasswordSource::Prompt)));
-    }
-
     Ok(None)
 }
 
@@ -1302,7 +1382,7 @@ fn read_password_file(path: &std::path::Path) -> Result<String> {
     Ok(raw.trim_end_matches(['\r', '\n']).to_string())
 }
 
-fn prompt_wallet_password() -> Result<Option<String>> {
+fn prompt_wallet_password(tui: &mut Option<TuiDisplay>) -> Result<Option<String>> {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         return Ok(None);
     }
@@ -1318,16 +1398,20 @@ fn prompt_wallet_password() -> Result<Option<String>> {
 
     let raw_mode = is_raw_mode_enabled().unwrap_or(false);
 
+    set_tui_state_label(tui, "awaiting-wallet");
     error(
         "WALLET",
-        "ACTION REQUIRED: enter wallet password to continue mining",
+        "ACTION REQUIRED: wallet password needed to continue mining",
     );
-    warn("WALLET", "password input is hidden; press Enter to submit");
+    warn(
+        "WALLET",
+        "password input is hidden; type password and press Enter",
+    );
+    render_tui_now(tui);
     if raw_mode {
         return prompt_wallet_password_raw_mode();
     }
 
-    eprintln!("seine: wallet password required to continue mining.");
     let password = rpassword::prompt_password("wallet password (input hidden): ")
         .context("failed to read wallet password from terminal")?;
     if password.is_empty() {
@@ -1351,6 +1435,9 @@ fn prompt_wallet_password_raw_mode() -> Result<Option<String>> {
         match key.code {
             KeyCode::Enter => break,
             KeyCode::Esc => return Ok(None),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(None);
+            }
             KeyCode::Backspace => {
                 password.pop();
             }
