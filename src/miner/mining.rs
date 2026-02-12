@@ -11,12 +11,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use blocknet_pow_spec::POW_HEADER_BASE_LEN;
 use crossbeam_channel::Receiver;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, is_raw_mode_enabled, EnterAlternateScreen,
-    LeaveAlternateScreen,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal::is_raw_mode_enabled;
 use serde_json::Value;
 
 use crate::api::{
@@ -191,54 +187,31 @@ static PROMPT_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[derive(Default)]
 struct RetryTracker {
     failures: u64,
-    disconnected_since: Option<Instant>,
-    last_signature: String,
     last_log_at: Option<Instant>,
     outage_logged: bool,
 }
 
 impl RetryTracker {
-    fn note_failure(
-        &mut self,
-        tag: &str,
-        context: &str,
-        detail: &str,
-        retry_delay: Duration,
-        immediate: bool,
-    ) {
+    fn note_failure(&mut self, tag: &str, first: &str, repeat: &str, immediate_first: bool) {
         let now = Instant::now();
         self.failures = self.failures.saturating_add(1);
-        if self.disconnected_since.is_none() {
-            self.disconnected_since = Some(now);
-        }
 
-        let should_log = if immediate && self.failures == 1 {
-            true
-        } else if self.failures >= 2 {
-            self.last_signature != detail
-                || self
-                    .last_log_at
-                    .is_none_or(|last| now.saturating_duration_since(last) >= RETRY_LOG_INTERVAL)
+        let should_log = if self.failures == 1 {
+            immediate_first
         } else {
-            false
+            self.last_log_at
+                .is_none_or(|last| now.saturating_duration_since(last) >= RETRY_LOG_INTERVAL)
         };
 
         if should_log {
-            warn(
-                tag,
-                format!(
-                    "{context} unavailable (attempt {}); retrying in {}s: {detail}",
-                    self.failures,
-                    retry_delay.as_secs_f64(),
-                ),
-            );
-            self.last_signature = detail.to_string();
+            let message = if self.failures == 1 { first } else { repeat };
+            warn(tag, message);
             self.last_log_at = Some(now);
             self.outage_logged = true;
         }
     }
 
-    fn note_recovered(&mut self, tag: &str, context: &str) {
+    fn note_recovered(&mut self, tag: &str, message: &str) {
         if self.failures == 0 {
             return;
         }
@@ -246,28 +219,9 @@ impl RetryTracker {
             *self = Self::default();
             return;
         }
-        let downtime = self
-            .disconnected_since
-            .map(|since| since.elapsed().as_secs_f64())
-            .unwrap_or(0.0);
-        success(
-            tag,
-            format!(
-                "{context} reconnected after {} failure(s), downtime {:.1}s",
-                self.failures, downtime
-            ),
-        );
+        success(tag, message);
         *self = Self::default();
     }
-}
-
-fn concise_error(err: &anyhow::Error) -> String {
-    let root = err.root_cause().to_string();
-    let root = root.trim();
-    if root.is_empty() {
-        return err.to_string();
-    }
-    root.to_string()
 }
 
 enum TokenRefreshOutcome {
@@ -926,15 +880,13 @@ pub(super) fn spawn_tip_listener(
         while !shutdown.load(Ordering::Relaxed) {
             match client.open_events_stream() {
                 Ok(resp) => {
-                    retry.note_recovered("EVENTS", "events stream");
-                    if let Err(err) = stream_tip_events(resp, &signal, &shutdown) {
+                    retry.note_recovered("EVENTS", "events stream reconnected");
+                    if let Err(_err) = stream_tip_events(resp, &signal, &shutdown) {
                         if !shutdown.load(Ordering::Relaxed) {
-                            let detail = concise_error(&err);
                             retry.note_failure(
                                 "EVENTS",
-                                "events stream",
-                                &detail,
-                                Duration::from_secs(1),
+                                "failed to fetch events; reconnecting",
+                                "still failing to fetch events; reconnecting",
                                 false,
                             );
                         }
@@ -948,26 +900,40 @@ pub(super) fn spawn_tip_listener(
                                 token_cookie_path.as_deref(),
                             ) {
                                 TokenRefreshOutcome::Refreshed => {
-                                    success(
-                                        "AUTH",
-                                        "events stream unauthorized; refreshed API token from cookie and retrying",
-                                    );
+                                    success("AUTH", "auth refreshed from cookie");
                                     continue;
                                 }
-                                TokenRefreshOutcome::Unchanged => {}
-                                TokenRefreshOutcome::Unavailable => {}
+                                TokenRefreshOutcome::Unchanged => {
+                                    retry.note_failure(
+                                        "AUTH",
+                                        "auth expired; waiting for new cookie token",
+                                        "auth still expired; waiting for new cookie token",
+                                        true,
+                                    );
+                                }
+                                TokenRefreshOutcome::Unavailable => {
+                                    retry.note_failure(
+                                        "AUTH",
+                                        "auth failed; static --token cannot auto-refresh",
+                                        "still waiting for manual token refresh",
+                                        true,
+                                    );
+                                }
                                 TokenRefreshOutcome::Failed(msg) => {
-                                    warn("AUTH", msg);
+                                    retry.note_failure(
+                                        "AUTH",
+                                        &msg,
+                                        "failed to refresh auth token from cookie",
+                                        true,
+                                    );
                                 }
                             }
                         }
 
-                        let detail = concise_error(&err);
                         retry.note_failure(
                             "EVENTS",
-                            "events stream",
-                            &detail,
-                            Duration::from_secs(1),
+                            "failed to fetch events; reconnecting",
+                            "still failing to fetch events; reconnecting",
                             false,
                         );
                     }
@@ -1088,7 +1054,7 @@ fn fetch_template_with_retry(
     while !shutdown.load(Ordering::Relaxed) {
         match client.get_block_template() {
             Ok(template) => {
-                retry.note_recovered("NETWORK", "blocktemplate");
+                retry.note_recovered("NETWORK", "blocktemplate fetch recovered");
                 return Some(template);
             }
             Err(err) if is_no_wallet_loaded_error(&err) => {
@@ -1117,36 +1083,30 @@ fn fetch_template_with_retry(
             Err(err) if is_unauthorized_error(&err) => {
                 match refresh_api_token_from_cookie(client, cfg.token_cookie_path.as_deref()) {
                     TokenRefreshOutcome::Refreshed => {
-                        success(
-                            "AUTH",
-                            "blocktemplate unauthorized; refreshed API token from cookie and retrying",
-                        );
+                        success("AUTH", "auth refreshed from cookie");
                         continue;
                     }
                     TokenRefreshOutcome::Unchanged => {
                         retry.note_failure(
                             "AUTH",
-                            "daemon authentication",
-                            "token unauthorized (cookie token unchanged; waiting for daemon/cookie rotation)",
-                            TEMPLATE_RETRY_DELAY,
+                            "auth expired; waiting for new cookie token",
+                            "auth still expired; waiting for new cookie token",
                             true,
                         );
                     }
                     TokenRefreshOutcome::Unavailable => {
                         retry.note_failure(
                             "AUTH",
-                            "daemon authentication",
-                            "token unauthorized; running with static --token (restart with a fresh token or use --cookie)",
-                            TEMPLATE_RETRY_DELAY,
+                            "auth failed; static --token cannot auto-refresh",
+                            "still waiting for manual token refresh",
                             true,
                         );
                     }
                     TokenRefreshOutcome::Failed(msg) => {
                         retry.note_failure(
                             "AUTH",
-                            "daemon authentication",
                             &msg,
-                            TEMPLATE_RETRY_DELAY,
+                            "failed to refresh auth token from cookie",
                             true,
                         );
                     }
@@ -1155,13 +1115,11 @@ fn fetch_template_with_retry(
                     break;
                 }
             }
-            Err(err) => {
-                let detail = concise_error(&err);
+            Err(_) => {
                 retry.note_failure(
                     "NETWORK",
-                    "blocktemplate",
-                    &detail,
-                    TEMPLATE_RETRY_DELAY,
+                    "failed to fetch blocktemplate; retrying",
+                    "still failing to fetch blocktemplate; retrying",
                     true,
                 );
                 if !sleep_with_shutdown(shutdown, TEMPLATE_RETRY_DELAY) {
@@ -1184,21 +1142,13 @@ fn refresh_api_token_from_cookie(
 
     let token = match read_token_from_cookie_file(cookie_path) {
         Ok(token) => token,
-        Err(err) => {
-            return TokenRefreshOutcome::Failed(format!(
-                "failed reading API cookie at {}: {err:#}",
-                cookie_path.display()
-            ))
-        }
+        Err(_) => return TokenRefreshOutcome::Failed("failed reading API cookie".to_string()),
     };
 
     match client.replace_token(token) {
         Ok(true) => TokenRefreshOutcome::Refreshed,
         Ok(false) => TokenRefreshOutcome::Unchanged,
-        Err(err) => TokenRefreshOutcome::Failed(format!(
-            "failed updating API token from {}: {err:#}",
-            cookie_path.display()
-        )),
+        Err(_) => TokenRefreshOutcome::Failed("failed updating API token".to_string()),
     }
 }
 
@@ -1366,35 +1316,56 @@ fn prompt_wallet_password() -> Result<Option<String>> {
     }
     let _prompt_guard = PromptGuard;
 
-    let was_raw_mode = is_raw_mode_enabled().unwrap_or(false);
-    if was_raw_mode {
-        let _ = disable_raw_mode();
-        let mut stdout = std::io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen);
+    let raw_mode = is_raw_mode_enabled().unwrap_or(false);
+
+    error(
+        "WALLET",
+        "ACTION REQUIRED: enter wallet password to continue mining",
+    );
+    warn("WALLET", "password input is hidden; press Enter to submit");
+    if raw_mode {
+        return prompt_wallet_password_raw_mode();
     }
-    struct TerminalRestoreGuard {
-        restore_raw: bool,
-        restore_alt: bool,
-    }
-    impl Drop for TerminalRestoreGuard {
-        fn drop(&mut self) {
-            if self.restore_raw {
-                let _ = enable_raw_mode();
-            }
-            if self.restore_alt {
-                let mut stdout = std::io::stdout();
-                let _ = execute!(stdout, EnterAlternateScreen);
-            }
-        }
-    }
-    let _terminal_restore_guard = TerminalRestoreGuard {
-        restore_raw: was_raw_mode,
-        restore_alt: was_raw_mode,
-    };
 
     eprintln!("seine: wallet password required to continue mining.");
     let password = rpassword::prompt_password("wallet password (input hidden): ")
         .context("failed to read wallet password from terminal")?;
+    if password.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(password))
+}
+
+fn prompt_wallet_password_raw_mode() -> Result<Option<String>> {
+    let mut password = String::new();
+
+    loop {
+        let event = event::read().context("failed to read wallet password key event")?;
+        let Event::Key(key) = event else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Enter => break,
+            KeyCode::Esc => return Ok(None),
+            KeyCode::Backspace => {
+                password.pop();
+            }
+            KeyCode::Char(ch) => {
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    password.push(ch);
+                }
+            }
+            _ => {}
+        }
+    }
+
     if password.is_empty() {
         return Ok(None);
     }
