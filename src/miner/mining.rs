@@ -434,7 +434,12 @@ pub(super) fn run_mining_loop(
                 }
             }
 
-            maybe_print_stats(&stats, &mut last_stats_print, cfg.stats_interval);
+            maybe_print_stats(
+                &stats,
+                &mut last_stats_print,
+                cfg.stats_interval,
+                tui.is_none(),
+            );
 
             if tip_signal.is_some_and(TipSignal::take_stale) {
                 stale_tip_event = true;
@@ -575,7 +580,7 @@ pub(super) fn run_mining_loop(
                             .unwrap_or_else(|| "unknown".to_string());
                         let hash = resp.hash.unwrap_or_else(|| "unknown".to_string());
                         mined("SUBMIT", format!("block accepted at height {height}"));
-                        mined("SUBMIT", format!("hash {hash}"));
+                        mined("SUBMIT", format!("hash {}", compact_hash(&hash)));
                     } else {
                         warn("SUBMIT", "rejected by daemon");
                     }
@@ -616,7 +621,12 @@ pub(super) fn run_mining_loop(
             );
         }
 
-        maybe_print_stats(&stats, &mut last_stats_print, cfg.stats_interval);
+        maybe_print_stats(
+            &stats,
+            &mut last_stats_print,
+            cfg.stats_interval,
+            tui.is_none(),
+        );
 
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -862,11 +872,38 @@ fn fetch_template_with_retry(
     None
 }
 
-fn maybe_print_stats(stats: &Stats, last_stats_print: &mut Instant, stats_interval: Duration) {
+fn maybe_print_stats(
+    stats: &Stats,
+    last_stats_print: &mut Instant,
+    stats_interval: Duration,
+    enabled: bool,
+) {
+    if !enabled {
+        return;
+    }
     if last_stats_print.elapsed() >= stats_interval {
         stats.print();
         *last_stats_print = Instant::now();
     }
+}
+
+fn compact_hash(hash: &str) -> String {
+    let value = hash.trim();
+    let len = value.chars().count();
+    if len <= 8 {
+        return value.to_string();
+    }
+
+    let prefix: String = value.chars().take(4).collect();
+    let suffix: String = value
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{prefix}...{suffix}")
 }
 
 fn sleep_with_shutdown(shutdown: &AtomicBool, duration: Duration) -> bool {
@@ -1197,6 +1234,13 @@ mod tests {
             &signal,
         );
         assert!(signal.take_stale());
+    }
+
+    #[test]
+    fn compact_hash_uses_prefix_and_suffix() {
+        assert_eq!(compact_hash("abcdef12"), "abcdef12");
+        assert_eq!(compact_hash("abc"), "abc");
+        assert_eq!(compact_hash("a1b2c3d4e5f6"), "a1b2...e5f6");
     }
 
     #[test]
