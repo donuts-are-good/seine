@@ -714,12 +714,14 @@ pub(super) fn run_mining_loop(
             &control_plane,
             epoch,
             &template,
-            &recent_templates,
-            &mut deferred_solutions,
-            &mut submitted_solution_order,
-            &mut submitted_solution_keys,
-            &stats,
-            &mut tui,
+            DeferredSubmitState {
+                recent_templates: &recent_templates,
+                deferred_solutions: &mut deferred_solutions,
+                submitted_solution_order: &mut submitted_solution_order,
+                submitted_solution_keys: &mut submitted_solution_keys,
+                stats: &stats,
+                tui: &mut tui,
+            },
         );
         collect_backend_hashes(
             backends,
@@ -885,12 +887,14 @@ pub(super) fn run_mining_loop(
             &control_plane,
             epoch,
             &template,
-            &recent_templates,
-            &mut deferred_solutions,
-            &mut submitted_solution_order,
-            &mut submitted_solution_keys,
-            &stats,
-            &mut tui,
+            DeferredSubmitState {
+                recent_templates: &recent_templates,
+                deferred_solutions: &mut deferred_solutions,
+                submitted_solution_order: &mut submitted_solution_order,
+                submitted_solution_keys: &mut submitted_solution_keys,
+                stats: &stats,
+                tui: &mut tui,
+            },
         );
     }
 
@@ -1303,31 +1307,35 @@ fn drain_mining_backend_events(
     Ok(action)
 }
 
+struct DeferredSubmitState<'a> {
+    recent_templates: &'a VecDeque<RecentTemplateEntry>,
+    deferred_solutions: &'a mut Vec<MiningSolution>,
+    submitted_solution_order: &'a mut VecDeque<(u64, u64)>,
+    submitted_solution_keys: &'a mut HashSet<(u64, u64)>,
+    stats: &'a Stats,
+    tui: &'a mut Option<TuiDisplay>,
+}
+
 fn submit_deferred_solutions(
     control_plane: &MiningControlPlane<'_>,
     current_epoch: u64,
     current_template: &BlockTemplateResponse,
-    recent_templates: &VecDeque<RecentTemplateEntry>,
-    deferred_solutions: &mut Vec<MiningSolution>,
-    submitted_solution_order: &mut VecDeque<(u64, u64)>,
-    submitted_solution_keys: &mut HashSet<(u64, u64)>,
-    stats: &Stats,
-    tui: &mut Option<TuiDisplay>,
+    state: DeferredSubmitState<'_>,
 ) {
-    if deferred_solutions.is_empty() {
+    if state.deferred_solutions.is_empty() {
         return;
     }
 
     let mut queued = Vec::new();
-    std::mem::swap(&mut queued, deferred_solutions);
+    std::mem::swap(&mut queued, state.deferred_solutions);
     for solution in dedupe_queued_solutions(queued) {
-        if already_submitted_solution(submitted_solution_keys, &solution) {
+        if already_submitted_solution(state.submitted_solution_keys, &solution) {
             continue;
         }
         let Some(template) = template_for_solution_epoch(
             current_epoch,
             current_template,
-            recent_templates,
+            state.recent_templates,
             solution.epoch,
         ) else {
             warn(
@@ -1339,8 +1347,12 @@ fn submit_deferred_solutions(
             );
             continue;
         };
-        control_plane.submit_solution(template, solution.clone(), stats, tui);
-        remember_submitted_solution(submitted_solution_order, submitted_solution_keys, &solution);
+        control_plane.submit_solution(template, solution.clone(), state.stats, state.tui);
+        remember_submitted_solution(
+            state.submitted_solution_order,
+            state.submitted_solution_keys,
+            &solution,
+        );
     }
 }
 
