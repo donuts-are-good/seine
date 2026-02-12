@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -163,6 +163,7 @@ struct Cli {
 pub struct Config {
     pub api_url: String,
     pub token: Option<String>,
+    pub token_cookie_path: Option<PathBuf>,
     pub wallet_password: Option<String>,
     pub wallet_password_file: Option<PathBuf>,
     pub backends: Vec<BackendKind>,
@@ -223,16 +224,18 @@ impl Config {
 
         validate_cpu_memory(&backends, cli.threads, cli.allow_oversubscribe)?;
 
-        let token = if cli.bench {
-            None
+        let (token, token_cookie_path) = if cli.bench {
+            (None, None)
         } else {
-            Some(resolve_token(&cli)?)
+            let (token, cookie_path) = resolve_token_with_source(&cli)?;
+            (Some(token), cookie_path)
         };
         let api_url = normalize_api_url(&cli.api_url);
 
         Ok(Self {
             api_url,
             token,
+            token_cookie_path,
             wallet_password: cli.wallet_password,
             wallet_password_file: cli.wallet_password_file,
             backends,
@@ -261,13 +264,13 @@ impl Config {
     }
 }
 
-fn resolve_token(cli: &Cli) -> Result<String> {
+fn resolve_token_with_source(cli: &Cli) -> Result<(String, Option<PathBuf>)> {
     if let Some(token) = &cli.token {
         let trimmed = token.trim();
         if trimmed.is_empty() {
             bail!("--token is empty");
         }
-        return Ok(trimmed.to_string());
+        return Ok((trimmed.to_string(), None));
     }
 
     let cookie_path = cli
@@ -275,7 +278,12 @@ fn resolve_token(cli: &Cli) -> Result<String> {
         .clone()
         .unwrap_or_else(|| cli.data_dir.join("api.cookie"));
 
-    let token = fs::read_to_string(&cookie_path)
+    let token = read_token_from_cookie_file(&cookie_path)?;
+    Ok((token, Some(cookie_path)))
+}
+
+pub fn read_token_from_cookie_file(cookie_path: &Path) -> Result<String> {
+    let token = fs::read_to_string(cookie_path)
         .with_context(|| format!("failed to read cookie file at {}", cookie_path.display()))?;
 
     let trimmed = token.trim();
@@ -462,7 +470,9 @@ mod tests {
         let mut cli = sample_cli();
         cli.token = Some("  abc123  ".to_string());
 
-        assert_eq!(resolve_token(&cli).expect("token should parse"), "abc123");
+        let (token, source) = resolve_token_with_source(&cli).expect("token should parse");
+        assert_eq!(token, "abc123");
+        assert!(source.is_none());
     }
 
     #[test]
@@ -476,10 +486,9 @@ mod tests {
         cli.cookie = Some(cookie.clone());
         cli.data_dir = dir.clone();
 
-        assert_eq!(
-            resolve_token(&cli).expect("cookie should be read"),
-            "deadbeef"
-        );
+        let (token, source) = resolve_token_with_source(&cli).expect("cookie should be read");
+        assert_eq!(token, "deadbeef");
+        assert_eq!(source.as_deref(), Some(cookie.as_path()));
         let _ = fs::remove_file(cookie);
         let _ = fs::remove_dir_all(dir);
     }

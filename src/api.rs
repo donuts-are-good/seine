@@ -1,9 +1,9 @@
 use std::fmt;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
-use reqwest::blocking::{Client, Response};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use anyhow::{anyhow, bail, Context, Result};
+use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::StatusCode;
 use serde::Serialize;
 use serde_json::Value;
@@ -59,6 +59,7 @@ pub struct ApiClient {
     json_client: Client,
     stream_client: Client,
     base_url: String,
+    token: Arc<RwLock<String>>,
 }
 
 impl ApiClient {
@@ -68,24 +69,18 @@ impl ApiClient {
         timeout: Duration,
         events_stream_timeout: Duration,
     ) -> Result<Self> {
-        let mut headers = HeaderMap::new();
-
-        let auth_value = format!("Bearer {token}");
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&auth_value).context("invalid authorization header")?,
-        );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let token = token.trim().to_string();
+        if token.is_empty() {
+            bail!("API token is empty");
+        }
 
         let json_client = Client::builder()
-            .default_headers(headers.clone())
             .timeout(timeout)
             .build()
             .context("failed to build HTTP JSON client")?;
 
         // Dedicated SSE client without global request timeout.
         let stream_client = Client::builder()
-            .default_headers(headers)
             .connect_timeout(events_stream_timeout)
             .build()
             .context("failed to build HTTP stream client")?;
@@ -94,14 +89,31 @@ impl ApiClient {
             json_client,
             stream_client,
             base_url,
+            token: Arc::new(RwLock::new(token)),
         })
+    }
+
+    pub fn replace_token(&self, token: String) -> Result<bool> {
+        let trimmed = token.trim().to_string();
+        if trimmed.is_empty() {
+            bail!("replacement API token is empty");
+        }
+
+        let mut current = self
+            .token
+            .write()
+            .map_err(|_| anyhow!("API token lock poisoned"))?;
+        if *current == trimmed {
+            return Ok(false);
+        }
+        *current = trimmed;
+        Ok(true)
     }
 
     pub fn get_block_template(&self) -> Result<BlockTemplateResponse> {
         let url = format!("{}/api/mining/blocktemplate", self.base_url);
         let resp = self
-            .json_client
-            .get(url)
+            .with_auth(self.json_client.get(url))?
             .send()
             .context("request to blocktemplate endpoint failed")?;
 
@@ -115,7 +127,7 @@ impl ApiClient {
         nonce: u64,
     ) -> Result<SubmitBlockResponse> {
         let url = format!("{}/api/mining/submitblock", self.base_url);
-        let request = self.json_client.post(url);
+        let request = self.with_auth(self.json_client.post(url))?;
         let request = if let Some(template_id) = template_id {
             request.json(&CompactSubmitPayload { template_id, nonce })
         } else {
@@ -132,8 +144,7 @@ impl ApiClient {
         let url = format!("{}/api/wallet/load", self.base_url);
         let payload = WalletLoadPayload { password };
         let resp = self
-            .json_client
-            .post(url)
+            .with_auth(self.json_client.post(url))?
             .json(&payload)
             .send()
             .context("request to wallet/load endpoint failed")?;
@@ -144,10 +155,25 @@ impl ApiClient {
 
     pub fn open_events_stream(&self) -> Result<Response> {
         let url = format!("{}/api/events", self.base_url);
-        self.stream_client
-            .get(url)
+        let resp = self
+            .with_auth(self.stream_client.get(url))?
             .send()
-            .context("request to events endpoint failed")
+            .context("request to events endpoint failed")?;
+
+        if resp.status().is_success() {
+            Ok(resp)
+        } else {
+            Err(status_error_from_response(resp, "events"))
+        }
+    }
+
+    fn with_auth(&self, request: RequestBuilder) -> Result<RequestBuilder> {
+        let token = self
+            .token
+            .read()
+            .map_err(|_| anyhow!("API token lock poisoned"))?
+            .clone();
+        Ok(request.bearer_auth(token))
     }
 }
 
@@ -169,6 +195,13 @@ pub fn is_wallet_already_loaded_error(err: &anyhow::Error) -> bool {
         && api_err.message().trim() == "wallet already loaded"
 }
 
+pub fn is_unauthorized_error(err: &anyhow::Error) -> bool {
+    let Some(api_err) = err.downcast_ref::<ApiStatusError>() else {
+        return false;
+    };
+    api_err.status() == StatusCode::UNAUTHORIZED
+}
+
 fn decode_json_response<T: serde::de::DeserializeOwned>(
     resp: Response,
     endpoint: &str,
@@ -179,23 +212,30 @@ fn decode_json_response<T: serde::de::DeserializeOwned>(
             .with_context(|| format!("failed to decode {endpoint} response JSON"));
     }
 
+    Err(status_error_from_response(resp, endpoint))
+}
+
+fn status_error_from_response(resp: Response, endpoint: &str) -> anyhow::Error {
     let status = resp.status();
     let body = resp.text().unwrap_or_default();
-    let message = if let Ok(value) = serde_json::from_str::<Value>(&body) {
-        value
-            .get("error")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or(body)
-    } else {
-        body
-    };
+    let message = parse_error_message(body);
 
-    Err(anyhow!(ApiStatusError {
+    anyhow!(ApiStatusError {
         endpoint: endpoint.to_string(),
         status,
         message,
-    }))
+    })
+}
+
+fn parse_error_message(body: String) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(&body) {
+        return value
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or(body);
+    }
+    body
 }
 
 #[cfg(test)]

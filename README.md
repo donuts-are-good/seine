@@ -69,6 +69,7 @@ Run headless/plain logs (no fullscreen TUI):
 - Each CPU thread needs roughly 2GB RAM due to Argon2id parameters.
 - By default, seine refuses to start if configured CPU lanes exceed detected system RAM. Override with `--allow-oversubscribe` if needed.
 - The miner fetches block templates from `/api/mining/blocktemplate` and submits solved blocks to `/api/mining/submitblock` using compact `{template_id, nonce}` payloads when available.
+- When authenticating via cookie (`--cookie` or default `<data-dir>/api.cookie`), the miner automatically refreshes bearer auth after daemon restarts that rotate the API token.
 - If `/api/mining/blocktemplate` reports `no wallet loaded`, the miner automatically calls `/api/wallet/load` and retries.
 - The miner listens to `/api/events` and refreshes work immediately on `new_block` events (disable with `--disable-sse`).
   - SSE events with heights older than the current template tip are ignored to avoid historical replay storms.

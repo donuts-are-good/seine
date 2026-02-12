@@ -3,7 +3,6 @@ use std::io::{self, Stdout};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -194,20 +193,6 @@ impl TuiRenderer {
             draw_dashboard(frame, area, state);
         })?;
         Ok(())
-    }
-
-    pub fn poll_quit(&self) -> bool {
-        if event::poll(std::time::Duration::ZERO).unwrap_or(false) {
-            if let Ok(Event::Key(key)) = event::read() {
-                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    return true;
-                }
-                if key.code == KeyCode::Char('q') {
-                    return true;
-                }
-            }
-        }
-        false
     }
 }
 

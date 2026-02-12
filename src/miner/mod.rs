@@ -113,6 +113,7 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
             client.clone(),
             Arc::clone(&shutdown),
             cfg.refresh_on_same_height,
+            cfg.token_cookie_path.clone(),
         ))
     } else {
         None

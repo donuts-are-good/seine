@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, IsTerminal};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -10,11 +11,19 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use blocknet_pow_spec::POW_HEADER_BASE_LEN;
 use crossbeam_channel::Receiver;
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, is_raw_mode_enabled, EnterAlternateScreen,
+    LeaveAlternateScreen,
+};
 use serde_json::Value;
 
-use crate::api::{is_no_wallet_loaded_error, is_wallet_already_loaded_error, ApiClient};
+use crate::api::{
+    is_no_wallet_loaded_error, is_unauthorized_error, is_wallet_already_loaded_error, ApiClient,
+};
 use crate::backend::{BackendEvent, MiningSolution};
-use crate::config::Config;
+use crate::config::{read_token_from_cookie_file, Config};
 use crate::types::{
     decode_hex, parse_target, set_block_nonce, template_difficulty, template_height,
     BlockTemplateResponse,
@@ -175,12 +184,106 @@ impl WalletPasswordSource {
 }
 
 const TUI_RENDER_INTERVAL: Duration = Duration::from_secs(1);
+const TUI_QUIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const RETRY_LOG_INTERVAL: Duration = Duration::from_secs(10);
+static PROMPT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+#[derive(Default)]
+struct RetryTracker {
+    failures: u64,
+    disconnected_since: Option<Instant>,
+    last_signature: String,
+    last_log_at: Option<Instant>,
+    outage_logged: bool,
+}
+
+impl RetryTracker {
+    fn note_failure(
+        &mut self,
+        tag: &str,
+        context: &str,
+        detail: &str,
+        retry_delay: Duration,
+        immediate: bool,
+    ) {
+        let now = Instant::now();
+        self.failures = self.failures.saturating_add(1);
+        if self.disconnected_since.is_none() {
+            self.disconnected_since = Some(now);
+        }
+
+        let should_log = if immediate && self.failures == 1 {
+            true
+        } else if self.failures >= 2 {
+            self.last_signature != detail
+                || self
+                    .last_log_at
+                    .is_none_or(|last| now.saturating_duration_since(last) >= RETRY_LOG_INTERVAL)
+        } else {
+            false
+        };
+
+        if should_log {
+            warn(
+                tag,
+                format!(
+                    "{context} unavailable (attempt {}); retrying in {}s: {detail}",
+                    self.failures,
+                    retry_delay.as_secs_f64(),
+                ),
+            );
+            self.last_signature = detail.to_string();
+            self.last_log_at = Some(now);
+            self.outage_logged = true;
+        }
+    }
+
+    fn note_recovered(&mut self, tag: &str, context: &str) {
+        if self.failures == 0 {
+            return;
+        }
+        if !self.outage_logged {
+            *self = Self::default();
+            return;
+        }
+        let downtime = self
+            .disconnected_since
+            .map(|since| since.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        success(
+            tag,
+            format!(
+                "{context} reconnected after {} failure(s), downtime {:.1}s",
+                self.failures, downtime
+            ),
+        );
+        *self = Self::default();
+    }
+}
+
+fn concise_error(err: &anyhow::Error) -> String {
+    let root = err.root_cause().to_string();
+    let root = root.trim();
+    if root.is_empty() {
+        return err.to_string();
+    }
+    root.to_string()
+}
+
+enum TokenRefreshOutcome {
+    Refreshed,
+    Unchanged,
+    Unavailable,
+    Failed(String),
+}
 
 struct TuiDisplay {
     renderer: TuiRenderer,
     state: TuiState,
     last_render: Instant,
     last_state_label: String,
+    quit_watcher_stop: Arc<AtomicBool>,
+    quit_watcher: Option<JoinHandle<()>>,
 }
 
 struct RoundUiView<'a> {
@@ -195,15 +298,22 @@ struct RoundUiView<'a> {
 }
 
 impl TuiDisplay {
-    fn new(tui_state: TuiState) -> Result<Self> {
+    fn new(tui_state: TuiState, shutdown: Arc<AtomicBool>) -> Result<Self> {
         let renderer =
             TuiRenderer::new().map_err(|err| anyhow!("TUI renderer init failed: {err}"))?;
-        Ok(Self {
+        let (quit_watcher_stop, quit_watcher) = spawn_tui_quit_watcher(shutdown);
+        let mut display = Self {
             renderer,
             state: tui_state,
             last_render: Instant::now() - TUI_RENDER_INTERVAL,
             last_state_label: String::new(),
-        })
+            quit_watcher_stop,
+            quit_watcher: Some(quit_watcher),
+        };
+        if let Ok(locked) = display.state.lock() {
+            let _ = display.renderer.render(&locked);
+        }
+        Ok(display)
     }
 
     fn update(&mut self, stats: &Stats, view: RoundUiView<'_>) {
@@ -239,10 +349,6 @@ impl TuiDisplay {
         self.last_state_label = view.state_label.to_string();
     }
 
-    fn poll_quit(&self) -> bool {
-        self.renderer.poll_quit()
-    }
-
     fn mark_block_found(&mut self) {
         if let Ok(mut s) = self.state.lock() {
             let elapsed = s.started_at.elapsed().as_secs();
@@ -251,9 +357,18 @@ impl TuiDisplay {
     }
 }
 
-fn init_tui_display(tui_state: Option<TuiState>) -> Option<TuiDisplay> {
+impl Drop for TuiDisplay {
+    fn drop(&mut self) {
+        self.quit_watcher_stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.quit_watcher.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn init_tui_display(tui_state: Option<TuiState>, shutdown: Arc<AtomicBool>) -> Option<TuiDisplay> {
     let state = tui_state?;
-    match TuiDisplay::new(Arc::clone(&state)) {
+    match TuiDisplay::new(Arc::clone(&state), shutdown) {
         Ok(display) => {
             set_tui_state(state);
             Some(display)
@@ -272,6 +387,33 @@ fn update_tui(tui: &mut Option<TuiDisplay>, stats: &Stats, view: RoundUiView<'_>
     if let Some(display) = tui.as_mut() {
         display.update(stats, view);
     }
+}
+
+fn spawn_tui_quit_watcher(shutdown: Arc<AtomicBool>) -> (Arc<AtomicBool>, JoinHandle<()>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop);
+    let handle = thread::spawn(move || {
+        while !stop_flag.load(Ordering::Relaxed) && !shutdown.load(Ordering::Relaxed) {
+            if PROMPT_ACTIVE.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            let has_event = event::poll(TUI_QUIT_POLL_INTERVAL).unwrap_or(false);
+            if !has_event {
+                continue;
+            }
+            if let Ok(Event::Key(key)) = event::read() {
+                if key.code == KeyCode::Char('q')
+                    || (key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL))
+                {
+                    shutdown.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+        }
+    });
+    (stop, handle)
 }
 
 fn current_tip_sequence(tip_signal: Option<&TipSignal>) -> u64 {
@@ -293,7 +435,7 @@ pub(super) fn run_mining_loop(
     let mut epoch = 0u64;
     let mut last_stats_print = Instant::now();
     let mut prefetch: Option<TemplatePrefetch> = None;
-    let mut tui = init_tui_display(tui_state);
+    let mut tui = init_tui_display(tui_state, Arc::clone(&shutdown));
 
     let mut template = match fetch_template_with_retry(client, cfg, shutdown.as_ref()) {
         Some(t) => t,
@@ -454,10 +596,6 @@ pub(super) fn run_mining_loop(
                         state_label: "working",
                     },
                 );
-                if tui.as_ref().is_some_and(TuiDisplay::poll_quit) {
-                    shutdown.store(true, Ordering::SeqCst);
-                    break;
-                }
             }
 
             maybe_print_stats(
@@ -772,6 +910,7 @@ pub(super) fn spawn_tip_listener(
     client: ApiClient,
     shutdown: Arc<AtomicBool>,
     refresh_on_same_height: bool,
+    token_cookie_path: Option<PathBuf>,
 ) -> TipListener {
     let tip_signal = TipSignal::new(refresh_on_same_height);
     let signal = TipSignal {
@@ -783,18 +922,54 @@ pub(super) fn spawn_tip_listener(
     };
 
     let handle = thread::spawn(move || {
+        let mut retry = RetryTracker::default();
         while !shutdown.load(Ordering::Relaxed) {
             match client.open_events_stream() {
                 Ok(resp) => {
+                    retry.note_recovered("EVENTS", "events stream");
                     if let Err(err) = stream_tip_events(resp, &signal, &shutdown) {
-                        if !shutdown.load(Ordering::Relaxed) && !is_stream_timeout_error(&err) {
-                            warn("EVENTS", format!("stream dropped: {err:#}"));
+                        if !shutdown.load(Ordering::Relaxed) {
+                            let detail = concise_error(&err);
+                            retry.note_failure(
+                                "EVENTS",
+                                "events stream",
+                                &detail,
+                                Duration::from_secs(1),
+                                false,
+                            );
                         }
                     }
                 }
                 Err(err) => {
-                    if !shutdown.load(Ordering::Relaxed) && !is_stream_timeout_error(&err) {
-                        warn("EVENTS", format!("failed to open stream: {err:#}"));
+                    if !shutdown.load(Ordering::Relaxed) {
+                        if is_unauthorized_error(&err) {
+                            match refresh_api_token_from_cookie(
+                                &client,
+                                token_cookie_path.as_deref(),
+                            ) {
+                                TokenRefreshOutcome::Refreshed => {
+                                    success(
+                                        "AUTH",
+                                        "events stream unauthorized; refreshed API token from cookie and retrying",
+                                    );
+                                    continue;
+                                }
+                                TokenRefreshOutcome::Unchanged => {}
+                                TokenRefreshOutcome::Unavailable => {}
+                                TokenRefreshOutcome::Failed(msg) => {
+                                    warn("AUTH", msg);
+                                }
+                            }
+                        }
+
+                        let detail = concise_error(&err);
+                        retry.note_failure(
+                            "EVENTS",
+                            "events stream",
+                            &detail,
+                            Duration::from_secs(1),
+                            false,
+                        );
                     }
                 }
             }
@@ -828,6 +1003,10 @@ fn stream_tip_events(
         process_sse_line(&line, &mut frame, signal);
     }
     process_sse_frame(&frame, signal);
+
+    if !shutdown.load(Ordering::Relaxed) {
+        bail!("SSE stream closed by peer");
+    }
 
     Ok(())
 }
@@ -899,30 +1078,19 @@ fn extract_new_block_event(payload: &str) -> Option<NewBlockEvent> {
     Some(NewBlockEvent { hash, height })
 }
 
-fn is_stream_timeout_error(err: &anyhow::Error) -> bool {
-    for cause in err.chain() {
-        if let Some(req_err) = cause.downcast_ref::<reqwest::Error>() {
-            if req_err.is_timeout() {
-                return true;
-            }
-        }
-        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
-            if io_err.kind() == std::io::ErrorKind::TimedOut {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 fn fetch_template_with_retry(
     client: &ApiClient,
     cfg: &Config,
     shutdown: &AtomicBool,
 ) -> Option<BlockTemplateResponse> {
+    let mut retry = RetryTracker::default();
+
     while !shutdown.load(Ordering::Relaxed) {
         match client.get_block_template() {
-            Ok(template) => return Some(template),
+            Ok(template) => {
+                retry.note_recovered("NETWORK", "blocktemplate");
+                return Some(template);
+            }
             Err(err) if is_no_wallet_loaded_error(&err) => {
                 warn(
                     "WALLET",
@@ -946,8 +1114,56 @@ fn fetch_template_with_retry(
                     }
                 }
             }
+            Err(err) if is_unauthorized_error(&err) => {
+                match refresh_api_token_from_cookie(client, cfg.token_cookie_path.as_deref()) {
+                    TokenRefreshOutcome::Refreshed => {
+                        success(
+                            "AUTH",
+                            "blocktemplate unauthorized; refreshed API token from cookie and retrying",
+                        );
+                        continue;
+                    }
+                    TokenRefreshOutcome::Unchanged => {
+                        retry.note_failure(
+                            "AUTH",
+                            "daemon authentication",
+                            "token unauthorized (cookie token unchanged; waiting for daemon/cookie rotation)",
+                            TEMPLATE_RETRY_DELAY,
+                            true,
+                        );
+                    }
+                    TokenRefreshOutcome::Unavailable => {
+                        retry.note_failure(
+                            "AUTH",
+                            "daemon authentication",
+                            "token unauthorized; running with static --token (restart with a fresh token or use --cookie)",
+                            TEMPLATE_RETRY_DELAY,
+                            true,
+                        );
+                    }
+                    TokenRefreshOutcome::Failed(msg) => {
+                        retry.note_failure(
+                            "AUTH",
+                            "daemon authentication",
+                            &msg,
+                            TEMPLATE_RETRY_DELAY,
+                            true,
+                        );
+                    }
+                }
+                if !sleep_with_shutdown(shutdown, TEMPLATE_RETRY_DELAY) {
+                    break;
+                }
+            }
             Err(err) => {
-                warn("NETWORK", format!("blocktemplate request failed: {err:#}"));
+                let detail = concise_error(&err);
+                retry.note_failure(
+                    "NETWORK",
+                    "blocktemplate",
+                    &detail,
+                    TEMPLATE_RETRY_DELAY,
+                    true,
+                );
                 if !sleep_with_shutdown(shutdown, TEMPLATE_RETRY_DELAY) {
                     break;
                 }
@@ -956,6 +1172,34 @@ fn fetch_template_with_retry(
     }
 
     None
+}
+
+fn refresh_api_token_from_cookie(
+    client: &ApiClient,
+    cookie_path: Option<&Path>,
+) -> TokenRefreshOutcome {
+    let Some(cookie_path) = cookie_path else {
+        return TokenRefreshOutcome::Unavailable;
+    };
+
+    let token = match read_token_from_cookie_file(cookie_path) {
+        Ok(token) => token,
+        Err(err) => {
+            return TokenRefreshOutcome::Failed(format!(
+                "failed reading API cookie at {}: {err:#}",
+                cookie_path.display()
+            ))
+        }
+    };
+
+    match client.replace_token(token) {
+        Ok(true) => TokenRefreshOutcome::Refreshed,
+        Ok(false) => TokenRefreshOutcome::Unchanged,
+        Err(err) => TokenRefreshOutcome::Failed(format!(
+            "failed updating API token from {}: {err:#}",
+            cookie_path.display()
+        )),
+    }
 }
 
 fn maybe_print_stats(
@@ -1113,7 +1357,43 @@ fn prompt_wallet_password() -> Result<Option<String>> {
         return Ok(None);
     }
 
-    let password = rpassword::prompt_password("wallet password: ")
+    PROMPT_ACTIVE.store(true, Ordering::Release);
+    struct PromptGuard;
+    impl Drop for PromptGuard {
+        fn drop(&mut self) {
+            PROMPT_ACTIVE.store(false, Ordering::Release);
+        }
+    }
+    let _prompt_guard = PromptGuard;
+
+    let was_raw_mode = is_raw_mode_enabled().unwrap_or(false);
+    if was_raw_mode {
+        let _ = disable_raw_mode();
+        let mut stdout = std::io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen);
+    }
+    struct TerminalRestoreGuard {
+        restore_raw: bool,
+        restore_alt: bool,
+    }
+    impl Drop for TerminalRestoreGuard {
+        fn drop(&mut self) {
+            if self.restore_raw {
+                let _ = enable_raw_mode();
+            }
+            if self.restore_alt {
+                let mut stdout = std::io::stdout();
+                let _ = execute!(stdout, EnterAlternateScreen);
+            }
+        }
+    }
+    let _terminal_restore_guard = TerminalRestoreGuard {
+        restore_raw: was_raw_mode,
+        restore_alt: was_raw_mode,
+    };
+
+    eprintln!("seine: wallet password required to continue mining.");
+    let password = rpassword::prompt_password("wallet password (input hidden): ")
         .context("failed to read wallet password from terminal")?;
     if password.is_empty() {
         return Ok(None);
