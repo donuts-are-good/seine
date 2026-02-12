@@ -1,15 +1,18 @@
 use std::collections::BTreeMap;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError};
 
 use crate::backend::{BackendEvent, BackendInstanceId};
 
 use super::ui::{error, info, warn};
 use super::{
-    backend_names, dispatch_pool, remove_backend_by_id, BackendSlot, RuntimeBackendEventAction,
-    RuntimeMode,
+    backend_names, remove_backend_by_id, BackendSlot, RuntimeBackendEventAction, RuntimeMode,
 };
 
 type BackendFailureMap = BTreeMap<BackendInstanceId, (&'static str, Vec<String>)>;
@@ -280,41 +283,55 @@ fn run_backend_control_phase(
 
     let timeout = timeout.max(Duration::from_millis(1));
     let expected = slots.len();
-    let mut metadata = Vec::with_capacity(expected);
+    let mut metadata_by_idx = vec![(0u64, "unknown"); expected];
+    let mut immediate_failures: Vec<Option<String>> =
+        std::iter::repeat_with(|| None).take(expected).collect();
     let mut outcomes: Vec<Option<BackendControlOutcome>> =
         std::iter::repeat_with(|| None).take(expected).collect();
     let (outcome_tx, outcome_rx) = bounded::<BackendControlOutcome>(expected.max(1));
+    let mut pre_resolved = 0usize;
 
     for (idx, slot) in slots.into_iter().enumerate() {
         let backend_id = slot.id;
         let backend = slot.backend.name();
-        metadata.push((backend_id, backend));
+        if idx < metadata_by_idx.len() {
+            metadata_by_idx[idx] = (backend_id, backend);
+        }
 
-        let outcome_tx = outcome_tx.clone();
-        dispatch_pool::submit(Box::new(move || {
-            let started = Instant::now();
-            let deadline = started + timeout;
-            let result = match phase {
-                BackendControlPhase::Cancel => slot.backend.cancel_work_with_deadline(deadline),
-                BackendControlPhase::Fence => slot.backend.fence_with_deadline(deadline),
-            };
-            let elapsed = started.elapsed();
-            let send_result = outcome_tx.send(BackendControlOutcome {
-                idx,
-                slot,
-                elapsed,
-                result,
-            });
-            if let Err(send_err) = send_result {
-                let mut dropped = send_err.0;
-                dropped.slot.backend.stop();
+        let slot_cell = Arc::new(Mutex::new(Some(slot)));
+        let slot_cell_for_thread = Arc::clone(&slot_cell);
+        let outcome_tx_for_thread = outcome_tx.clone();
+        let thread_name = format!(
+            "seine-control-{}-{backend}-{backend_id}",
+            phase.action_label()
+        );
+        let spawn_result = thread::Builder::new().name(thread_name).spawn(move || {
+            let slot = slot_cell_for_thread
+                .lock()
+                .ok()
+                .and_then(|mut pending| pending.take());
+            if let Some(slot) = slot {
+                run_backend_control_task(idx, slot, phase, timeout, outcome_tx_for_thread);
             }
-        }));
+        });
+
+        if let Err(spawn_err) = spawn_result {
+            let slot = slot_cell.lock().ok().and_then(|mut pending| pending.take());
+            if let Some(slot) = slot {
+                run_backend_control_task(idx, slot, phase, timeout, outcome_tx.clone());
+            } else if idx < immediate_failures.len() {
+                immediate_failures[idx] = Some(format!(
+                    "{} failed to spawn control task thread: {spawn_err}",
+                    phase.action_label()
+                ));
+                pre_resolved = pre_resolved.saturating_add(1);
+            }
+        }
     }
     drop(outcome_tx);
 
     let deadline = Instant::now() + timeout;
-    let mut received = 0usize;
+    let mut received = pre_resolved;
     while received < expected {
         let now = Instant::now();
         if now >= deadline {
@@ -345,7 +362,15 @@ fn run_backend_control_phase(
     let action_label = phase.action_label();
 
     for idx in 0..expected {
-        let (backend_id, backend) = metadata[idx];
+        let (backend_id, backend) = metadata_by_idx[idx];
+        if let Some(message) = immediate_failures[idx].take() {
+            failures
+                .entry(backend_id)
+                .or_insert_with(|| (backend, Vec::new()))
+                .1
+                .push(message);
+            continue;
+        }
         match outcomes[idx].take() {
             Some(mut outcome) => {
                 if outcome.elapsed > timeout {
@@ -395,6 +420,35 @@ fn run_backend_control_phase(
             .collect::<Vec<_>>(),
         failures,
     )
+}
+
+fn run_backend_control_task(
+    idx: usize,
+    slot: BackendSlot,
+    phase: BackendControlPhase,
+    timeout: Duration,
+    outcome_tx: crossbeam_channel::Sender<BackendControlOutcome>,
+) {
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let result = match panic::catch_unwind(AssertUnwindSafe(|| match phase {
+        BackendControlPhase::Cancel => slot.backend.cancel_work_with_deadline(deadline),
+        BackendControlPhase::Fence => slot.backend.fence_with_deadline(deadline),
+    })) {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("{} task panicked", phase.action_label())),
+    };
+    let elapsed = started.elapsed();
+    let send_result = outcome_tx.send(BackendControlOutcome {
+        idx,
+        slot,
+        elapsed,
+        result,
+    });
+    if let Err(send_err) = send_result {
+        let mut dropped = send_err.0;
+        dropped.slot.backend.stop();
+    }
 }
 
 fn merge_backend_failures(failures: &mut BackendFailureMap, additional: BackendFailureMap) {

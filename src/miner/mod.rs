@@ -1,7 +1,6 @@
 mod auth;
 mod backend_control;
 mod bench;
-mod dispatch_pool;
 mod mining;
 mod scheduler;
 mod stats;
@@ -126,6 +125,26 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
             backend_chunk_profiles(&backends, cfg.nonce_iters_per_lane)
         ),
     );
+    let append_semantics = backends
+        .iter()
+        .filter_map(|slot| {
+            let semantics = slot.backend.capabilities().assignment_semantics;
+            if semantics == crate::backend::AssignmentSemantics::Append {
+                Some(format!("{}#{}", slot.backend.name(), slot.id))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if !append_semantics.is_empty() {
+        warn(
+            "MINER",
+            format!(
+                "append assignment semantics reported by {}; ensure stale work is dropped by work_id/epoch",
+                append_semantics.join(", ")
+            ),
+        );
+    }
     info(
         "MINER",
         format!(
@@ -568,14 +587,16 @@ fn backend_chunk_profiles(backends: &[BackendSlot], default_iters_per_lane: u64)
                 .map(|d| format!("{}ms", d.as_millis()))
                 .unwrap_or_else(|| "none".to_string());
             let deadline_support = capabilities.deadline_support.describe();
+            let assignment_semantics = capabilities.assignment_semantics.describe();
             format!(
-                "{}#{}={} iters/lane inflight={} poll_hint={} deadline={}",
+                "{}#{}={} iters/lane inflight={} poll_hint={} deadline={} assign={}",
                 slot.backend.name(),
                 slot.id,
                 hinted,
                 inflight,
                 poll_hint,
                 deadline_support,
+                assignment_semantics,
             )
         })
         .collect::<Vec<_>>()
@@ -716,6 +737,7 @@ mod tests {
     struct MockState {
         fail_start: AtomicBool,
         fail_next_assign: AtomicBool,
+        panic_next_assign: AtomicBool,
         assign_calls: AtomicUsize,
         assign_batch_calls: AtomicUsize,
         last_batch_len: AtomicUsize,
@@ -797,6 +819,9 @@ mod tests {
                 std::thread::sleep(delay);
             }
             self.state.assign_calls.fetch_add(1, Ordering::Relaxed);
+            if self.state.panic_next_assign.swap(false, Ordering::AcqRel) {
+                panic!("injected assign panic");
+            }
             if self.state.fail_next_assign.swap(false, Ordering::AcqRel) {
                 return Err(anyhow!("injected assign failure"));
             }
@@ -832,6 +857,7 @@ mod tests {
                 preferred_hash_poll_interval: self.preferred_hash_poll_interval,
                 max_inflight_assignments: self.max_inflight_assignments.max(1),
                 deadline_support: crate::backend::DeadlineSupport::Cooperative,
+                assignment_semantics: crate::backend::AssignmentSemantics::Replace,
             }
         }
     }
@@ -1040,6 +1066,57 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("timed-out backend should be stopped once late dispatch completes");
+    }
+
+    #[test]
+    fn distribute_work_quarantines_assignment_panics_and_reassigns_lanes() {
+        let first_state = Arc::new(MockState::default());
+        let panic_state = Arc::new(MockState::default());
+        let third_state = Arc::new(MockState::default());
+        panic_state.panic_next_assign.store(true, Ordering::Relaxed);
+
+        let mut backends = vec![
+            slot(
+                1,
+                2,
+                Box::new(MockBackend::new("cpu", 2, Arc::clone(&first_state))),
+            ),
+            slot(
+                2,
+                1,
+                Box::new(MockBackend::new("nvidia", 1, Arc::clone(&panic_state))),
+            ),
+            slot(
+                3,
+                1,
+                Box::new(MockBackend::new("nvidia", 1, Arc::clone(&third_state))),
+            ),
+        ];
+
+        let additional_span = distribute_work(
+            &mut backends,
+            DistributeWorkOptions {
+                epoch: 1,
+                work_id: 1,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                target: [0xFF; 32],
+                reservation: NonceReservation {
+                    start_nonce: 100,
+                    max_iters_per_lane: 10,
+                    reserved_span: 40,
+                },
+                stop_at: Instant::now() + Duration::from_secs(1),
+                assignment_timeout: Duration::from_secs(1),
+                backend_weights: None,
+            },
+        )
+        .expect("distribution should continue after quarantining panicing backend");
+
+        assert_eq!(additional_span, 30);
+        assert_eq!(backends.len(), 2);
+        assert_eq!(backends[0].id, 1);
+        assert_eq!(backends[1].id, 3);
+        assert_eq!(panic_state.stop_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1361,6 +1438,71 @@ mod tests {
         }
     }
 
+    struct ControlPanicBackend {
+        name: &'static str,
+        panic_cancel: bool,
+        panic_fence: bool,
+        stop_calls: Arc<AtomicUsize>,
+    }
+
+    impl ControlPanicBackend {
+        fn new(
+            name: &'static str,
+            panic_cancel: bool,
+            panic_fence: bool,
+            stop_calls: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                name,
+                panic_cancel,
+                panic_fence,
+                stop_calls,
+            }
+        }
+    }
+
+    impl PowBackend for ControlPanicBackend {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn lanes(&self) -> usize {
+            1
+        }
+
+        fn set_instance_id(&mut self, _id: BackendInstanceId) {}
+
+        fn set_event_sink(&mut self, _sink: Sender<BackendEvent>) {}
+
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) {
+            self.stop_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn assign_work(&self, _work: WorkAssignment) -> Result<()> {
+            Ok(())
+        }
+
+        fn cancel_work(&self) -> Result<()> {
+            if self.panic_cancel {
+                panic!("injected cancel panic")
+            } else {
+                Ok(())
+            }
+        }
+
+        fn fence(&self) -> Result<()> {
+            if self.panic_fence {
+                panic!("injected fence panic")
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     #[test]
     fn quiesce_quarantines_only_failing_backend() {
         let fail_stop_calls = Arc::new(AtomicUsize::new(0));
@@ -1396,6 +1538,44 @@ mod tests {
         assert_eq!(backends.len(), 1);
         assert_eq!(backends[0].id, 2);
         assert_eq!(fail_stop_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(ok_stop_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn quiesce_quarantines_backend_when_control_panics() {
+        let panic_stop_calls = Arc::new(AtomicUsize::new(0));
+        let ok_stop_calls = Arc::new(AtomicUsize::new(0));
+        let mut backends = vec![
+            slot(
+                1,
+                1,
+                Box::new(ControlPanicBackend::new(
+                    "cpu-a",
+                    false,
+                    true,
+                    Arc::clone(&panic_stop_calls),
+                )),
+            ),
+            slot(
+                2,
+                1,
+                Box::new(ControlPanicBackend::new(
+                    "cpu-b",
+                    false,
+                    false,
+                    Arc::clone(&ok_stop_calls),
+                )),
+            ),
+        ];
+
+        let action =
+            quiesce_backend_slots(&mut backends, RuntimeMode::Mining, Duration::from_secs(1))
+                .expect("quiesce should quarantine panicing backend");
+
+        assert_eq!(action, RuntimeBackendEventAction::TopologyChanged);
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].id, 2);
+        assert_eq!(panic_stop_calls.load(Ordering::Relaxed), 1);
         assert_eq!(ok_stop_calls.load(Ordering::Relaxed), 0);
     }
 }

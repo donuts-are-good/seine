@@ -9,9 +9,9 @@ use blocknet_pow_spec::{pow_params, POW_OUTPUT_LEN};
 use crossbeam_channel::{SendTimeoutError, Sender};
 
 use crate::backend::{
-    BackendCapabilities, BackendEvent, BackendInstanceId, BackendTelemetry, BenchBackend,
-    DeadlineSupport, MiningSolution, PowBackend, PreemptionGranularity, WorkAssignment,
-    WORK_ID_MAX,
+    AssignmentSemantics, BackendCapabilities, BackendEvent, BackendInstanceId, BackendTelemetry,
+    BenchBackend, DeadlineSupport, MiningSolution, PowBackend, PreemptionGranularity,
+    WorkAssignment, WORK_ID_MAX,
 };
 use crate::config::CpuAffinityMode;
 use crate::types::hash_meets_target;
@@ -371,6 +371,7 @@ impl PowBackend for CpuBackend {
             preferred_hash_poll_interval: Some(HASH_FLUSH_INTERVAL),
             max_inflight_assignments: 1,
             deadline_support: DeadlineSupport::Cooperative,
+            assignment_semantics: AssignmentSemantics::Replace,
         }
     }
 

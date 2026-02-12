@@ -17,8 +17,8 @@ pub mod nvidia {
     use crossbeam_channel::Sender;
 
     use super::{
-        BackendCapabilities, BackendEvent, BackendInstanceId, BenchBackend, DeadlineSupport,
-        PowBackend, PreemptionGranularity, WorkAssignment,
+        AssignmentSemantics, BackendCapabilities, BackendEvent, BackendInstanceId, BenchBackend,
+        DeadlineSupport, PowBackend, PreemptionGranularity, WorkAssignment,
     };
 
     pub struct NvidiaBackend {
@@ -85,6 +85,7 @@ pub mod nvidia {
                 preferred_hash_poll_interval: Some(Duration::from_millis(50)),
                 max_inflight_assignments: 2,
                 deadline_support: DeadlineSupport::BestEffort,
+                assignment_semantics: AssignmentSemantics::Replace,
             }
         }
 
@@ -171,6 +172,23 @@ impl DeadlineSupport {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AssignmentSemantics {
+    /// Each assignment call replaces any previously queued/in-flight work.
+    Replace,
+    /// Assignment calls append to backend-local queues until cancel/fence.
+    Append,
+}
+
+impl AssignmentSemantics {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Append => "append",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct BackendCapabilities {
     /// Preferred iterations per lane for one assignment chunk.
@@ -184,6 +202,8 @@ pub struct BackendCapabilities {
     pub max_inflight_assignments: u32,
     /// Contract for deadline-aware backend calls.
     pub deadline_support: DeadlineSupport,
+    /// Assignment queueing contract for repeated assign calls.
+    pub assignment_semantics: AssignmentSemantics,
 }
 
 impl Default for BackendCapabilities {
@@ -193,6 +213,7 @@ impl Default for BackendCapabilities {
             preferred_hash_poll_interval: None,
             max_inflight_assignments: 1,
             deadline_support: DeadlineSupport::BestEffort,
+            assignment_semantics: AssignmentSemantics::Replace,
         }
     }
 }
@@ -232,11 +253,18 @@ pub trait PowBackend: Send {
 
     fn stop(&mut self);
 
+    /// Assign exactly one work chunk.
+    ///
+    /// Contract: a call must supersede previously assigned work for this backend
+    /// (or produce equivalent stale-safe behavior keyed by `work.template.work_id`).
     fn assign_work(&self, work: WorkAssignment) -> Result<()>;
 
-    /// Assign one or more work chunks to the backend.
+    /// Assign one or more work chunks to the backend as one assignment generation.
     ///
-    /// Default behavior preserves current single-assignment semantics.
+    /// Runtime expects this call to replace prior generation work. Backends may queue
+    /// the provided chunks internally when `max_inflight_assignments > 1`.
+    ///
+    /// Default behavior preserves single-assignment semantics.
     /// Backends that can queue multiple chunks (for example GPUs) should
     /// override this for lower control-plane overhead.
     fn assign_work_batch(&self, work: &[WorkAssignment]) -> Result<()> {

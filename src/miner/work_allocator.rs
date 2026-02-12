@@ -1,14 +1,17 @@
 use std::collections::BTreeMap;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use crossbeam_channel::{bounded, RecvTimeoutError};
 
 use crate::backend::{BackendInstanceId, NonceChunk, WorkAssignment, WorkTemplate};
 
 use super::ui::warn;
-use super::{backend_names, dispatch_pool, total_lanes, BackendSlot, DistributeWorkOptions};
+use super::{backend_names, total_lanes, BackendSlot, DistributeWorkOptions};
 
 struct DispatchTask {
     idx: usize,
@@ -124,43 +127,56 @@ fn dispatch_assignment_tasks(
 
     let timeout = timeout.max(Duration::from_millis(1));
     let expected = tasks.len();
-    let mut metadata = Vec::with_capacity(expected);
+    let mut metadata_by_idx = vec![(0u64, "unknown"); expected];
+    let mut immediate_failures: Vec<Option<DispatchFailure>> =
+        std::iter::repeat_with(|| None).take(expected).collect();
     let mut outcomes: Vec<Option<DispatchOutcome>> =
         std::iter::repeat_with(|| None).take(expected).collect();
     let (outcome_tx, outcome_rx) = bounded::<DispatchOutcome>(expected.max(1));
+    let mut pre_resolved = 0usize;
 
     for task in tasks {
+        let idx = task.idx;
         let backend_id = task.slot.id;
         let backend = task.slot.backend.name();
-        metadata.push((task.idx, backend_id, backend));
+        if idx < metadata_by_idx.len() {
+            metadata_by_idx[idx] = (backend_id, backend);
+        }
 
-        let outcome_tx = outcome_tx.clone();
-        dispatch_pool::submit(Box::new(move || {
-            let slot = task.slot;
-            let started = Instant::now();
-            let deadline = started + timeout;
-            let result = slot
-                .backend
-                .assign_work_batch_with_deadline(&task.batch, deadline);
-            let elapsed = started.elapsed();
-            let send_result = outcome_tx.send(DispatchOutcome {
-                idx: task.idx,
-                slot,
-                backend_id,
-                backend,
-                elapsed,
-                result,
-            });
-            if let Err(send_err) = send_result {
-                let mut dropped = send_err.0;
-                dropped.slot.backend.stop();
+        let task_slot = Arc::new(Mutex::new(Some(task)));
+        let task_slot_for_thread = Arc::clone(&task_slot);
+        let outcome_tx_for_thread = outcome_tx.clone();
+        let thread_name = format!("seine-assign-{backend}-{backend_id}");
+        let spawn_result = thread::Builder::new().name(thread_name).spawn(move || {
+            let task = task_slot_for_thread
+                .lock()
+                .ok()
+                .and_then(|mut pending| pending.take());
+            if let Some(task) = task {
+                run_assignment_task(task, timeout, outcome_tx_for_thread);
             }
-        }));
+        });
+
+        if let Err(spawn_err) = spawn_result {
+            let task = task_slot.lock().ok().and_then(|mut pending| pending.take());
+            if let Some(task) = task {
+                run_assignment_task(task, timeout, outcome_tx.clone());
+            } else {
+                if idx < immediate_failures.len() {
+                    immediate_failures[idx] = Some(DispatchFailure {
+                        backend_id,
+                        backend,
+                        reason: format!("failed to spawn assignment task thread: {spawn_err}"),
+                    });
+                    pre_resolved = pre_resolved.saturating_add(1);
+                }
+            }
+        }
     }
     drop(outcome_tx);
 
     let deadline = Instant::now() + timeout;
-    let mut received = outcomes.iter().filter(|outcome| outcome.is_some()).count();
+    let mut received = pre_resolved;
     while received < expected {
         let now = Instant::now();
         if now >= deadline {
@@ -188,14 +204,12 @@ fn dispatch_assignment_tasks(
 
     let mut survivors = Vec::new();
     let mut failures = Vec::new();
-    let mut metadata_by_idx = vec![(0u64, "unknown"); expected];
-    for (idx, backend_id, backend) in metadata {
-        if idx < metadata_by_idx.len() {
-            metadata_by_idx[idx] = (backend_id, backend);
-        }
-    }
 
     for (idx, outcome_slot) in outcomes.iter_mut().enumerate().take(expected) {
+        if let Some(failure) = immediate_failures[idx].take() {
+            failures.push(failure);
+            continue;
+        }
         match outcome_slot.take() {
             Some(mut outcome) => {
                 if outcome.elapsed > timeout {
@@ -247,6 +261,39 @@ fn dispatch_assignment_tasks(
             .collect::<Vec<_>>(),
         failures,
     )
+}
+
+fn run_assignment_task(
+    task: DispatchTask,
+    timeout: Duration,
+    outcome_tx: crossbeam_channel::Sender<DispatchOutcome>,
+) {
+    let DispatchTask { idx, slot, batch } = task;
+    let backend_id = slot.id;
+    let backend = slot.backend.name();
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let result = match panic::catch_unwind(AssertUnwindSafe(|| {
+        slot.backend
+            .assign_work_batch_with_deadline(&batch, deadline)
+    })) {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("assignment task panicked")),
+    };
+    let elapsed = started.elapsed();
+
+    let send_result = outcome_tx.send(DispatchOutcome {
+        idx,
+        slot,
+        backend_id,
+        backend,
+        elapsed,
+        result,
+    });
+    if let Err(send_err) = send_result {
+        let mut dropped = send_err.0;
+        dropped.slot.backend.stop();
+    }
 }
 
 pub(super) fn compute_backend_nonce_counts(
