@@ -60,7 +60,7 @@ struct DistributeWorkOptions<'a> {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct BackendRoundTelemetry {
+pub(super) struct BackendRoundTelemetry {
     dropped_events: u64,
     completed_assignments: u64,
     completed_assignment_hashes: u64,
@@ -493,14 +493,15 @@ fn merge_backend_telemetry(
     backend_id: BackendInstanceId,
     telemetry: BackendTelemetry,
 ) {
-    if telemetry.active_lanes == 0
-        && telemetry.pending_work == 0
+    let telemetry = backend_round_telemetry_delta(telemetry);
+    if telemetry.peak_active_lanes == 0
+        && telemetry.peak_pending_work == 0
         && telemetry.dropped_events == 0
         && telemetry.completed_assignments == 0
         && telemetry.completed_assignment_hashes == 0
         && telemetry.completed_assignment_micros == 0
-        && telemetry.inflight_assignment_hashes == 0
-        && telemetry.inflight_assignment_micros == 0
+        && telemetry.peak_inflight_assignment_hashes == 0
+        && telemetry.peak_inflight_assignment_micros == 0
     {
         return;
     }
@@ -518,14 +519,27 @@ fn merge_backend_telemetry(
     entry.completed_assignment_micros = entry
         .completed_assignment_micros
         .saturating_add(telemetry.completed_assignment_micros);
-    entry.peak_active_lanes = entry.peak_active_lanes.max(telemetry.active_lanes);
-    entry.peak_pending_work = entry.peak_pending_work.max(telemetry.pending_work);
+    entry.peak_active_lanes = entry.peak_active_lanes.max(telemetry.peak_active_lanes);
+    entry.peak_pending_work = entry.peak_pending_work.max(telemetry.peak_pending_work);
     entry.peak_inflight_assignment_hashes = entry
         .peak_inflight_assignment_hashes
-        .max(telemetry.inflight_assignment_hashes);
+        .max(telemetry.peak_inflight_assignment_hashes);
     entry.peak_inflight_assignment_micros = entry
         .peak_inflight_assignment_micros
-        .max(telemetry.inflight_assignment_micros);
+        .max(telemetry.peak_inflight_assignment_micros);
+}
+
+pub(super) fn backend_round_telemetry_delta(telemetry: BackendTelemetry) -> BackendRoundTelemetry {
+    BackendRoundTelemetry {
+        dropped_events: telemetry.dropped_events,
+        completed_assignments: telemetry.completed_assignments,
+        completed_assignment_hashes: telemetry.completed_assignment_hashes,
+        completed_assignment_micros: telemetry.completed_assignment_micros,
+        peak_active_lanes: telemetry.active_lanes,
+        peak_pending_work: telemetry.pending_work,
+        peak_inflight_assignment_hashes: telemetry.inflight_assignment_hashes,
+        peak_inflight_assignment_micros: telemetry.inflight_assignment_micros,
+    }
 }
 
 fn cancel_backend_slots(

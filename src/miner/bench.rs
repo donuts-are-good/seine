@@ -506,24 +506,7 @@ fn run_worker_benchmark_inner(
                     merge_round_telemetry(
                         &mut round_backend_telemetry,
                         sample.backend_id,
-                        BackendRoundTelemetry {
-                            dropped_events: sample.telemetry.dropped_events,
-                            completed_assignments: sample.telemetry.completed_assignments,
-                            completed_assignment_hashes: sample
-                                .telemetry
-                                .completed_assignment_hashes,
-                            completed_assignment_micros: sample
-                                .telemetry
-                                .completed_assignment_micros,
-                            peak_active_lanes: sample.telemetry.active_lanes,
-                            peak_pending_work: sample.telemetry.pending_work,
-                            peak_inflight_assignment_hashes: sample
-                                .telemetry
-                                .inflight_assignment_hashes,
-                            peak_inflight_assignment_micros: sample
-                                .telemetry
-                                .inflight_assignment_micros,
-                        },
+                        super::backend_round_telemetry_delta(sample.telemetry),
                     );
                     if sample.hashes > 0 {
                         collected = collected.saturating_add(sample.hashes);
