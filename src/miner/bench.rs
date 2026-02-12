@@ -4,13 +4,15 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use blocknet_pow_spec::POW_HEADER_BASE_LEN;
+use blocknet_pow_spec::{
+    POW_HEADER_BASE_LEN, POW_ITERATIONS, POW_MEMORY_KB, POW_OUTPUT_LEN, POW_PARALLELISM,
+};
 use crossbeam_channel::Receiver;
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
 
 use crate::backend::{BackendEvent, BackendInstanceId, PowBackend};
-use crate::config::{BenchKind, Config};
+use crate::config::{BenchKind, Config, CpuAffinityMode, WorkAllocation};
 
 use super::scheduler::NonceScheduler;
 use super::stats::{format_hashrate, median};
@@ -61,7 +63,13 @@ struct BenchRun {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BenchReport {
     #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
     environment: BenchEnvironment,
+    #[serde(default)]
+    config_fingerprint: BenchConfigFingerprint,
+    #[serde(default)]
+    pow_fingerprint: BenchPowFingerprint,
     bench_kind: String,
     backends: Vec<String>,
     #[serde(default)]
@@ -75,6 +83,28 @@ struct BenchReport {
     min_hps: f64,
     max_hps: f64,
     runs: Vec<BenchRun>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+struct BenchConfigFingerprint {
+    backend_event_capacity: usize,
+    hash_poll_ms: u64,
+    strict_round_accounting: bool,
+    refresh_secs: u64,
+    nonce_iters_per_lane: u64,
+    start_nonce: u64,
+    work_allocation: String,
+    cpu_affinity: String,
+    events_idle_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+struct BenchPowFingerprint {
+    memory_kb: u32,
+    iterations: u32,
+    parallelism: u32,
+    output_len: usize,
+    header_base_len: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -98,6 +128,7 @@ struct BenchEnvironment {
 }
 
 type BackendEventAction = RuntimeBackendEventAction;
+const BENCH_REPORT_SCHEMA_VERSION: u32 = 2;
 
 pub(super) fn run_benchmark(cfg: &Config, shutdown: &AtomicBool) -> Result<()> {
     let instances = super::build_backend_instances(cfg);
@@ -181,7 +212,10 @@ fn run_kernel_benchmark(
     summarize_benchmark(
         cfg,
         BenchReport {
+            schema_version: BENCH_REPORT_SCHEMA_VERSION,
             environment,
+            config_fingerprint: benchmark_config_fingerprint(cfg),
+            pow_fingerprint: benchmark_pow_fingerprint(),
             bench_kind: "kernel".to_string(),
             backends: vec![backend.name().to_string()],
             preemption: vec![format!(
@@ -462,7 +496,10 @@ fn run_worker_benchmark_inner(
     summarize_benchmark(
         cfg,
         BenchReport {
+            schema_version: BENCH_REPORT_SCHEMA_VERSION,
             environment,
+            config_fingerprint: benchmark_config_fingerprint(cfg),
+            pow_fingerprint: benchmark_pow_fingerprint(),
             bench_kind: if restart_each_round {
                 "end_to_end".to_string()
             } else {
@@ -584,6 +621,13 @@ fn summarize_benchmark(cfg: &Config, mut report: BenchReport) -> Result<()> {
 fn baseline_compatibility_issues(current: &BenchReport, baseline: &BenchReport) -> Vec<String> {
     let mut issues = Vec::new();
 
+    if baseline.schema_version != current.schema_version {
+        issues.push(format!(
+            "schema mismatch baseline={} current={}",
+            baseline.schema_version, current.schema_version
+        ));
+    }
+
     if baseline.bench_kind != current.bench_kind {
         issues.push(format!(
             "kind mismatch baseline={} current={}",
@@ -623,6 +667,111 @@ fn baseline_compatibility_issues(current: &BenchReport, baseline: &BenchReport) 
         ));
     }
 
+    if baseline.schema_version >= BENCH_REPORT_SCHEMA_VERSION
+        && current.schema_version >= BENCH_REPORT_SCHEMA_VERSION
+    {
+        if baseline.config_fingerprint.backend_event_capacity
+            != current.config_fingerprint.backend_event_capacity
+        {
+            issues.push(format!(
+                "backend_event_capacity mismatch baseline={} current={}",
+                baseline.config_fingerprint.backend_event_capacity,
+                current.config_fingerprint.backend_event_capacity
+            ));
+        }
+        if baseline.config_fingerprint.hash_poll_ms != current.config_fingerprint.hash_poll_ms {
+            issues.push(format!(
+                "hash_poll_ms mismatch baseline={} current={}",
+                baseline.config_fingerprint.hash_poll_ms, current.config_fingerprint.hash_poll_ms
+            ));
+        }
+        if baseline.config_fingerprint.strict_round_accounting
+            != current.config_fingerprint.strict_round_accounting
+        {
+            issues.push(format!(
+                "strict_round_accounting mismatch baseline={} current={}",
+                baseline.config_fingerprint.strict_round_accounting,
+                current.config_fingerprint.strict_round_accounting
+            ));
+        }
+        if baseline.config_fingerprint.refresh_secs != current.config_fingerprint.refresh_secs {
+            issues.push(format!(
+                "refresh_secs mismatch baseline={} current={}",
+                baseline.config_fingerprint.refresh_secs, current.config_fingerprint.refresh_secs
+            ));
+        }
+        if baseline.config_fingerprint.nonce_iters_per_lane
+            != current.config_fingerprint.nonce_iters_per_lane
+        {
+            issues.push(format!(
+                "nonce_iters_per_lane mismatch baseline={} current={}",
+                baseline.config_fingerprint.nonce_iters_per_lane,
+                current.config_fingerprint.nonce_iters_per_lane
+            ));
+        }
+        if baseline.config_fingerprint.start_nonce != current.config_fingerprint.start_nonce {
+            issues.push(format!(
+                "start_nonce mismatch baseline={} current={}",
+                baseline.config_fingerprint.start_nonce, current.config_fingerprint.start_nonce
+            ));
+        }
+        if baseline.config_fingerprint.work_allocation != current.config_fingerprint.work_allocation
+        {
+            issues.push(format!(
+                "work_allocation mismatch baseline={} current={}",
+                baseline.config_fingerprint.work_allocation,
+                current.config_fingerprint.work_allocation
+            ));
+        }
+        if baseline.config_fingerprint.cpu_affinity != current.config_fingerprint.cpu_affinity {
+            issues.push(format!(
+                "cpu_affinity mismatch baseline={} current={}",
+                baseline.config_fingerprint.cpu_affinity, current.config_fingerprint.cpu_affinity
+            ));
+        }
+        if baseline.config_fingerprint.events_idle_timeout_secs
+            != current.config_fingerprint.events_idle_timeout_secs
+        {
+            issues.push(format!(
+                "events_idle_timeout_secs mismatch baseline={} current={}",
+                baseline.config_fingerprint.events_idle_timeout_secs,
+                current.config_fingerprint.events_idle_timeout_secs
+            ));
+        }
+        if baseline.pow_fingerprint != current.pow_fingerprint {
+            issues.push("pow parameter fingerprint mismatch".to_string());
+        }
+    } else {
+        issues.push("baseline benchmark report schema is too old".to_string());
+    }
+
+    if !baseline.environment.seine_version.is_empty()
+        && !current.environment.seine_version.is_empty()
+        && baseline.environment.seine_version != current.environment.seine_version
+    {
+        issues.push(format!(
+            "version mismatch baseline={} current={}",
+            baseline.environment.seine_version, current.environment.seine_version
+        ));
+    }
+    if baseline.environment.git_commit.is_some()
+        && current.environment.git_commit.is_some()
+        && baseline.environment.git_commit != current.environment.git_commit
+    {
+        issues.push(format!(
+            "git mismatch baseline={} current={}",
+            baseline
+                .environment
+                .git_commit
+                .as_deref()
+                .unwrap_or("unknown"),
+            current
+                .environment
+                .git_commit
+                .as_deref()
+                .unwrap_or("unknown")
+        ));
+    }
     if !baseline.environment.target_triple.is_empty()
         && !current.environment.target_triple.is_empty()
         && baseline.environment.target_triple != current.environment.target_triple
@@ -630,6 +779,20 @@ fn baseline_compatibility_issues(current: &BenchReport, baseline: &BenchReport) 
         issues.push(format!(
             "target mismatch baseline={} current={}",
             baseline.environment.target_triple, current.environment.target_triple
+        ));
+    }
+    if baseline.environment.cpu_arch.is_some()
+        && current.environment.cpu_arch.is_some()
+        && baseline.environment.cpu_arch != current.environment.cpu_arch
+    {
+        issues.push(format!(
+            "cpu_arch mismatch baseline={} current={}",
+            baseline
+                .environment
+                .cpu_arch
+                .as_deref()
+                .unwrap_or("unknown"),
+            current.environment.cpu_arch.as_deref().unwrap_or("unknown")
         ));
     }
     if baseline.environment.cpu_brand.is_some()
@@ -648,6 +811,25 @@ fn baseline_compatibility_issues(current: &BenchReport, baseline: &BenchReport) 
                 .cpu_brand
                 .as_deref()
                 .unwrap_or("unknown")
+        ));
+    }
+    if baseline.environment.logical_cores > 0
+        && current.environment.logical_cores > 0
+        && baseline.environment.logical_cores != current.environment.logical_cores
+    {
+        issues.push(format!(
+            "logical_cores mismatch baseline={} current={}",
+            baseline.environment.logical_cores, current.environment.logical_cores
+        ));
+    }
+    if baseline.environment.physical_cores.is_some()
+        && current.environment.physical_cores.is_some()
+        && baseline.environment.physical_cores != current.environment.physical_cores
+    {
+        issues.push(format!(
+            "physical_cores mismatch baseline={} current={}",
+            baseline.environment.physical_cores.unwrap_or(0),
+            current.environment.physical_cores.unwrap_or(0)
         ));
     }
 
@@ -702,6 +884,44 @@ fn benchmark_environment() -> BenchEnvironment {
             .as_ref()
             .map(|limits| limits.free_memory)
             .filter(|value| *value > 0),
+    }
+}
+
+fn benchmark_config_fingerprint(cfg: &Config) -> BenchConfigFingerprint {
+    BenchConfigFingerprint {
+        backend_event_capacity: cfg.backend_event_capacity,
+        hash_poll_ms: cfg.hash_poll_interval.as_millis() as u64,
+        strict_round_accounting: cfg.strict_round_accounting,
+        refresh_secs: cfg.refresh_interval.as_secs(),
+        nonce_iters_per_lane: cfg.nonce_iters_per_lane,
+        start_nonce: cfg.start_nonce,
+        work_allocation: work_allocation_label(cfg.work_allocation).to_string(),
+        cpu_affinity: cpu_affinity_label(cfg.cpu_affinity).to_string(),
+        events_idle_timeout_secs: cfg.events_idle_timeout.as_secs(),
+    }
+}
+
+fn benchmark_pow_fingerprint() -> BenchPowFingerprint {
+    BenchPowFingerprint {
+        memory_kb: POW_MEMORY_KB,
+        iterations: POW_ITERATIONS,
+        parallelism: POW_PARALLELISM,
+        output_len: POW_OUTPUT_LEN,
+        header_base_len: POW_HEADER_BASE_LEN,
+    }
+}
+
+fn work_allocation_label(mode: WorkAllocation) -> &'static str {
+    match mode {
+        WorkAllocation::Static => "static",
+        WorkAllocation::Adaptive => "adaptive",
+    }
+}
+
+fn cpu_affinity_label(mode: CpuAffinityMode) -> &'static str {
+    match mode {
+        CpuAffinityMode::Off => "off",
+        CpuAffinityMode::Auto => "auto",
     }
 }
 
@@ -787,10 +1007,33 @@ mod tests {
 
     fn sample_report() -> BenchReport {
         BenchReport {
+            schema_version: BENCH_REPORT_SCHEMA_VERSION,
             environment: BenchEnvironment {
+                seine_version: "0.1.0".to_string(),
                 target_triple: "linux/x86_64".to_string(),
                 cpu_brand: Some("test-cpu".to_string()),
+                cpu_arch: Some("x86_64".to_string()),
+                logical_cores: 8,
+                physical_cores: Some(4),
                 ..BenchEnvironment::default()
+            },
+            config_fingerprint: BenchConfigFingerprint {
+                backend_event_capacity: 1024,
+                hash_poll_ms: 200,
+                strict_round_accounting: true,
+                refresh_secs: 20,
+                nonce_iters_per_lane: 1u64 << 36,
+                start_nonce: 7,
+                work_allocation: "adaptive".to_string(),
+                cpu_affinity: "auto".to_string(),
+                events_idle_timeout_secs: 90,
+            },
+            pow_fingerprint: BenchPowFingerprint {
+                memory_kb: POW_MEMORY_KB,
+                iterations: POW_ITERATIONS,
+                parallelism: POW_PARALLELISM,
+                output_len: POW_OUTPUT_LEN,
+                header_base_len: POW_HEADER_BASE_LEN,
             },
             bench_kind: "backend".to_string(),
             backends: vec!["cpu#1".to_string()],
@@ -842,5 +1085,15 @@ mod tests {
         let issues = baseline_compatibility_issues(&current, &baseline);
         assert!(!issues.is_empty());
         assert!(issues.iter().any(|issue| issue.contains("kind mismatch")));
+    }
+
+    #[test]
+    fn baseline_compatibility_detects_schema_mismatch() {
+        let current = sample_report();
+        let mut baseline = sample_report();
+        baseline.schema_version = 1;
+
+        let issues = baseline_compatibility_issues(&current, &baseline);
+        assert!(issues.iter().any(|issue| issue.contains("schema mismatch")));
     }
 }

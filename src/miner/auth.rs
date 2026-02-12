@@ -1,0 +1,32 @@
+use std::path::Path;
+
+use crate::api::ApiClient;
+use crate::config::read_token_from_cookie_file;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(super) enum TokenRefreshOutcome {
+    Refreshed,
+    Unchanged,
+    Unavailable,
+    Failed(String),
+}
+
+pub(super) fn refresh_api_token_from_cookie(
+    client: &ApiClient,
+    cookie_path: Option<&Path>,
+) -> TokenRefreshOutcome {
+    let Some(cookie_path) = cookie_path else {
+        return TokenRefreshOutcome::Unavailable;
+    };
+
+    let token = match read_token_from_cookie_file(cookie_path) {
+        Ok(token) => token,
+        Err(_) => return TokenRefreshOutcome::Failed("failed reading API cookie".to_string()),
+    };
+
+    match client.replace_token(token) {
+        Ok(true) => TokenRefreshOutcome::Refreshed,
+        Ok(false) => TokenRefreshOutcome::Unchanged,
+        Err(_) => TokenRefreshOutcome::Failed("failed updating API token".to_string()),
+    }
+}

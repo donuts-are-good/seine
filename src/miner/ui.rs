@@ -445,7 +445,10 @@ mod tests {
 
     #[test]
     fn suppresses_telemetry_lines_in_tui() {
-        assert!(suppress_in_tui("BACKEND", "telemetry | cpu#1:active_peak=1"));
+        assert!(suppress_in_tui(
+            "BACKEND",
+            "telemetry | cpu#1:active_peak=1"
+        ));
         assert!(suppress_in_tui("BENCH", "telemetry | cpu#1:active_peak=1"));
         assert!(!suppress_in_tui("BACKEND", "quarantined cpu#1"));
         assert!(!suppress_in_tui("MINER", "telemetry | cpu#1:active_peak=1"));

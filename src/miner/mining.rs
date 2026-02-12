@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::IsTerminal;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -18,12 +17,13 @@ use crate::api::{
     is_no_wallet_loaded_error, is_unauthorized_error, is_wallet_already_loaded_error, ApiClient,
 };
 use crate::backend::{BackendEvent, MiningSolution};
-use crate::config::{read_token_from_cookie_file, Config, WorkAllocation};
+use crate::config::{Config, WorkAllocation};
 use crate::types::{
     decode_hex, parse_target, set_block_nonce, template_difficulty, template_height,
     BlockTemplateResponse,
 };
 
+use super::auth::{refresh_api_token_from_cookie, TokenRefreshOutcome};
 use super::scheduler::NonceScheduler;
 use super::stats::{format_hashrate, Stats};
 pub(super) use super::tip::{spawn_tip_listener, TipListener, TipSignal};
@@ -100,13 +100,6 @@ impl RetryTracker {
         success(tag, message);
         *self = Self::default();
     }
-}
-
-enum TokenRefreshOutcome {
-    Refreshed,
-    Unchanged,
-    Unavailable,
-    Failed(String),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -200,7 +193,7 @@ impl TuiDisplay {
     fn mark_block_found(&mut self) {
         if let Ok(mut s) = self.state.lock() {
             let elapsed = s.started_at.elapsed().as_secs();
-            s.block_found_ticks.push(elapsed);
+            s.push_block_found_tick(elapsed);
         }
     }
 
@@ -991,26 +984,6 @@ fn fetch_template_prefetch_once(
             }
         }
         Err(_) => None,
-    }
-}
-
-fn refresh_api_token_from_cookie(
-    client: &ApiClient,
-    cookie_path: Option<&Path>,
-) -> TokenRefreshOutcome {
-    let Some(cookie_path) = cookie_path else {
-        return TokenRefreshOutcome::Unavailable;
-    };
-
-    let token = match read_token_from_cookie_file(cookie_path) {
-        Ok(token) => token,
-        Err(_) => return TokenRefreshOutcome::Failed("failed reading API cookie".to_string()),
-    };
-
-    match client.replace_token(token) {
-        Ok(true) => TokenRefreshOutcome::Refreshed,
-        Ok(false) => TokenRefreshOutcome::Unchanged,
-        Err(_) => TokenRefreshOutcome::Failed("failed updating API token".to_string()),
     }
 }
 

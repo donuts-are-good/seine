@@ -10,11 +10,15 @@ use crate::backend::{
 
 pub struct NvidiaBackend {
     _instance_id: BackendInstanceId,
+    device_index: Option<u32>,
 }
 
 impl NvidiaBackend {
-    pub fn new() -> Self {
-        Self { _instance_id: 0 }
+    pub fn new(device_index: Option<u32>) -> Self {
+        Self {
+            _instance_id: 0,
+            device_index,
+        }
     }
 }
 
@@ -34,7 +38,14 @@ impl PowBackend for NvidiaBackend {
     fn set_event_sink(&mut self, _sink: Sender<BackendEvent>) {}
 
     fn start(&mut self) -> Result<()> {
-        bail!("NVIDIA backend is scaffolded but not implemented yet")
+        if let Some(device_index) = self.device_index {
+            bail!(
+                "NVIDIA backend device {} is scaffolded but not implemented yet",
+                device_index
+            )
+        } else {
+            bail!("NVIDIA backend is scaffolded but not implemented yet")
+        }
     }
 
     fn stop(&mut self) {}

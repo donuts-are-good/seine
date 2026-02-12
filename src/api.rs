@@ -68,6 +68,7 @@ impl ApiClient {
         token: String,
         timeout: Duration,
         events_stream_timeout: Duration,
+        events_idle_timeout: Duration,
     ) -> Result<Self> {
         let token = token.trim().to_string();
         if token.is_empty() {
@@ -79,9 +80,10 @@ impl ApiClient {
             .build()
             .context("failed to build HTTP JSON client")?;
 
-        // Dedicated SSE client without global request timeout.
+        // Dedicated SSE client with bounded stream session lifetime to guarantee reconnect/liveness.
         let stream_client = Client::builder()
             .connect_timeout(events_stream_timeout)
+            .timeout(events_idle_timeout)
             .build()
             .context("failed to build HTTP stream client")?;
 
@@ -251,6 +253,7 @@ mod tests {
             "testtoken".to_string(),
             Duration::from_secs(5),
             Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .expect("test client should be created")
     }

@@ -8,6 +8,7 @@ Current status:
 - Runtime architecture: supports multiple backends in one process with persistent workers, configurable bounded backend event queues with lossless `Solution` delivery and deduplicated backend `Error` events (prevents multi-thread error storms from stalling worker teardown), coalesced tip notifications (deduped across SSE reconnects), template prefetch overlap to reduce round-boundary idle, and optional strict quiesce barriers for round-accurate hash accounting.
   - Runtime assigns disjoint nonce chunks per backend per round (backend-local scheduling inside each chunk) so CPU and future GPU implementations can iterate independently without nonce overlap.
   - Mining mode supports adaptive weighted nonce allocation (`--work-allocation adaptive`) based on observed backend throughput, with `--work-allocation static` available for fixed lane-based splitting.
+  - NVIDIA backend topology supports multiple explicit device instances via `--nvidia-devices` (for example `--backend nvidia --nvidia-devices 0,1`).
   - Runtime is split into `src/miner/{mining,tip,bench,scheduler,stats}.rs` to keep orchestration, tip-stream control, benchmarking, nonce scheduling, and telemetry isolated for faster iteration.
 
 ## Test
@@ -59,6 +60,12 @@ Select multiple backends (comma-separated or repeated flag). Unavailable backend
 ./target/release/seine --backend cpu,nvidia --threads 1
 ```
 
+Select explicit NVIDIA device instances:
+
+```bash
+./target/release/seine --backend nvidia --nvidia-devices 0,1
+```
+
 Build with NVIDIA support enabled:
 
 ```bash
@@ -88,6 +95,7 @@ Run headless/plain logs (no fullscreen TUI):
   - `--work-allocation` (`adaptive` or `static`) controls backend nonce-chunk splitting policy in mining mode.
   - `--request-timeout-secs` (default `10`) controls JSON API request timeout for template/submit/wallet calls.
   - `--events-stream-timeout-secs` (default `10`) controls SSE connect timeout per attempt (stream itself is long-lived).
+  - `--events-idle-timeout-secs` (default `90`) bounds one SSE stream request lifetime before reconnect to avoid liveness stalls.
   - `--cpu-affinity` (`auto` or `off`) controls CPU worker pinning policy for better repeatability on NUMA/SMT hosts.
   - `--ui` (`auto`, `tui`, `plain`) controls rendering mode. `auto` enables TUI only when stdout/stderr are terminals.
   - `--relaxed-accounting` disables per-round quiesce barriers (higher throughput, less exact round accounting).
@@ -108,7 +116,8 @@ Run deterministic local benchmarking (no API connection needed):
 - `--bench-kind end-to-end`: includes backend start/stop per round.
 - Worker benchmarks always apply a round-end measurement fence so round H/s is comparable across strict/relaxed accounting modes.
   - Benchmark reports now expose `counted_hashes` and `late_hashes` per round; throughput uses measured elapsed + fence time to avoid inflation when backend preemption is coarse.
-  - Baseline comparison validates benchmark/config/environment compatibility before computing deltas (and fails fast when regression gating is requested on non-comparable runs).
+  - Baseline comparison validates benchmark/config/environment compatibility (including report schema, runtime fingerprint, and PoW fingerprint) before computing deltas.
+  - In benchmark mode, default `start_nonce` is deterministic (`0`) unless `--start-nonce` is explicitly provided.
 
 ```bash
 cd seine

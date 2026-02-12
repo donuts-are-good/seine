@@ -22,11 +22,15 @@ pub mod nvidia {
 
     pub struct NvidiaBackend {
         _instance_id: BackendInstanceId,
+        _device_index: Option<u32>,
     }
 
     impl NvidiaBackend {
-        pub fn new() -> Self {
-            Self { _instance_id: 0 }
+        pub fn new(device_index: Option<u32>) -> Self {
+            Self {
+                _instance_id: 0,
+                _device_index: device_index,
+            }
         }
     }
 
@@ -46,7 +50,14 @@ pub mod nvidia {
         fn set_event_sink(&mut self, _sink: Sender<BackendEvent>) {}
 
         fn start(&mut self) -> Result<()> {
-            bail!("NVIDIA backend is disabled in this build (rebuild with --features nvidia)")
+            if let Some(device_index) = self._device_index {
+                bail!(
+                    "NVIDIA backend device {} is disabled in this build (rebuild with --features nvidia)",
+                    device_index
+                )
+            } else {
+                bail!("NVIDIA backend is disabled in this build (rebuild with --features nvidia)")
+            }
         }
 
         fn stop(&mut self) {}

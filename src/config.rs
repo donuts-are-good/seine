@@ -39,6 +39,12 @@ pub enum WorkAllocation {
     Adaptive,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct BackendSpec {
+    pub kind: BackendKind,
+    pub device_index: Option<u32>,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "seine", version, about = "Seine net miner for Blocknet")]
 struct Cli {
@@ -76,6 +82,11 @@ struct Cli {
     )]
     backends: Vec<BackendKind>,
 
+    /// Explicit NVIDIA device indices; creates one NVIDIA backend instance per index.
+    /// Requires selecting NVIDIA in --backend.
+    #[arg(long = "nvidia-devices", value_delimiter = ',', num_args = 1..)]
+    nvidia_devices: Vec<u32>,
+
     /// Number of CPU mining threads (each uses ~2GB RAM for Argon2id).
     #[arg(long, alias = "cpu-threads", default_value_t = 1)]
     threads: usize,
@@ -99,6 +110,10 @@ struct Cli {
     /// Timeout for each SSE stream connection attempt, in seconds.
     #[arg(long, default_value_t = 10)]
     events_stream_timeout_secs: u64,
+
+    /// Maximum lifetime for one SSE stream request before reconnecting, in seconds.
+    #[arg(long, default_value_t = 90)]
+    events_idle_timeout_secs: u64,
 
     /// Interval for periodic stats printing.
     #[arg(long, default_value_t = 10)]
@@ -176,12 +191,13 @@ pub struct Config {
     pub token_cookie_path: Option<PathBuf>,
     pub wallet_password: Option<String>,
     pub wallet_password_file: Option<PathBuf>,
-    pub backends: Vec<BackendKind>,
+    pub backend_specs: Vec<BackendSpec>,
     pub threads: usize,
     pub cpu_affinity: CpuAffinityMode,
     pub refresh_interval: Duration,
     pub request_timeout: Duration,
     pub events_stream_timeout: Duration,
+    pub events_idle_timeout: Duration,
     pub stats_interval: Duration,
     pub backend_event_capacity: usize,
     pub hash_poll_interval: Duration,
@@ -232,8 +248,9 @@ impl Config {
         if backends.is_empty() {
             bail!("at least one backend is required");
         }
+        let backend_specs = expand_backend_specs(&backends, &cli.nvidia_devices)?;
 
-        validate_cpu_memory(&backends, cli.threads, cli.allow_oversubscribe)?;
+        validate_cpu_memory(&backend_specs, cli.threads, cli.allow_oversubscribe)?;
 
         let (token, token_cookie_path) = if cli.bench {
             (None, None)
@@ -249,17 +266,24 @@ impl Config {
             token_cookie_path,
             wallet_password: cli.wallet_password,
             wallet_password_file: cli.wallet_password_file,
-            backends,
+            backend_specs,
             threads: cli.threads,
             cpu_affinity: cli.cpu_affinity,
             refresh_interval: Duration::from_secs(cli.refresh_secs.max(1)),
             request_timeout: Duration::from_secs(cli.request_timeout_secs.max(1)),
             events_stream_timeout: Duration::from_secs(cli.events_stream_timeout_secs.max(1)),
+            events_idle_timeout: Duration::from_secs(cli.events_idle_timeout_secs.max(1)),
             stats_interval: Duration::from_secs(cli.stats_secs.max(1)),
             backend_event_capacity: cli.backend_event_capacity,
             hash_poll_interval: Duration::from_millis(cli.hash_poll_ms),
             strict_round_accounting: !cli.relaxed_accounting,
-            start_nonce: cli.start_nonce.unwrap_or_else(default_nonce_seed),
+            start_nonce: cli.start_nonce.unwrap_or_else(|| {
+                if cli.bench {
+                    0
+                } else {
+                    default_nonce_seed()
+                }
+            }),
             nonce_iters_per_lane: cli.nonce_iters_per_lane,
             work_allocation: cli.work_allocation,
             sse_enabled: !cli.disable_sse,
@@ -332,24 +356,81 @@ fn dedupe_backends(backends: &[BackendKind]) -> Vec<BackendKind> {
     ordered
 }
 
-fn validate_cpu_memory(
+fn dedupe_device_indexes(device_indexes: &[u32]) -> Vec<u32> {
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::with_capacity(device_indexes.len());
+    for device_index in device_indexes {
+        if seen.insert(*device_index) {
+            ordered.push(*device_index);
+        }
+    }
+    ordered
+}
+
+fn expand_backend_specs(
     backends: &[BackendKind],
+    nvidia_devices: &[u32],
+) -> Result<Vec<BackendSpec>> {
+    if !nvidia_devices.is_empty() && !backends.contains(&BackendKind::Nvidia) {
+        bail!("--nvidia-devices requires selecting nvidia in --backend");
+    }
+
+    let nvidia_devices = dedupe_device_indexes(nvidia_devices);
+    let mut specs = Vec::new();
+    for backend in backends {
+        match backend {
+            BackendKind::Cpu => specs.push(BackendSpec {
+                kind: BackendKind::Cpu,
+                device_index: None,
+            }),
+            BackendKind::Nvidia => {
+                if nvidia_devices.is_empty() {
+                    specs.push(BackendSpec {
+                        kind: BackendKind::Nvidia,
+                        device_index: None,
+                    });
+                } else {
+                    for device_index in &nvidia_devices {
+                        specs.push(BackendSpec {
+                            kind: BackendKind::Nvidia,
+                            device_index: Some(*device_index),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if specs.is_empty() {
+        bail!("at least one backend is required");
+    }
+    Ok(specs)
+}
+
+fn validate_cpu_memory(
+    backend_specs: &[BackendSpec],
     threads: usize,
     allow_oversubscribe: bool,
 ) -> Result<()> {
-    if !backends.contains(&BackendKind::Cpu) {
+    let cpu_backend_count = backend_specs
+        .iter()
+        .filter(|spec| spec.kind == BackendKind::Cpu)
+        .count() as u64;
+    if cpu_backend_count == 0 {
         return Ok(());
     }
 
-    let required = CPU_LANE_MEMORY_BYTES.saturating_mul(threads as u64);
+    let total_cpu_lanes = cpu_backend_count.saturating_mul(threads as u64);
+    let required = CPU_LANE_MEMORY_BYTES.saturating_mul(total_cpu_lanes);
     let Some(budget) = detect_memory_budget_bytes() else {
         return Ok(());
     };
 
     if required > budget.effective_total && !allow_oversubscribe {
         bail!(
-            "configured CPU lanes need ~{} RAM ({} thread(s) * 2GB), but effective memory limit is ~{}. Use fewer threads or pass --allow-oversubscribe to bypass this safety check.",
+            "configured CPU lanes need ~{} RAM ({} backend(s) * {} thread(s) * 2GB), but effective memory limit is ~{}. Use fewer CPU lanes or pass --allow-oversubscribe to bypass this safety check.",
             human_bytes(required),
+            cpu_backend_count,
             threads,
             human_bytes(budget.effective_total),
         );
@@ -357,8 +438,9 @@ fn validate_cpu_memory(
 
     if required > budget.effective_available && !allow_oversubscribe {
         bail!(
-            "configured CPU lanes need ~{} RAM ({} thread(s) * 2GB), but currently available memory is ~{} (effective limit ~{}). Reduce threads or pass --allow-oversubscribe if you accept potential swap/OOM risk.",
+            "configured CPU lanes need ~{} RAM ({} backend(s) * {} thread(s) * 2GB), but currently available memory is ~{} (effective limit ~{}). Reduce CPU lanes or pass --allow-oversubscribe if you accept potential swap/OOM risk.",
             human_bytes(required),
+            cpu_backend_count,
             threads,
             human_bytes(budget.effective_available),
             human_bytes(budget.effective_total),
@@ -440,12 +522,14 @@ mod tests {
             cookie: None,
             data_dir: PathBuf::from("./data"),
             backends: vec![BackendKind::Cpu],
+            nvidia_devices: Vec::new(),
             threads: 1,
             cpu_affinity: CpuAffinityMode::Auto,
             allow_oversubscribe: false,
             refresh_secs: 20,
             request_timeout_secs: 10,
             events_stream_timeout_secs: 10,
+            events_idle_timeout_secs: 90,
             stats_secs: 10,
             backend_event_capacity: 1024,
             hash_poll_ms: 200,
@@ -510,6 +594,36 @@ mod tests {
     fn dedupe_backends_preserves_order() {
         let out = dedupe_backends(&[BackendKind::Cpu, BackendKind::Nvidia, BackendKind::Cpu]);
         assert_eq!(out, vec![BackendKind::Cpu, BackendKind::Nvidia]);
+    }
+
+    #[test]
+    fn expand_backend_specs_expands_nvidia_devices() {
+        let out = expand_backend_specs(&[BackendKind::Cpu, BackendKind::Nvidia], &[2, 0, 2])
+            .expect("backend specs should parse");
+        assert_eq!(
+            out,
+            vec![
+                BackendSpec {
+                    kind: BackendKind::Cpu,
+                    device_index: None
+                },
+                BackendSpec {
+                    kind: BackendKind::Nvidia,
+                    device_index: Some(2)
+                },
+                BackendSpec {
+                    kind: BackendKind::Nvidia,
+                    device_index: Some(0)
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_backend_specs_requires_nvidia_backend_for_devices() {
+        let err = expand_backend_specs(&[BackendKind::Cpu], &[0])
+            .expect_err("nvidia devices without backend should fail");
+        assert!(format!("{err:#}").contains("--nvidia-devices requires selecting nvidia"));
     }
 
     #[test]

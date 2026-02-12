@@ -15,6 +15,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 
 const LOG_CAPACITY: usize = 200;
+const BLOCK_MARKER_CAPACITY: usize = 4096;
 
 #[derive(Clone)]
 pub struct LogEntry {
@@ -107,7 +108,7 @@ pub struct TuiStateInner {
     pub log_entries: VecDeque<LogEntry>,
 
     // Wave markers for mined blocks (elapsed seconds when each block was accepted)
-    pub block_found_ticks: Vec<u64>,
+    pub block_found_ticks: VecDeque<u64>,
 }
 
 impl TuiStateInner {
@@ -138,7 +139,7 @@ impl TuiStateInner {
 
             log_entries: VecDeque::with_capacity(LOG_CAPACITY),
 
-            block_found_ticks: Vec::new(),
+            block_found_ticks: VecDeque::with_capacity(BLOCK_MARKER_CAPACITY),
         }
     }
 
@@ -147,6 +148,13 @@ impl TuiStateInner {
             self.log_entries.pop_front();
         }
         self.log_entries.push_back(entry);
+    }
+
+    pub fn push_block_found_tick(&mut self, tick: u64) {
+        if self.block_found_ticks.len() >= BLOCK_MARKER_CAPACITY {
+            self.block_found_ticks.pop_front();
+        }
+        self.block_found_ticks.push_back(tick);
     }
 
     fn uptime(&self) -> String {
@@ -277,7 +285,7 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner) {
     frame.render_widget(paragraph, area);
 }
 
-fn wave_lines(width: usize, tick: u64, block_ticks: &[u64]) -> Vec<Line<'static>> {
+fn wave_lines(width: usize, tick: u64, block_ticks: &VecDeque<u64>) -> Vec<Line<'static>> {
     const CREST_COLOR: Color = Color::Rgb(65, 125, 175);
     const WAVE_COLOR: Color = Color::Rgb(45, 85, 130);
     const BLOCK_COLOR: Color = Color::Rgb(230, 190, 60);
@@ -286,14 +294,14 @@ fn wave_lines(width: usize, tick: u64, block_ticks: &[u64]) -> Vec<Line<'static>
     let upper: Vec<char> = "≈ ~ ≈ ~ ≈ ~ ~ ≈ ~ ≈ ^ ≈ ~ ≈ ~ ~ ≈ ".chars().collect();
     let lower: Vec<char> = "~ ≈ ~ ≈ ~ ~ ≈ ~ ~ ≈ ~ ^ ≈ ~ ≈ ~ ≈ ~ ".chars().collect();
 
-    // Block indicators scroll left from right edge on the crest row
-    let block_cols: Vec<usize> = block_ticks
-        .iter()
-        .filter_map(|&bt| {
-            let age = tick.saturating_sub(bt) as usize;
-            (age < width).then(|| width - 1 - age)
-        })
-        .collect();
+    // Block indicators scroll left from right edge on the crest row.
+    let mut block_mask = vec![false; width];
+    for &block_tick in block_ticks {
+        let age = tick.saturating_sub(block_tick) as usize;
+        if age < width {
+            block_mask[width - 1 - age] = true;
+        }
+    }
 
     vec![
         wave_row(
@@ -301,10 +309,10 @@ fn wave_lines(width: usize, tick: u64, block_ticks: &[u64]) -> Vec<Line<'static>
             tick as usize,
             &upper,
             CREST_COLOR,
-            &block_cols,
+            Some(&block_mask),
             BLOCK_COLOR,
         ),
-        wave_row(width, tick as usize, &lower, WAVE_COLOR, &[], BLOCK_COLOR),
+        wave_row(width, tick as usize, &lower, WAVE_COLOR, None, BLOCK_COLOR),
     ]
 }
 
@@ -313,7 +321,7 @@ fn wave_row(
     offset_base: usize,
     pattern: &[char],
     color: Color,
-    block_cols: &[usize],
+    block_mask: Option<&[bool]>,
     block_color: Color,
 ) -> Line<'static> {
     let plen = pattern.len();
@@ -321,7 +329,11 @@ fn wave_row(
     let mut spans = Vec::with_capacity(width);
 
     for i in 0..width {
-        if block_cols.contains(&i) {
+        if block_mask
+            .and_then(|mask| mask.get(i))
+            .copied()
+            .unwrap_or(false)
+        {
             spans.push(Span::styled(
                 "◆",
                 Style::default()
@@ -603,6 +615,16 @@ mod tests {
         }
         assert_eq!(state.log_entries.len(), LOG_CAPACITY);
         assert_eq!(state.log_entries.front().unwrap().message, "msg 50");
+    }
+
+    #[test]
+    fn block_marker_history_is_capped() {
+        let mut state = TuiStateInner::new();
+        for i in 0..(BLOCK_MARKER_CAPACITY + 32) {
+            state.push_block_found_tick(i as u64);
+        }
+        assert_eq!(state.block_found_ticks.len(), BLOCK_MARKER_CAPACITY);
+        assert_eq!(state.block_found_ticks.front().copied(), Some(32));
     }
 
     #[test]

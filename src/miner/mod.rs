@@ -1,3 +1,4 @@
+mod auth;
 mod bench;
 mod mining;
 mod scheduler;
@@ -72,6 +73,7 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
         token,
         cfg.request_timeout,
         cfg.events_stream_timeout,
+        cfg.events_idle_timeout,
     )?;
 
     let backend_instances = build_backend_instances(cfg);
@@ -210,13 +212,15 @@ fn build_tui_state(
 }
 
 fn build_backend_instances(cfg: &Config) -> Vec<Box<dyn PowBackend>> {
-    cfg.backends
+    cfg.backend_specs
         .iter()
-        .map(|backend_kind| match backend_kind {
+        .map(|backend_spec| match backend_spec.kind {
             BackendKind::Cpu => {
                 Box::new(CpuBackend::new(cfg.threads, cfg.cpu_affinity)) as Box<dyn PowBackend>
             }
-            BackendKind::Nvidia => Box::new(NvidiaBackend::new()) as Box<dyn PowBackend>,
+            BackendKind::Nvidia => {
+                Box::new(NvidiaBackend::new(backend_spec.device_index)) as Box<dyn PowBackend>
+            }
         })
         .collect()
 }
@@ -272,15 +276,35 @@ fn activate_backends(
     Ok((active, event_rx))
 }
 
-fn start_backend_slots(backends: &mut [BackendSlot]) -> Result<()> {
-    for slot in backends {
-        slot.backend.start().with_context(|| {
-            format!(
-                "failed to start backend {}#{}",
-                slot.backend.name(),
-                slot.id
-            )
-        })?;
+fn start_backend_slots(backends: &mut Vec<BackendSlot>) -> Result<()> {
+    let mut failed_indices = Vec::new();
+    for (idx, slot) in backends.iter_mut().enumerate() {
+        if let Err(err) = slot.backend.start() {
+            warn(
+                "BENCH",
+                format!(
+                    "backend {}#{} failed to restart: {err:#}",
+                    slot.backend.name(),
+                    slot.id
+                ),
+            );
+            failed_indices.push(idx);
+        }
+    }
+
+    for idx in failed_indices.into_iter().rev() {
+        let mut slot = backends.remove(idx);
+        let backend_name = slot.backend.name();
+        let backend_id = slot.id;
+        slot.backend.stop();
+        warn(
+            "BENCH",
+            format!("quarantined {backend_name}#{backend_id} after restart failure"),
+        );
+    }
+
+    if backends.is_empty() {
+        bail!("all benchmark backends are unavailable after restart failure");
     }
     Ok(())
 }
@@ -1007,6 +1031,33 @@ mod tests {
             .expect("activation should continue with the healthy backend");
 
         assert_eq!(active.len(), 1);
+        assert_eq!(failed_state.stop_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(healthy_state.stop_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn start_backend_slots_quarantines_failed_restart() {
+        let failed_state = Arc::new(MockState::default());
+        let healthy_state = Arc::new(MockState::default());
+        failed_state.fail_start.store(true, Ordering::Relaxed);
+
+        let mut backends = vec![
+            slot(
+                1,
+                1,
+                Box::new(MockBackend::new("cpu", 1, Arc::clone(&failed_state))),
+            ),
+            slot(
+                2,
+                1,
+                Box::new(MockBackend::new("cpu", 1, Arc::clone(&healthy_state))),
+            ),
+        ];
+
+        start_backend_slots(&mut backends).expect("restart should continue with healthy backend");
+
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].id, 2);
         assert_eq!(failed_state.stop_calls.load(Ordering::Relaxed), 1);
         assert_eq!(healthy_state.stop_calls.load(Ordering::Relaxed), 0);
     }

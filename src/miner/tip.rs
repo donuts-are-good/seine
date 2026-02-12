@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -9,8 +9,8 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use crate::api::{is_unauthorized_error, ApiClient};
-use crate::config::read_token_from_cookie_file;
 
+use super::auth::{refresh_api_token_from_cookie, TokenRefreshOutcome};
 use super::ui::{success, warn};
 
 const RETRY_LOG_INTERVAL: Duration = Duration::from_secs(10);
@@ -177,13 +177,6 @@ impl RetryTracker {
         success(tag, message);
         *self = Self::default();
     }
-}
-
-enum TokenRefreshOutcome {
-    Refreshed,
-    Unchanged,
-    Unavailable,
-    Failed(String),
 }
 
 pub(super) fn spawn_tip_listener(
@@ -362,26 +355,6 @@ fn extract_new_block_event(payload: &str) -> Option<NewBlockEvent> {
         .map(str::to_string)?;
     let height = value.get("height").and_then(Value::as_u64);
     Some(NewBlockEvent { hash, height })
-}
-
-fn refresh_api_token_from_cookie(
-    client: &ApiClient,
-    cookie_path: Option<&Path>,
-) -> TokenRefreshOutcome {
-    let Some(cookie_path) = cookie_path else {
-        return TokenRefreshOutcome::Unavailable;
-    };
-
-    let token = match read_token_from_cookie_file(cookie_path) {
-        Ok(token) => token,
-        Err(_) => return TokenRefreshOutcome::Failed("failed reading API cookie".to_string()),
-    };
-
-    match client.replace_token(token) {
-        Ok(true) => TokenRefreshOutcome::Refreshed,
-        Ok(false) => TokenRefreshOutcome::Unchanged,
-        Err(_) => TokenRefreshOutcome::Failed("failed updating API token".to_string()),
-    }
 }
 
 #[cfg(test)]
