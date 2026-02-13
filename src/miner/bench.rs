@@ -15,7 +15,7 @@ use sysinfo::System;
 use crate::backend::{BackendEvent, BackendInstanceId, DeadlineSupport, PowBackend};
 use crate::config::{BenchBaselinePolicy, BenchKind, Config, CpuAffinityMode, WorkAllocation};
 
-use super::hash_poll::{build_backend_poll_state, next_backend_poll_deadline};
+use super::hash_poll::build_backend_poll_state;
 use super::runtime::{
     seed_backend_weights, update_backend_weights, work_distribution_weights, RoundEndReason,
     WeightUpdateInputs,
@@ -24,10 +24,9 @@ use super::scheduler::NonceScheduler;
 use super::stats::{format_hashrate, median};
 use super::ui::{info, startup_banner, success, warn};
 use super::{
-    activate_backends, collect_backend_hashes, collect_round_backend_samples, distribute_work,
-    format_round_backend_telemetry, next_work_id, quiesce_backend_slots, start_backend_slots,
-    stop_backend_slots, total_lanes, BackendRoundTelemetry, BackendSlot, RuntimeBackendEventAction,
-    RuntimeMode, MIN_EVENT_WAIT,
+    activate_backends, collect_backend_hashes, distribute_work, format_round_backend_telemetry,
+    next_work_id, quiesce_backend_slots, start_backend_slots, stop_backend_slots, total_lanes,
+    BackendRoundTelemetry, BackendSlot, RuntimeBackendEventAction, RuntimeMode,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,7 +201,11 @@ pub(super) fn run_benchmark(cfg: &Config, shutdown: &AtomicBool) -> Result<()> {
     backend_executor.set_assignment_timeout_threshold(cfg.backend_assign_timeout_strikes);
 
     match cfg.bench_kind {
-        BenchKind::Kernel => run_kernel_benchmark(cfg, shutdown, instances),
+        BenchKind::Kernel => run_kernel_benchmark(
+            cfg,
+            shutdown,
+            instances.into_iter().map(|(_, backend)| backend).collect(),
+        ),
         BenchKind::Backend => {
             run_worker_benchmark(cfg, shutdown, instances, false, &backend_executor)
         }
@@ -415,11 +418,12 @@ fn ensure_worker_topology_identity(
 fn run_worker_benchmark(
     cfg: &Config,
     shutdown: &AtomicBool,
-    instances: Vec<Arc<dyn PowBackend>>,
+    instances: Vec<(crate::config::BackendSpec, Arc<dyn PowBackend>)>,
     restart_each_round: bool,
     backend_executor: &super::backend_executor::BackendExecutor,
 ) -> Result<()> {
-    let (mut backends, backend_events) = activate_backends(instances, cfg.backend_event_capacity)?;
+    let (mut backends, backend_events) =
+        activate_backends(instances, cfg.backend_event_capacity, cfg)?;
     super::enforce_deadline_policy(
         &mut backends,
         cfg.allow_best_effort_deadlines,
@@ -573,7 +577,6 @@ fn run_worker_benchmark_inner(
                 target: impossible_target,
                 reservation,
                 stop_at,
-                assignment_timeout: cfg.backend_assign_timeout,
                 backend_weights: work_distribution_weights(cfg.work_allocation, &backend_weights),
             },
             backend_executor,
@@ -585,36 +588,25 @@ fn run_worker_benchmark_inner(
         let mut round_backend_telemetry = BTreeMap::new();
         let mut backend_poll_state = build_backend_poll_state(backends, cfg.hash_poll_interval);
         while Instant::now() < stop_at && !shutdown.load(Ordering::Relaxed) {
-            let collected = collect_round_backend_samples(
+            let step = super::round_driver::drive_round_step(
                 backends,
+                backend_events,
                 backend_executor,
                 cfg.hash_poll_interval,
                 &mut backend_poll_state,
                 &mut round_backend_hashes,
                 &mut round_backend_telemetry,
-            );
-            round_hashes = round_hashes.saturating_add(collected);
-            let now = Instant::now();
-            let next_hash_poll_at = next_backend_poll_deadline(&backend_poll_state);
-            let wait_for = stop_at
-                .saturating_duration_since(now)
-                .min(next_hash_poll_at.saturating_duration_since(now))
-                .max(MIN_EVENT_WAIT);
+                stop_at,
+                None,
+            )?;
+            round_hashes = round_hashes.saturating_add(step.collected_hashes);
 
-            crossbeam_channel::select! {
-                recv(backend_events) -> event => {
-                    let event = event.map_err(|_| anyhow!("backend event channel closed"))?;
-                    if handle_benchmark_backend_event(event, epoch, backends, backend_executor)?
-                        == BackendEventAction::TopologyChanged
-                    {
-                        ensure_worker_topology_identity(
-                            backends,
-                            identity,
-                            &phase_label,
-                        )?;
-                    }
+            if let Some(event) = step.event {
+                if handle_benchmark_backend_event(event, epoch, backends, backend_executor)?
+                    == BackendEventAction::TopologyChanged
+                {
+                    ensure_worker_topology_identity(backends, identity, &phase_label)?;
                 }
-                default(wait_for) => {}
             }
         }
 
@@ -1721,6 +1713,7 @@ mod tests {
             id: 7,
             backend: Arc::new(NoopBackend),
             lanes: 1,
+            runtime_policy: crate::miner::BackendRuntimePolicy::default(),
         }];
         let round_backend_hashes = BTreeMap::new();
         let round_backend_telemetry = BTreeMap::new();
@@ -1743,6 +1736,7 @@ mod tests {
             id: 7,
             backend: Arc::new(NoopBackend),
             lanes: 1,
+            runtime_policy: crate::miner::BackendRuntimePolicy::default(),
         }];
         let round_backend_hashes = BTreeMap::new();
 
@@ -1757,11 +1751,13 @@ mod tests {
                 id: 2,
                 backend: Arc::new(NoopBackend),
                 lanes: 1,
+                runtime_policy: crate::miner::BackendRuntimePolicy::default(),
             },
             BackendSlot {
                 id: 9,
                 backend: Arc::new(NoopBackend),
                 lanes: 2,
+                runtime_policy: crate::miner::BackendRuntimePolicy::default(),
             },
         ];
 
@@ -1788,17 +1784,20 @@ mod tests {
                 id: 2,
                 backend: Arc::new(NoopBackend),
                 lanes: 1,
+                runtime_policy: crate::miner::BackendRuntimePolicy::default(),
             },
             BackendSlot {
                 id: 9,
                 backend: Arc::new(NoopBackend),
                 lanes: 1,
+                runtime_policy: crate::miner::BackendRuntimePolicy::default(),
             },
         ];
         let current = vec![BackendSlot {
             id: 2,
             backend: Arc::new(NoopBackend),
             lanes: 1,
+            runtime_policy: crate::miner::BackendRuntimePolicy::default(),
         }];
         let identity = worker_benchmark_identity(&expected);
 
@@ -1813,11 +1812,13 @@ mod tests {
             id: 2,
             backend: Arc::new(NoopBackend),
             lanes: 2,
+            runtime_policy: crate::miner::BackendRuntimePolicy::default(),
         }];
         let current = vec![BackendSlot {
             id: 2,
             backend: Arc::new(NoopBackend),
             lanes: 1,
+            runtime_policy: crate::miner::BackendRuntimePolicy::default(),
         }];
         let identity = worker_benchmark_identity(&expected);
 

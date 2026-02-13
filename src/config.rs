@@ -49,6 +49,11 @@ pub enum WorkAllocation {
 pub struct BackendSpec {
     pub kind: BackendKind,
     pub device_index: Option<u32>,
+    pub cpu_threads: Option<usize>,
+    pub cpu_affinity: Option<CpuAffinityMode>,
+    pub assign_timeout_override: Option<Duration>,
+    pub control_timeout_override: Option<Duration>,
+    pub assign_timeout_strikes_override: Option<u32>,
 }
 
 #[derive(Debug, Parser)]
@@ -101,6 +106,21 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CpuAffinityMode::Auto)]
     cpu_affinity: CpuAffinityMode,
 
+    /// Optional per-CPU-instance thread counts (comma-separated).
+    /// Length must match the number of configured CPU backend instances.
+    #[arg(long = "cpu-threads-per-instance", value_delimiter = ',', num_args = 1..)]
+    cpu_threads_per_instance: Vec<usize>,
+
+    /// Optional per-CPU-instance affinity policies (comma-separated).
+    /// Length must match the number of configured CPU backend instances.
+    #[arg(
+        long = "cpu-affinity-per-instance",
+        value_enum,
+        value_delimiter = ',',
+        num_args = 1..
+    )]
+    cpu_affinity_per_instance: Vec<CpuAffinityMode>,
+
     /// Allow starting when configured CPU lanes exceed detected system RAM.
     #[arg(long, default_value_t = false)]
     allow_oversubscribe: bool,
@@ -137,13 +157,40 @@ struct Cli {
     #[arg(long, default_value_t = 1000)]
     backend_assign_timeout_ms: u64,
 
+    /// Optional per-backend-instance assignment dispatch timeouts in milliseconds.
+    /// Length must match total backend instances after expansion.
+    #[arg(
+        long = "backend-assign-timeout-ms-per-instance",
+        value_delimiter = ',',
+        num_args = 1..
+    )]
+    backend_assign_timeout_ms_per_instance: Vec<u64>,
+
     /// Consecutive assignment timeouts before backend quarantine.
     #[arg(long, default_value_t = 3)]
     backend_assign_timeout_strikes: u32,
 
+    /// Optional per-backend-instance assignment-timeout strike thresholds.
+    /// Length must match total backend instances after expansion.
+    #[arg(
+        long = "backend-assign-timeout-strikes-per-instance",
+        value_delimiter = ',',
+        num_args = 1..
+    )]
+    backend_assign_timeout_strikes_per_instance: Vec<u32>,
+
     /// Maximum time to wait for backend cancel/fence control calls, in milliseconds.
     #[arg(long, default_value_t = 60_000)]
     backend_control_timeout_ms: u64,
+
+    /// Optional per-backend-instance cancel/fence timeouts in milliseconds.
+    /// Length must match total backend instances after expansion.
+    #[arg(
+        long = "backend-control-timeout-ms-per-instance",
+        value_delimiter = ',',
+        num_args = 1..
+    )]
+    backend_control_timeout_ms_per_instance: Vec<u64>,
 
     /// Allow backends with best-effort deadline semantics.
     #[arg(long, default_value_t = false)]
@@ -296,11 +343,32 @@ impl Config {
         if cli.backend_assign_timeout_ms == 0 {
             bail!("backend-assign-timeout-ms must be >= 1");
         }
+        if cli
+            .backend_assign_timeout_ms_per_instance
+            .iter()
+            .any(|value| *value == 0)
+        {
+            bail!("backend-assign-timeout-ms-per-instance values must be >= 1");
+        }
         if cli.backend_assign_timeout_strikes == 0 {
             bail!("backend-assign-timeout-strikes must be >= 1");
         }
+        if cli
+            .backend_assign_timeout_strikes_per_instance
+            .iter()
+            .any(|value| *value == 0)
+        {
+            bail!("backend-assign-timeout-strikes-per-instance values must be >= 1");
+        }
         if cli.backend_control_timeout_ms == 0 {
             bail!("backend-control-timeout-ms must be >= 1");
+        }
+        if cli
+            .backend_control_timeout_ms_per_instance
+            .iter()
+            .any(|value| *value == 0)
+        {
+            bail!("backend-control-timeout-ms-per-instance values must be >= 1");
         }
         if cli.prefetch_wait_ms == 0 {
             bail!("prefetch-wait-ms must be >= 1");
@@ -326,11 +394,21 @@ impl Config {
             }
         }
 
-        let backends = dedupe_backends(&cli.backends);
+        let backends = cli.backends.clone();
         if backends.is_empty() {
             bail!("at least one backend is required");
         }
-        let backend_specs = expand_backend_specs(&backends, &cli.nvidia_devices)?;
+        let backend_specs = expand_backend_specs(
+            &backends,
+            &cli.nvidia_devices,
+            cli.threads,
+            cli.cpu_affinity,
+            &cli.cpu_threads_per_instance,
+            &cli.cpu_affinity_per_instance,
+            &cli.backend_assign_timeout_ms_per_instance,
+            &cli.backend_control_timeout_ms_per_instance,
+            &cli.backend_assign_timeout_strikes_per_instance,
+        )?;
 
         validate_cpu_memory(&backend_specs, cli.threads, cli.allow_oversubscribe)?;
 
@@ -445,17 +523,6 @@ fn default_nonce_seed() -> u64 {
         .unwrap_or(0)
 }
 
-fn dedupe_backends(backends: &[BackendKind]) -> Vec<BackendKind> {
-    let mut seen = HashSet::new();
-    let mut ordered = Vec::with_capacity(backends.len());
-    for backend in backends {
-        if seen.insert(*backend) {
-            ordered.push(*backend);
-        }
-    }
-    ordered
-}
-
 fn dedupe_device_indexes(device_indexes: &[u32]) -> Vec<u32> {
     let mut seen = HashSet::new();
     let mut ordered = Vec::with_capacity(device_indexes.len());
@@ -470,6 +537,13 @@ fn dedupe_device_indexes(device_indexes: &[u32]) -> Vec<u32> {
 fn expand_backend_specs(
     backends: &[BackendKind],
     nvidia_devices: &[u32],
+    default_cpu_threads: usize,
+    default_cpu_affinity: CpuAffinityMode,
+    cpu_threads_per_instance: &[usize],
+    cpu_affinity_per_instance: &[CpuAffinityMode],
+    backend_assign_timeout_ms_per_instance: &[u64],
+    backend_control_timeout_ms_per_instance: &[u64],
+    backend_assign_timeout_strikes_per_instance: &[u32],
 ) -> Result<Vec<BackendSpec>> {
     if !nvidia_devices.is_empty() && !backends.contains(&BackendKind::Nvidia) {
         bail!("--nvidia-devices requires selecting nvidia in --backend");
@@ -482,18 +556,33 @@ fn expand_backend_specs(
             BackendKind::Cpu => specs.push(BackendSpec {
                 kind: BackendKind::Cpu,
                 device_index: None,
+                cpu_threads: None,
+                cpu_affinity: None,
+                assign_timeout_override: None,
+                control_timeout_override: None,
+                assign_timeout_strikes_override: None,
             }),
             BackendKind::Nvidia => {
                 if nvidia_devices.is_empty() {
                     specs.push(BackendSpec {
                         kind: BackendKind::Nvidia,
                         device_index: None,
+                        cpu_threads: None,
+                        cpu_affinity: None,
+                        assign_timeout_override: None,
+                        control_timeout_override: None,
+                        assign_timeout_strikes_override: None,
                     });
                 } else {
                     for device_index in &nvidia_devices {
                         specs.push(BackendSpec {
                             kind: BackendKind::Nvidia,
                             device_index: Some(*device_index),
+                            cpu_threads: None,
+                            cpu_affinity: None,
+                            assign_timeout_override: None,
+                            control_timeout_override: None,
+                            assign_timeout_strikes_override: None,
                         });
                     }
                 }
@@ -504,6 +593,86 @@ fn expand_backend_specs(
     if specs.is_empty() {
         bail!("at least one backend is required");
     }
+
+    let cpu_instance_indexes = specs
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, spec)| (spec.kind == BackendKind::Cpu).then_some(idx))
+        .collect::<Vec<_>>();
+
+    if !cpu_threads_per_instance.is_empty() && cpu_threads_per_instance.len() != cpu_instance_indexes.len()
+    {
+        bail!(
+            "--cpu-threads-per-instance length ({}) must match CPU backend instances ({})",
+            cpu_threads_per_instance.len(),
+            cpu_instance_indexes.len()
+        );
+    }
+    if !cpu_affinity_per_instance.is_empty()
+        && cpu_affinity_per_instance.len() != cpu_instance_indexes.len()
+    {
+        bail!(
+            "--cpu-affinity-per-instance length ({}) must match CPU backend instances ({})",
+            cpu_affinity_per_instance.len(),
+            cpu_instance_indexes.len()
+        );
+    }
+
+    for (cpu_idx, spec_idx) in cpu_instance_indexes.iter().copied().enumerate() {
+        let threads = cpu_threads_per_instance
+            .get(cpu_idx)
+            .copied()
+            .unwrap_or(default_cpu_threads)
+            .max(1);
+        let affinity = cpu_affinity_per_instance
+            .get(cpu_idx)
+            .copied()
+            .unwrap_or(default_cpu_affinity);
+        specs[spec_idx].cpu_threads = Some(threads);
+        specs[spec_idx].cpu_affinity = Some(affinity);
+    }
+
+    let instance_count = specs.len();
+    if !backend_assign_timeout_ms_per_instance.is_empty()
+        && backend_assign_timeout_ms_per_instance.len() != instance_count
+    {
+        bail!(
+            "--backend-assign-timeout-ms-per-instance length ({}) must match backend instances ({})",
+            backend_assign_timeout_ms_per_instance.len(),
+            instance_count
+        );
+    }
+    if !backend_control_timeout_ms_per_instance.is_empty()
+        && backend_control_timeout_ms_per_instance.len() != instance_count
+    {
+        bail!(
+            "--backend-control-timeout-ms-per-instance length ({}) must match backend instances ({})",
+            backend_control_timeout_ms_per_instance.len(),
+            instance_count
+        );
+    }
+    if !backend_assign_timeout_strikes_per_instance.is_empty()
+        && backend_assign_timeout_strikes_per_instance.len() != instance_count
+    {
+        bail!(
+            "--backend-assign-timeout-strikes-per-instance length ({}) must match backend instances ({})",
+            backend_assign_timeout_strikes_per_instance.len(),
+            instance_count
+        );
+    }
+
+    for (idx, spec) in specs.iter_mut().enumerate() {
+        spec.assign_timeout_override = backend_assign_timeout_ms_per_instance
+            .get(idx)
+            .map(|value| Duration::from_millis(*value));
+        spec.control_timeout_override = backend_control_timeout_ms_per_instance
+            .get(idx)
+            .map(|value| Duration::from_millis(*value));
+        spec.assign_timeout_strikes_override = backend_assign_timeout_strikes_per_instance
+            .get(idx)
+            .copied();
+    }
+
     Ok(specs)
 }
 
@@ -512,15 +681,18 @@ fn validate_cpu_memory(
     threads: usize,
     allow_oversubscribe: bool,
 ) -> Result<()> {
-    let cpu_backend_count = backend_specs
+    let cpu_lane_configs = backend_specs
         .iter()
         .filter(|spec| spec.kind == BackendKind::Cpu)
-        .count() as u64;
-    if cpu_backend_count == 0 {
+        .map(|spec| spec.cpu_threads.unwrap_or(threads).max(1) as u64)
+        .collect::<Vec<_>>();
+    if cpu_lane_configs.is_empty() {
         return Ok(());
     }
 
-    let total_cpu_lanes = cpu_backend_count.saturating_mul(threads as u64);
+    let total_cpu_lanes = cpu_lane_configs
+        .iter()
+        .fold(0u64, |acc, lanes| acc.saturating_add(*lanes));
     let required = CPU_LANE_MEMORY_BYTES.saturating_mul(total_cpu_lanes);
     let Some(budget) = detect_memory_budget_bytes() else {
         return Ok(());
@@ -528,20 +700,18 @@ fn validate_cpu_memory(
 
     if required > budget.effective_total && !allow_oversubscribe {
         bail!(
-            "configured CPU lanes need ~{} RAM ({} backend(s) * {} thread(s) * 2GB), but effective memory limit is ~{}. Use fewer CPU lanes or pass --allow-oversubscribe to bypass this safety check.",
+            "configured CPU lanes need ~{} RAM ({} CPU lane(s) * 2GB), but effective memory limit is ~{}. Use fewer CPU lanes or pass --allow-oversubscribe to bypass this safety check.",
             human_bytes(required),
-            cpu_backend_count,
-            threads,
+            total_cpu_lanes,
             human_bytes(budget.effective_total),
         );
     }
 
     if required > budget.effective_available && !allow_oversubscribe {
         bail!(
-            "configured CPU lanes need ~{} RAM ({} backend(s) * {} thread(s) * 2GB), but currently available memory is ~{} (effective limit ~{}). Reduce CPU lanes or pass --allow-oversubscribe if you accept potential swap/OOM risk.",
+            "configured CPU lanes need ~{} RAM ({} CPU lane(s) * 2GB), but currently available memory is ~{} (effective limit ~{}). Reduce CPU lanes or pass --allow-oversubscribe if you accept potential swap/OOM risk.",
             human_bytes(required),
-            cpu_backend_count,
-            threads,
+            total_cpu_lanes,
             human_bytes(budget.effective_available),
             human_bytes(budget.effective_total),
         );
@@ -625,6 +795,8 @@ mod tests {
             nvidia_devices: Vec::new(),
             threads: 1,
             cpu_affinity: CpuAffinityMode::Auto,
+            cpu_threads_per_instance: Vec::new(),
+            cpu_affinity_per_instance: Vec::new(),
             allow_oversubscribe: false,
             refresh_secs: 20,
             request_timeout_secs: 10,
@@ -634,8 +806,11 @@ mod tests {
             backend_event_capacity: 1024,
             hash_poll_ms: 200,
             backend_assign_timeout_ms: 1000,
+            backend_assign_timeout_ms_per_instance: Vec::new(),
             backend_assign_timeout_strikes: 3,
+            backend_assign_timeout_strikes_per_instance: Vec::new(),
             backend_control_timeout_ms: 60_000,
+            backend_control_timeout_ms_per_instance: Vec::new(),
             allow_best_effort_deadlines: false,
             prefetch_wait_ms: 250,
             tip_listener_join_wait_ms: 250,
@@ -702,29 +877,67 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_backends_preserves_order() {
-        let out = dedupe_backends(&[BackendKind::Cpu, BackendKind::Nvidia, BackendKind::Cpu]);
-        assert_eq!(out, vec![BackendKind::Cpu, BackendKind::Nvidia]);
+    fn duplicate_backends_are_preserved_for_instance_shaping() {
+        let out = expand_backend_specs(
+            &[BackendKind::Cpu, BackendKind::Cpu],
+            &[],
+            1,
+            CpuAffinityMode::Auto,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("duplicate CPU backends should be preserved");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].kind, BackendKind::Cpu);
+        assert_eq!(out[1].kind, BackendKind::Cpu);
     }
 
     #[test]
     fn expand_backend_specs_expands_nvidia_devices() {
-        let out = expand_backend_specs(&[BackendKind::Cpu, BackendKind::Nvidia], &[2, 0, 2])
-            .expect("backend specs should parse");
+        let out = expand_backend_specs(
+            &[BackendKind::Cpu, BackendKind::Nvidia],
+            &[2, 0, 2],
+            1,
+            CpuAffinityMode::Auto,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("backend specs should parse");
         assert_eq!(
             out,
             vec![
                 BackendSpec {
                     kind: BackendKind::Cpu,
-                    device_index: None
+                    device_index: None,
+                    cpu_threads: Some(1),
+                    cpu_affinity: Some(CpuAffinityMode::Auto),
+                    assign_timeout_override: None,
+                    control_timeout_override: None,
+                    assign_timeout_strikes_override: None,
                 },
                 BackendSpec {
                     kind: BackendKind::Nvidia,
-                    device_index: Some(2)
+                    device_index: Some(2),
+                    cpu_threads: None,
+                    cpu_affinity: None,
+                    assign_timeout_override: None,
+                    control_timeout_override: None,
+                    assign_timeout_strikes_override: None,
                 },
                 BackendSpec {
                     kind: BackendKind::Nvidia,
-                    device_index: Some(0)
+                    device_index: Some(0),
+                    cpu_threads: None,
+                    cpu_affinity: None,
+                    assign_timeout_override: None,
+                    control_timeout_override: None,
+                    assign_timeout_strikes_override: None,
                 }
             ]
         );
@@ -732,9 +945,63 @@ mod tests {
 
     #[test]
     fn expand_backend_specs_requires_nvidia_backend_for_devices() {
-        let err = expand_backend_specs(&[BackendKind::Cpu], &[0])
-            .expect_err("nvidia devices without backend should fail");
+        let err = expand_backend_specs(
+            &[BackendKind::Cpu],
+            &[0],
+            1,
+            CpuAffinityMode::Auto,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect_err("nvidia devices without backend should fail");
         assert!(format!("{err:#}").contains("--nvidia-devices requires selecting nvidia"));
+    }
+
+    #[test]
+    fn expand_backend_specs_applies_cpu_instance_overrides() {
+        let out = expand_backend_specs(
+            &[BackendKind::Cpu, BackendKind::Cpu],
+            &[],
+            2,
+            CpuAffinityMode::Auto,
+            &[3, 5],
+            &[CpuAffinityMode::Off, CpuAffinityMode::Auto],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("cpu instance overrides should apply");
+
+        assert_eq!(out[0].cpu_threads, Some(3));
+        assert_eq!(out[0].cpu_affinity, Some(CpuAffinityMode::Off));
+        assert_eq!(out[1].cpu_threads, Some(5));
+        assert_eq!(out[1].cpu_affinity, Some(CpuAffinityMode::Auto));
+    }
+
+    #[test]
+    fn expand_backend_specs_applies_per_instance_timeout_overrides() {
+        let out = expand_backend_specs(
+            &[BackendKind::Cpu, BackendKind::Nvidia],
+            &[],
+            1,
+            CpuAffinityMode::Auto,
+            &[],
+            &[],
+            &[900, 1500],
+            &[30_000, 90_000],
+            &[2, 4],
+        )
+        .expect("timeout overrides should apply");
+
+        assert_eq!(out[0].assign_timeout_override, Some(Duration::from_millis(900)));
+        assert_eq!(out[1].assign_timeout_override, Some(Duration::from_millis(1500)));
+        assert_eq!(out[0].control_timeout_override, Some(Duration::from_millis(30_000)));
+        assert_eq!(out[1].control_timeout_override, Some(Duration::from_millis(90_000)));
+        assert_eq!(out[0].assign_timeout_strikes_override, Some(2));
+        assert_eq!(out[1].assign_timeout_strikes_override, Some(4));
     }
 
     #[test]

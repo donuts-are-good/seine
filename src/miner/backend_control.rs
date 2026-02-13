@@ -179,20 +179,18 @@ fn control_backend_slots(
     backends: &mut Vec<BackendSlot>,
     mode: RuntimeMode,
     include_fence: bool,
-    control_timeout: Duration,
+    _control_timeout: Duration,
     backend_executor: &backend_executor::BackendExecutor,
 ) -> Result<RuntimeBackendEventAction> {
     if backends.is_empty() {
         return Ok(RuntimeBackendEventAction::None);
     }
 
-    let timeout = control_timeout.max(Duration::from_millis(1));
     let mut failures = BackendFailureMap::new();
 
     let (mut survivors, cancel_failures) = run_backend_control_phase(
         std::mem::take(backends),
         BackendControlPhase::Cancel,
-        timeout,
         backend_executor,
     );
     merge_backend_failures(&mut failures, cancel_failures);
@@ -201,7 +199,6 @@ fn control_backend_slots(
         let (after_fence, fence_failures) = run_backend_control_phase(
             survivors,
             BackendControlPhase::Fence,
-            timeout,
             backend_executor,
         );
         survivors = after_fence;
@@ -292,14 +289,12 @@ impl BackendControlPhase {
 fn run_backend_control_phase(
     slots: Vec<BackendSlot>,
     phase: BackendControlPhase,
-    timeout: Duration,
     backend_executor: &backend_executor::BackendExecutor,
 ) -> (Vec<BackendSlot>, BackendFailureMap) {
     if slots.is_empty() {
         return (Vec::new(), BackendFailureMap::new());
     }
 
-    let timeout = timeout.max(Duration::from_millis(1));
     let expected = slots.len();
     let mut slots_by_idx: Vec<Option<BackendSlot>> = slots.into_iter().map(Some).collect();
     let backend_tasks = slots_by_idx
@@ -315,10 +310,11 @@ fn run_backend_control_phase(
                     BackendControlPhase::Cancel => BackendTaskKind::Cancel,
                     BackendControlPhase::Fence => BackendTaskKind::Fence,
                 },
+                timeout: slot.runtime_policy.control_timeout,
             })
         })
         .collect();
-    let mut outcomes = backend_executor.dispatch_backend_tasks(backend_tasks, timeout);
+    let mut outcomes = backend_executor.dispatch_backend_tasks(backend_tasks);
     if outcomes.len() < expected {
         outcomes.resize_with(expected, || None);
     }
@@ -331,6 +327,7 @@ fn run_backend_control_phase(
         let Some(slot) = slots_by_idx.get_mut(idx).and_then(Option::take) else {
             continue;
         };
+        let timeout = slot.runtime_policy.control_timeout.max(Duration::from_millis(1));
         let backend_id = slot.id;
         let backend = slot.backend.name();
         match outcome_slot.take() {

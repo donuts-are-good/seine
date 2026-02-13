@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use blocknet_pow_spec::POW_HEADER_BASE_LEN;
 use crossbeam_channel::Receiver;
 
@@ -15,7 +15,7 @@ use crate::types::{
     decode_hex, parse_target, template_difficulty, template_height, BlockTemplateResponse,
 };
 
-use super::hash_poll::{build_backend_poll_state, next_backend_poll_deadline};
+use super::hash_poll::build_backend_poll_state;
 use super::mining_tui::{
     init_tui_display, render_tui_now, set_tui_state_label, update_tui, RoundUiView, TuiDisplay,
 };
@@ -35,10 +35,9 @@ use super::tui::TuiState;
 use super::ui::{error, info, mined, success, warn};
 use super::wallet::auto_load_wallet;
 use super::{
-    cancel_backend_slots, collect_backend_hashes, collect_round_backend_samples, distribute_work,
-    format_round_backend_telemetry, next_event_wait, next_work_id, quiesce_backend_slots,
-    total_lanes, BackendRoundTelemetry, BackendSlot, RuntimeBackendEventAction, RuntimeMode,
-    TEMPLATE_RETRY_DELAY,
+    cancel_backend_slots, collect_backend_hashes, distribute_work, format_round_backend_telemetry,
+    next_work_id, quiesce_backend_slots, total_lanes, BackendRoundTelemetry, BackendSlot,
+    RuntimeBackendEventAction, RuntimeMode, TEMPLATE_RETRY_DELAY,
 };
 
 type BackendEventAction = RuntimeBackendEventAction;
@@ -521,7 +520,6 @@ fn dispatch_round_assignments(
             target: inputs.target,
             reservation: inputs.reservation,
             stop_at: inputs.stop_at,
-            assignment_timeout: inputs.cfg.backend_assign_timeout,
             backend_weights: work_distribution_weights(
                 inputs.cfg.work_allocation,
                 inputs.backend_weights,
@@ -1125,15 +1123,44 @@ impl<'a> RoundRuntime<'a> {
             && solved.is_none()
             && !stale_tip_event
         {
-            let hashes_before = round_hashes;
-            let collected = collect_round_backend_samples(
+            if self.tip_signal.is_some_and(TipSignal::take_stale) {
+                stale_tip_event = true;
+                update_tui(
+                    self.tui,
+                    self.stats,
+                    RoundUiView {
+                        backends: self.backends,
+                        round_backend_hashes: &round_backend_hashes,
+                        round_hashes,
+                        round_start: input.round_start,
+                        height: input.height,
+                        difficulty: input.difficulty,
+                        epoch: input.epoch,
+                        state_label: "stale-tip",
+                    },
+                );
+                continue;
+            }
+
+            let stats_deadline = if self.tui.is_none() {
+                Some(*self.last_stats_print + self.cfg.stats_interval)
+            } else {
+                None
+            };
+            let step = super::round_driver::drive_round_step(
                 self.backends,
+                self.backend_events,
                 self.backend_executor,
                 self.cfg.hash_poll_interval,
                 &mut backend_poll_state,
                 &mut round_backend_hashes,
                 &mut round_backend_telemetry,
-            );
+                input.stop_at,
+                stats_deadline,
+            )?;
+
+            let hashes_before = round_hashes;
+            let collected = step.collected_hashes;
             if collected > 0 {
                 self.stats.add_hashes(collected);
                 round_hashes = round_hashes.saturating_add(collected);
@@ -1155,13 +1182,6 @@ impl<'a> RoundRuntime<'a> {
                 );
             }
 
-            maybe_print_stats(
-                self.stats,
-                self.last_stats_print,
-                self.cfg.stats_interval,
-                self.tui.is_none(),
-            );
-
             if self.tip_signal.is_some_and(TipSignal::take_stale) {
                 stale_tip_event = true;
                 update_tui(
@@ -1181,31 +1201,25 @@ impl<'a> RoundRuntime<'a> {
                 continue;
             }
 
-            let next_hash_poll_at = next_backend_poll_deadline(&backend_poll_state);
-            let wait_for = next_event_wait(
-                input.stop_at,
-                *self.last_stats_print,
+            maybe_print_stats(
+                self.stats,
+                self.last_stats_print,
                 self.cfg.stats_interval,
-                next_hash_poll_at,
                 self.tui.is_none(),
             );
 
-            crossbeam_channel::select! {
-                recv(self.backend_events) -> event => {
-                    let event = event.map_err(|_| anyhow!("backend event channel closed"))?;
-                    if handle_mining_backend_event(
-                        event,
-                        input.epoch,
-                        &mut solved,
-                        self.deferred_solutions,
-                        self.backends,
-                        self.backend_executor,
-                    )? == BackendEventAction::TopologyChanged
-                    {
-                        topology_changed = true;
-                    }
+            if let Some(event) = step.event {
+                if handle_mining_backend_event(
+                    event,
+                    input.epoch,
+                    &mut solved,
+                    self.deferred_solutions,
+                    self.backends,
+                    self.backend_executor,
+                )? == BackendEventAction::TopologyChanged
+                {
+                    topology_changed = true;
                 }
-                default(wait_for) => {}
             }
 
             if topology_changed
@@ -1223,7 +1237,6 @@ impl<'a> RoundRuntime<'a> {
                         header_base: Arc::clone(input.header_base),
                         target: input.target,
                         stop_at: input.stop_at,
-                        assignment_timeout: self.cfg.backend_assign_timeout,
                         control_timeout: self.cfg.backend_control_timeout,
                         mode: RuntimeMode::Mining,
                         work_allocation: self.cfg.work_allocation,
@@ -1301,7 +1314,6 @@ impl<'a> RoundRuntime<'a> {
                         header_base: Arc::clone(input.header_base),
                         target: input.target,
                         stop_at: input.stop_at,
-                        assignment_timeout: self.cfg.backend_assign_timeout,
                         control_timeout: self.cfg.backend_control_timeout,
                         mode: RuntimeMode::Mining,
                         work_allocation: self.cfg.work_allocation,
@@ -1959,6 +1971,7 @@ mod tests {
             id: 1,
             backend: Arc::new(NoopBackend::new("cpu")),
             lanes: 1,
+            runtime_policy: crate::miner::BackendRuntimePolicy::default(),
         }];
 
         let action = handle_mining_backend_event(
@@ -1996,6 +2009,7 @@ mod tests {
             id: 1,
             backend: Arc::new(NoopBackend::new("cpu")),
             lanes: 1,
+            runtime_policy: crate::miner::BackendRuntimePolicy::default(),
         }];
 
         let action = handle_mining_backend_event(
@@ -2030,6 +2044,7 @@ mod tests {
             id: 1,
             backend: Arc::new(NoopBackend::new("cpu")),
             lanes: 1,
+            runtime_policy: crate::miner::BackendRuntimePolicy::default(),
         }];
 
         event_tx
@@ -2388,11 +2403,13 @@ mod tests {
                 id: 1,
                 backend: Arc::new(NoopBackend::new("cpu")),
                 lanes: 1,
+                runtime_policy: crate::miner::BackendRuntimePolicy::default(),
             },
             BackendSlot {
                 id: 2,
                 backend: Arc::new(NoopBackend::new("cpu")),
                 lanes: 1,
+                runtime_policy: crate::miner::BackendRuntimePolicy::default(),
             },
         ];
 
@@ -2443,11 +2460,13 @@ mod tests {
                 id: 1,
                 backend: Arc::new(NoopBackend::new("cpu")),
                 lanes: 1,
+                runtime_policy: crate::miner::BackendRuntimePolicy::default(),
             },
             BackendSlot {
                 id: 2,
                 backend: Arc::new(NoopBackend::new("cpu")),
                 lanes: 1,
+                runtime_policy: crate::miner::BackendRuntimePolicy::default(),
             },
         ];
         let mut weights = seed_backend_weights(&backends);
@@ -2477,6 +2496,7 @@ mod tests {
             id: 7,
             backend: Arc::new(NoopBackend::new("cpu")),
             lanes: 1,
+            runtime_policy: crate::miner::BackendRuntimePolicy::default(),
         }];
         let mut weights = seed_backend_weights(&backends);
         let mut round_hashes = BTreeMap::new();
@@ -2504,6 +2524,7 @@ mod tests {
             id: 5,
             backend: Arc::new(NoopBackend::new("cpu")),
             lanes: 1,
+            runtime_policy: crate::miner::BackendRuntimePolicy::default(),
         }];
         let mut weights = seed_backend_weights(&backends);
         let mut round_hashes = BTreeMap::new();
@@ -2533,6 +2554,7 @@ mod tests {
             id: 15,
             backend: Arc::new(NoopBackend::new("cpu")),
             lanes: 1,
+            runtime_policy: crate::miner::BackendRuntimePolicy::default(),
         }];
         let mut weights = seed_backend_weights(&backends);
         let mut round_hashes = BTreeMap::new();
@@ -2563,6 +2585,7 @@ mod tests {
             id: 3,
             backend: Arc::new(NoopBackend::new("cpu")),
             lanes: 1,
+            runtime_policy: crate::miner::BackendRuntimePolicy::default(),
         }];
         let mut weights = seed_backend_weights(&backends);
         let mut round_hashes = BTreeMap::new();
@@ -2601,6 +2624,7 @@ mod tests {
             id: 9,
             backend: Arc::new(NoopBackend::new("cpu")),
             lanes: 3,
+            runtime_policy: crate::miner::BackendRuntimePolicy::default(),
         }];
         let mut weights = BTreeMap::new();
         weights.insert(9, 999.0);

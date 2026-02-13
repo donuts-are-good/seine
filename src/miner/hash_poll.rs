@@ -137,6 +137,7 @@ mod tests {
             id,
             backend,
             lanes: 1,
+            runtime_policy: crate::miner::BackendRuntimePolicy::default(),
         }
     }
 

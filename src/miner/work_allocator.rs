@@ -29,6 +29,8 @@ struct DispatchTask {
     backend_handle: Arc<dyn PowBackend>,
     assignments: DispatchAssignments,
     span_end_offset: u64,
+    assignment_timeout: Duration,
+    assignment_timeout_strikes: u32,
 }
 
 struct DispatchFailure {
@@ -100,6 +102,8 @@ pub(super) fn distribute_work(
                 backend_handle: Arc::clone(&slot.backend),
                 assignments,
                 span_end_offset: chunk_offset,
+                assignment_timeout: slot.runtime_policy.assignment_timeout,
+                assignment_timeout_strikes: slot.runtime_policy.assignment_timeout_strikes,
             });
             slots_by_idx.push(Some(slot));
             chunk_start = chunk_start.wrapping_add(nonce_count);
@@ -108,7 +112,6 @@ pub(super) fn distribute_work(
         let (survivors, failures, attempt_consumed_span) = dispatch_assignment_tasks(
             dispatch_tasks,
             slots_by_idx,
-            options.assignment_timeout,
             backend_executor,
         );
         *backends = survivors;
@@ -196,24 +199,26 @@ pub(super) fn distribute_work(
 fn dispatch_assignment_tasks(
     tasks: Vec<DispatchTask>,
     mut slots_by_idx: Vec<Option<BackendSlot>>,
-    timeout: Duration,
     backend_executor: &backend_executor::BackendExecutor,
 ) -> (Vec<BackendSlot>, Vec<DispatchFailure>, u64) {
     if tasks.is_empty() {
         return (Vec::new(), Vec::new(), 0);
     }
 
-    let timeout = timeout.max(Duration::from_millis(1));
     let expected = tasks.len().max(slots_by_idx.len());
     if slots_by_idx.len() < expected {
         slots_by_idx.resize_with(expected, || None);
     }
 
     let mut span_end_offsets = BTreeMap::new();
+    let mut task_timeouts = BTreeMap::new();
+    let mut task_timeout_strikes = BTreeMap::new();
     let backend_tasks = tasks
         .into_iter()
         .map(|task| {
             span_end_offsets.insert(task.idx, task.span_end_offset);
+            task_timeouts.insert(task.idx, task.assignment_timeout.max(Duration::from_millis(1)));
+            task_timeout_strikes.insert(task.idx, task.assignment_timeout_strikes.max(1));
             BackendTask {
                 idx: task.idx,
                 backend_id: task.backend_id,
@@ -223,10 +228,11 @@ fn dispatch_assignment_tasks(
                     DispatchAssignments::Single(work) => BackendTaskKind::Assign(work),
                     DispatchAssignments::Batch(batch) => BackendTaskKind::AssignBatch(batch),
                 },
+                timeout: task.assignment_timeout.max(Duration::from_millis(1)),
             }
         })
         .collect();
-    let mut outcomes = backend_executor.dispatch_backend_tasks(backend_tasks, timeout);
+    let mut outcomes = backend_executor.dispatch_backend_tasks(backend_tasks);
     if outcomes.len() < expected {
         outcomes.resize_with(expected, || None);
     }
@@ -240,6 +246,11 @@ fn dispatch_assignment_tasks(
             continue;
         };
         let span_end_offset = span_end_offsets.get(&idx).copied().unwrap_or(0);
+        let timeout = task_timeouts
+            .get(&idx)
+            .copied()
+            .unwrap_or_else(|| Duration::from_millis(1));
+        let timeout_strikes = task_timeout_strikes.get(&idx).copied().unwrap_or(1);
         let backend_id = slot.id;
         let backend = slot.backend.name();
         match outcome_slot.take() {
@@ -261,8 +272,11 @@ fn dispatch_assignment_tasks(
             }
             Some(BackendTaskDispatchResult::TimedOut(BackendTaskTimeoutKind::Execution)) | None => {
                 consumed_span = consumed_span.max(span_end_offset);
-                let timeout_decision =
-                    backend_executor.note_assignment_timeout(backend_id, &slot.backend);
+                let timeout_decision = backend_executor.note_assignment_timeout_with_threshold(
+                    backend_id,
+                    &slot.backend,
+                    timeout_strikes,
+                );
                 let append_semantics =
                     backend_capabilities(&slot).assignment_semantics == AssignmentSemantics::Append;
                 if timeout_decision.should_quarantine || append_semantics {
@@ -305,8 +319,11 @@ fn dispatch_assignment_tasks(
                 }
             }
             Some(BackendTaskDispatchResult::TimedOut(BackendTaskTimeoutKind::Enqueue)) => {
-                let timeout_decision =
-                    backend_executor.note_assignment_timeout(backend_id, &slot.backend);
+                let timeout_decision = backend_executor.note_assignment_timeout_with_threshold(
+                    backend_id,
+                    &slot.backend,
+                    timeout_strikes,
+                );
                 let append_semantics =
                     backend_capabilities(&slot).assignment_semantics == AssignmentSemantics::Append;
                 if timeout_decision.should_quarantine || append_semantics {

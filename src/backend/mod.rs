@@ -86,6 +86,9 @@ pub mod nvidia {
                 preferred_iters_per_lane: Some(1),
                 preferred_allocation_iters_per_lane: None,
                 preferred_hash_poll_interval: Some(Duration::from_millis(50)),
+                preferred_assignment_timeout: None,
+                preferred_control_timeout: None,
+                preferred_assignment_timeout_strikes: None,
                 max_inflight_assignments: 1,
                 deadline_support: DeadlineSupport::BestEffort,
                 assignment_semantics: AssignmentSemantics::Replace,
@@ -257,6 +260,12 @@ pub struct BackendCapabilities {
     /// Preferred backend hash-poll cadence for telemetry/accounting.
     /// Runtime clamps this against operator-configured polling limits.
     pub preferred_hash_poll_interval: Option<Duration>,
+    /// Preferred backend-specific assignment-dispatch timeout.
+    pub preferred_assignment_timeout: Option<Duration>,
+    /// Preferred backend-specific cancel/fence timeout.
+    pub preferred_control_timeout: Option<Duration>,
+    /// Preferred backend-specific assignment timeout strike threshold.
+    pub preferred_assignment_timeout_strikes: Option<u32>,
     /// Maximum number of in-flight assignments this backend can queue efficiently.
     /// Runtime may split one reservation into this many chunks for dispatch.
     pub max_inflight_assignments: u32,
@@ -278,6 +287,9 @@ impl Default for BackendCapabilities {
             preferred_iters_per_lane: None,
             preferred_allocation_iters_per_lane: None,
             preferred_hash_poll_interval: None,
+            preferred_assignment_timeout: None,
+            preferred_control_timeout: None,
+            preferred_assignment_timeout_strikes: None,
             max_inflight_assignments: 1,
             deadline_support: DeadlineSupport::BestEffort,
             assignment_semantics: AssignmentSemantics::Replace,
@@ -296,6 +308,16 @@ pub fn normalize_backend_capabilities(
     if capabilities.max_inflight_assignments > 1 && !supports_assignment_batching {
         capabilities.max_inflight_assignments = 1;
     }
+
+    capabilities.preferred_assignment_timeout = capabilities
+        .preferred_assignment_timeout
+        .map(|timeout| timeout.max(Duration::from_millis(1)));
+    capabilities.preferred_control_timeout = capabilities
+        .preferred_control_timeout
+        .map(|timeout| timeout.max(Duration::from_millis(1)));
+    capabilities.preferred_assignment_timeout_strikes = capabilities
+        .preferred_assignment_timeout_strikes
+        .map(|strikes| strikes.max(1));
 
     capabilities.nonblocking_poll_min = capabilities
         .nonblocking_poll_min

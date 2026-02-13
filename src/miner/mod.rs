@@ -5,6 +5,7 @@ mod bench;
 mod hash_poll;
 mod mining;
 mod mining_tui;
+mod round_driver;
 mod round_control;
 mod runtime;
 mod scheduler;
@@ -35,7 +36,7 @@ use crate::backend::{
     BackendInstanceId, BackendTelemetry, DeadlineSupport, PowBackend, PreemptionGranularity,
     WORK_ID_MAX,
 };
-use crate::config::{BackendKind, Config, UiMode, WorkAllocation};
+use crate::config::{BackendKind, BackendSpec, Config, UiMode, WorkAllocation};
 use scheduler::NonceReservation;
 use stats::{format_hashrate, Stats};
 use tui::{new_tui_state, TuiState};
@@ -44,10 +45,28 @@ use ui::{info, warn};
 const TEMPLATE_RETRY_DELAY: Duration = Duration::from_secs(2);
 const MIN_EVENT_WAIT: Duration = Duration::from_millis(1);
 
+#[derive(Debug, Clone, Copy)]
+struct BackendRuntimePolicy {
+    assignment_timeout: Duration,
+    assignment_timeout_strikes: u32,
+    control_timeout: Duration,
+}
+
+impl Default for BackendRuntimePolicy {
+    fn default() -> Self {
+        Self {
+            assignment_timeout: Duration::from_millis(1_000),
+            assignment_timeout_strikes: 3,
+            control_timeout: Duration::from_millis(60_000),
+        }
+    }
+}
+
 struct BackendSlot {
     id: BackendInstanceId,
     backend: Arc<dyn PowBackend>,
     lanes: u64,
+    runtime_policy: BackendRuntimePolicy,
 }
 
 struct DistributeWorkOptions<'a> {
@@ -57,7 +76,6 @@ struct DistributeWorkOptions<'a> {
     target: [u8; 32],
     reservation: NonceReservation,
     stop_at: Instant,
-    assignment_timeout: Duration,
     backend_weights: Option<&'a BTreeMap<BackendInstanceId, f64>>,
 }
 
@@ -112,7 +130,7 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
 
     let backend_instances = build_backend_instances(cfg);
     let (mut backends, backend_events) =
-        activate_backends(backend_instances, cfg.backend_event_capacity)?;
+        activate_backends(backend_instances, cfg.backend_event_capacity, cfg)?;
     enforce_deadline_policy(
         &mut backends,
         cfg.allow_best_effort_deadlines,
@@ -211,6 +229,10 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
             cfg.submit_join_wait.as_millis(),
             sub_round_rebalance,
         ),
+    );
+    info(
+        "MINER",
+        format!("timeout-policy | {}", backend_timeout_profiles(&backends)),
     );
     if cfg.strict_round_accounting {
         let constrained: Vec<String> = backends
@@ -344,29 +366,35 @@ fn build_tui_state(
     tui_state
 }
 
-fn build_backend_instances(cfg: &Config) -> Vec<Arc<dyn PowBackend>> {
+fn build_backend_instances(cfg: &Config) -> Vec<(BackendSpec, Arc<dyn PowBackend>)> {
     cfg.backend_specs
         .iter()
-        .map(|backend_spec| match backend_spec.kind {
-            BackendKind::Cpu => {
-                Arc::new(CpuBackend::new(cfg.threads, cfg.cpu_affinity)) as Arc<dyn PowBackend>
-            }
-            BackendKind::Nvidia => {
-                Arc::new(NvidiaBackend::new(backend_spec.device_index)) as Arc<dyn PowBackend>
-            }
+        .copied()
+        .map(|backend_spec| {
+            let backend = match backend_spec.kind {
+                BackendKind::Cpu => Arc::new(CpuBackend::new(
+                    backend_spec.cpu_threads.unwrap_or(cfg.threads),
+                    backend_spec.cpu_affinity.unwrap_or(cfg.cpu_affinity),
+                )) as Arc<dyn PowBackend>,
+                BackendKind::Nvidia => {
+                    Arc::new(NvidiaBackend::new(backend_spec.device_index)) as Arc<dyn PowBackend>
+                }
+            };
+            (backend_spec, backend)
         })
         .collect()
 }
 
 fn activate_backends(
-    mut backends: Vec<Arc<dyn PowBackend>>,
+    mut backends: Vec<(BackendSpec, Arc<dyn PowBackend>)>,
     event_capacity: usize,
+    cfg: &Config,
 ) -> Result<(Vec<BackendSlot>, Receiver<BackendEvent>)> {
     let mut active = Vec::new();
     let (event_tx, event_rx) = bounded::<BackendEvent>(event_capacity.max(1));
     let mut next_backend_id: BackendInstanceId = 1;
 
-    for backend in backends.drain(..) {
+    for (backend_spec, backend) in backends.drain(..) {
         let backend_id = next_backend_id;
         next_backend_id = next_backend_id.saturating_add(1);
         let backend_name = backend.name();
@@ -416,10 +444,12 @@ fn activate_backends(
                     backend.stop();
                     continue;
                 }
+                let runtime_policy = backend_runtime_policy(cfg, &backend_spec, capabilities);
                 active.push(BackendSlot {
                     id: backend_id,
                     backend,
                     lanes,
+                    runtime_policy,
                 });
             }
             Err(err) => {
@@ -936,7 +966,7 @@ fn backend_chunk_profiles(backends: &[BackendSlot], default_iters_per_lane: u64)
                 _ => "default".to_string(),
             };
             format!(
-                "{}#{}=alloc:{} dispatch:{} iters/lane inflight={} worker_q={} poll_hint={} nb_poll={} deadline={} assign={} exec={}",
+                "{}#{}=alloc:{} dispatch:{} iters/lane inflight={} worker_q={} poll_hint={} nb_poll={} deadline={} assign={} exec={} assign_timeout={}ms control_timeout={}ms assign_strikes={}",
                 slot.backend.name(),
                 slot.id,
                 allocation_hint,
@@ -948,6 +978,26 @@ fn backend_chunk_profiles(backends: &[BackendSlot], default_iters_per_lane: u64)
                 deadline_support,
                 assignment_semantics,
                 execution_model,
+                slot.runtime_policy.assignment_timeout.as_millis(),
+                slot.runtime_policy.control_timeout.as_millis(),
+                slot.runtime_policy.assignment_timeout_strikes,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn backend_timeout_profiles(backends: &[BackendSlot]) -> String {
+    backends
+        .iter()
+        .map(|slot| {
+            format!(
+                "{}#{}=assign:{}ms strikes:{} control:{}ms",
+                slot.backend.name(),
+                slot.id,
+                slot.runtime_policy.assignment_timeout.as_millis(),
+                slot.runtime_policy.assignment_timeout_strikes,
+                slot.runtime_policy.control_timeout.as_millis(),
             )
         })
         .collect::<Vec<_>>()
@@ -983,6 +1033,33 @@ fn backend_capabilities_for_start(
         );
     }
     Ok(capabilities)
+}
+
+fn backend_runtime_policy(
+    cfg: &Config,
+    backend_spec: &BackendSpec,
+    capabilities: BackendCapabilities,
+) -> BackendRuntimePolicy {
+    let assignment_timeout = backend_spec
+        .assign_timeout_override
+        .or(capabilities.preferred_assignment_timeout)
+        .unwrap_or(cfg.backend_assign_timeout)
+        .max(Duration::from_millis(1));
+    let control_timeout = backend_spec
+        .control_timeout_override
+        .or(capabilities.preferred_control_timeout)
+        .unwrap_or(cfg.backend_control_timeout)
+        .max(Duration::from_millis(1));
+    let assignment_timeout_strikes = backend_spec
+        .assign_timeout_strikes_override
+        .or(capabilities.preferred_assignment_timeout_strikes)
+        .unwrap_or(cfg.backend_assign_timeout_strikes)
+        .max(1);
+    BackendRuntimePolicy {
+        assignment_timeout,
+        assignment_timeout_strikes,
+        control_timeout,
+    }
 }
 
 fn backend_capabilities(slot: &BackendSlot) -> BackendCapabilities {
@@ -1120,28 +1197,6 @@ fn format_round_backend_telemetry(
 
 fn total_lanes(backends: &[BackendSlot]) -> u64 {
     backends.iter().map(|slot| slot.lanes).sum::<u64>().max(1)
-}
-
-fn next_event_wait(
-    stop_at: Instant,
-    last_stats_print: Instant,
-    stats_interval: Duration,
-    next_hash_poll_at: Instant,
-    stats_enabled: bool,
-) -> Duration {
-    let now = Instant::now();
-    let until_stop = stop_at.saturating_duration_since(now);
-    let until_stats = if stats_enabled {
-        let next_stats_at = last_stats_print + stats_interval;
-        next_stats_at.saturating_duration_since(now)
-    } else {
-        until_stop
-    };
-    let until_hash_poll = next_hash_poll_at.saturating_duration_since(now);
-    until_stop
-        .min(until_stats)
-        .min(until_hash_poll)
-        .max(MIN_EVENT_WAIT)
 }
 
 fn next_work_id(next_id: &mut u64) -> u64 {
@@ -1351,6 +1406,9 @@ mod tests {
                 preferred_iters_per_lane: self.preferred_iters_per_lane,
                 preferred_allocation_iters_per_lane: self.preferred_allocation_iters_per_lane,
                 preferred_hash_poll_interval: self.preferred_hash_poll_interval,
+                preferred_assignment_timeout: None,
+                preferred_control_timeout: None,
+                preferred_assignment_timeout_strikes: None,
                 max_inflight_assignments: self.max_inflight_assignments.max(1),
                 deadline_support: self.deadline_support,
                 assignment_semantics: self.assignment_semantics,
@@ -1362,7 +1420,12 @@ mod tests {
     }
 
     fn slot(id: BackendInstanceId, lanes: u64, backend: Arc<dyn PowBackend>) -> BackendSlot {
-        BackendSlot { id, backend, lanes }
+        BackendSlot {
+            id,
+            backend,
+            lanes,
+            runtime_policy: BackendRuntimePolicy::default(),
+        }
     }
 
     fn wait_for_stop_call(state: &MockState, timeout: Duration) -> bool {
@@ -1388,6 +1451,58 @@ mod tests {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn test_config() -> Config {
+        Config {
+            api_url: "http://127.0.0.1:8332".to_string(),
+            token: Some("test-token".to_string()),
+            token_cookie_path: None,
+            wallet_password: None,
+            wallet_password_file: None,
+            backend_specs: vec![BackendSpec {
+                kind: BackendKind::Cpu,
+                device_index: None,
+                cpu_threads: Some(1),
+                cpu_affinity: Some(crate::config::CpuAffinityMode::Off),
+                assign_timeout_override: None,
+                control_timeout_override: None,
+                assign_timeout_strikes_override: None,
+            }],
+            threads: 1,
+            cpu_affinity: crate::config::CpuAffinityMode::Off,
+            refresh_interval: Duration::from_secs(20),
+            request_timeout: Duration::from_secs(10),
+            events_stream_timeout: Duration::from_secs(10),
+            events_idle_timeout: Duration::from_secs(90),
+            stats_interval: Duration::from_secs(10),
+            backend_event_capacity: 1024,
+            hash_poll_interval: Duration::from_millis(200),
+            backend_assign_timeout: Duration::from_millis(1_000),
+            backend_assign_timeout_strikes: 3,
+            backend_control_timeout: Duration::from_millis(60_000),
+            allow_best_effort_deadlines: false,
+            prefetch_wait: Duration::from_millis(250),
+            tip_listener_join_wait: Duration::from_millis(250),
+            submit_join_wait: Duration::from_millis(2_000),
+            strict_round_accounting: false,
+            start_nonce: 0,
+            nonce_iters_per_lane: 1 << 20,
+            work_allocation: WorkAllocation::Adaptive,
+            sub_round_rebalance_interval: None,
+            sse_enabled: true,
+            refresh_on_same_height: false,
+            ui_mode: crate::config::UiMode::Plain,
+            bench: false,
+            bench_kind: crate::config::BenchKind::Backend,
+            bench_secs: 20,
+            bench_rounds: 3,
+            bench_warmup_rounds: 0,
+            bench_output: None,
+            bench_baseline: None,
+            bench_fail_below_pct: None,
+            bench_baseline_policy: crate::config::BenchBaselinePolicy::Strict,
         }
     }
 
@@ -1518,7 +1633,6 @@ mod tests {
                     reserved_span: 40,
                 },
                 stop_at: Instant::now() + Duration::from_secs(1),
-                assignment_timeout: Duration::from_secs(1),
                 backend_weights: None,
             },
             &backend_executor,
@@ -1580,7 +1694,6 @@ mod tests {
                     reserved_span: 12,
                 },
                 stop_at: Instant::now() + Duration::from_secs(1),
-                assignment_timeout: Duration::from_secs(1),
                 backend_weights: None,
             },
             &backend_executor,
@@ -1619,6 +1732,7 @@ mod tests {
                     .with_assign_delay(Duration::from_millis(50)),
             ),
         )];
+        backends[0].runtime_policy.assignment_timeout = Duration::from_millis(5);
 
         let first_round = distribute_work(
             &mut backends,
@@ -1633,7 +1747,6 @@ mod tests {
                     reserved_span: 1,
                 },
                 stop_at: Instant::now() + Duration::from_secs(1),
-                assignment_timeout: Duration::from_millis(5),
                 backend_weights: None,
             },
             &backend_executor,
@@ -1656,7 +1769,6 @@ mod tests {
                     reserved_span: 1,
                 },
                 stop_at: Instant::now() + Duration::from_secs(1),
-                assignment_timeout: Duration::from_millis(5),
                 backend_weights: None,
             },
             &backend_executor,
@@ -1682,6 +1794,7 @@ mod tests {
                     .with_assign_delay(Duration::from_millis(50)),
             ),
         )];
+        backends[0].runtime_policy.assignment_timeout = Duration::from_millis(5);
 
         let additional_span = distribute_work(
             &mut backends,
@@ -1696,7 +1809,6 @@ mod tests {
                     reserved_span: 1,
                 },
                 stop_at: Instant::now() + Duration::from_secs(1),
-                assignment_timeout: Duration::from_millis(5),
                 backend_weights: None,
             },
             &backend_executor,
@@ -1725,6 +1837,7 @@ mod tests {
                     .with_assignment_semantics(crate::backend::AssignmentSemantics::Append),
             ),
         )];
+        backends[0].runtime_policy.assignment_timeout = Duration::from_millis(5);
 
         let err = distribute_work(
             &mut backends,
@@ -1739,7 +1852,6 @@ mod tests {
                     reserved_span: 1,
                 },
                 stop_at: Instant::now() + Duration::from_secs(1),
-                assignment_timeout: Duration::from_millis(5),
                 backend_weights: None,
             },
             &backend_executor,
@@ -1792,7 +1904,6 @@ mod tests {
                     reserved_span: 40,
                 },
                 stop_at: Instant::now() + Duration::from_secs(1),
-                assignment_timeout: Duration::from_secs(1),
                 backend_weights: None,
             },
             &backend_executor,
@@ -1815,12 +1926,28 @@ mod tests {
         let healthy_state = Arc::new(MockState::default());
         failed_state.fail_start.store(true, Ordering::Relaxed);
 
-        let instances: Vec<Arc<dyn PowBackend>> = vec![
-            Arc::new(MockBackend::new("cpu", 1, Arc::clone(&failed_state))),
-            Arc::new(MockBackend::new("cpu", 1, Arc::clone(&healthy_state))),
+        let cfg = test_config();
+        let backend_spec = BackendSpec {
+            kind: BackendKind::Cpu,
+            device_index: None,
+            cpu_threads: Some(1),
+            cpu_affinity: Some(crate::config::CpuAffinityMode::Off),
+            assign_timeout_override: None,
+            control_timeout_override: None,
+            assign_timeout_strikes_override: None,
+        };
+        let instances: Vec<(BackendSpec, Arc<dyn PowBackend>)> = vec![
+            (
+                backend_spec,
+                Arc::new(MockBackend::new("cpu", 1, Arc::clone(&failed_state))),
+            ),
+            (
+                backend_spec,
+                Arc::new(MockBackend::new("cpu", 1, Arc::clone(&healthy_state))),
+            ),
         ];
 
-        let (active, _events) = activate_backends(instances, 16)
+        let (active, _events) = activate_backends(instances, 16, &cfg)
             .expect("activation should continue with the healthy backend");
 
         assert_eq!(active.len(), 1);

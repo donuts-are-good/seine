@@ -56,6 +56,7 @@ pub(super) struct BackendTask {
     pub backend: &'static str,
     pub backend_handle: Arc<dyn PowBackend>,
     pub kind: BackendTaskKind,
+    pub timeout: Duration,
 }
 
 pub(super) struct BackendTaskOutcome {
@@ -718,8 +719,21 @@ impl BackendExecutor {
         backend_id: BackendInstanceId,
         backend_handle: &Arc<dyn PowBackend>,
     ) -> AssignmentTimeoutDecision {
+        self.note_assignment_timeout_with_threshold(
+            backend_id,
+            backend_handle,
+            self.assignment_timeout_threshold(),
+        )
+    }
+
+    pub(super) fn note_assignment_timeout_with_threshold(
+        &self,
+        backend_id: BackendInstanceId,
+        backend_handle: &Arc<dyn PowBackend>,
+        threshold: u32,
+    ) -> AssignmentTimeoutDecision {
         let key = backend_worker_key(backend_id, backend_handle);
-        let threshold = self.assignment_timeout_threshold();
+        let threshold = threshold.max(1);
         let mut strikes_map = match self.assignment_timeout_strikes.lock() {
             Ok(map) => map,
             Err(_) => {
@@ -752,7 +766,6 @@ impl BackendExecutor {
     pub(super) fn dispatch_backend_tasks(
         &self,
         tasks: Vec<BackendTask>,
-        timeout: Duration,
     ) -> Vec<Option<BackendTaskDispatchResult>> {
         if tasks.is_empty() {
             return Vec::new();
@@ -772,7 +785,6 @@ impl BackendExecutor {
             deadline: Instant,
         }
 
-        let timeout = timeout.max(Duration::from_millis(1));
         let expected_indices = tasks.iter().map(|task| task.idx).collect::<BTreeSet<_>>();
         let expected = expected_indices.len();
         let outcomes_len = expected_indices
@@ -802,6 +814,7 @@ impl BackendExecutor {
             let backend_handle = Arc::clone(&task.backend_handle);
             let idx = task.idx;
             let dispatch_started_at = Instant::now();
+            let timeout = effective_backend_task_timeout(&task.kind, task.timeout);
             let task_deadline = Instant::now()
                 .checked_add(timeout)
                 .unwrap_or_else(Instant::now);
@@ -1010,6 +1023,19 @@ impl BackendExecutor {
         }
 
         outcomes
+    }
+}
+
+fn effective_backend_task_timeout(kind: &BackendTaskKind, base_timeout: Duration) -> Duration {
+    let base_timeout = base_timeout.max(Duration::from_millis(1));
+    match kind {
+        BackendTaskKind::AssignBatch(batch) => {
+            let parts = (batch.len() as u32).max(1);
+            let scaled = base_timeout.saturating_mul(parts);
+            // Keep runaway queue hints bounded if a backend reports very deep inflight buffers.
+            scaled.min(base_timeout.saturating_mul(64))
+        }
+        _ => base_timeout,
     }
 }
 
@@ -1643,6 +1669,7 @@ mod tests {
                 backend: "noop",
                 backend_handle: Arc::clone(&backend),
                 kind: BackendTaskKind::Cancel,
+                timeout: Duration::from_millis(250),
             },
             BackendTask {
                 idx: 5,
@@ -1650,11 +1677,12 @@ mod tests {
                 backend: "noop",
                 backend_handle: backend,
                 kind: BackendTaskKind::Fence,
+                timeout: Duration::from_millis(250),
             },
         ];
 
         let started = Instant::now();
-        let outcomes = executor.dispatch_backend_tasks(tasks, Duration::from_millis(250));
+        let outcomes = executor.dispatch_backend_tasks(tasks);
         assert!(
             started.elapsed() < Duration::from_millis(200),
             "sparse indices should not block waiting for missing outcomes"
@@ -1707,6 +1735,7 @@ mod tests {
             id: 1,
             backend: Arc::clone(&active_backend),
             lanes: 1,
+            runtime_policy: crate::miner::BackendRuntimePolicy::default(),
         }];
         executor.prune(&backends);
 
@@ -1800,6 +1829,7 @@ mod tests {
                     backend: "stop-counter",
                     backend_handle: Arc::clone(&backend),
                     kind: BackendTaskKind::Cancel,
+                    timeout: Duration::from_secs(1),
                 },
                 deadline: Instant::now() + Duration::from_secs(1),
                 outcome_tx,
@@ -1831,6 +1861,7 @@ mod tests {
                     backend: "stop-counter",
                     backend_handle: Arc::clone(&backend),
                     kind: BackendTaskKind::Cancel,
+                    timeout: Duration::from_secs(1),
                 },
                 deadline: Instant::now() + Duration::from_secs(1),
                 outcome_tx,
@@ -2007,8 +2038,8 @@ mod tests {
                 backend: "slow-assign",
                 backend_handle: backend,
                 kind: BackendTaskKind::Assign(work),
+                timeout: Duration::from_millis(5),
             }],
-            Duration::from_millis(5),
         );
 
         assert!(
@@ -2053,12 +2084,15 @@ mod tests {
                     nonce_count: 1,
                 },
             }),
+            timeout: Duration::from_millis(5),
         };
 
-        let _ = executor.dispatch_backend_tasks(vec![make_task()], Duration::from_millis(5));
-        let _ = executor.dispatch_backend_tasks(vec![make_task()], Duration::from_millis(5));
+        let _ = executor.dispatch_backend_tasks(vec![make_task()]);
+        let _ = executor.dispatch_backend_tasks(vec![make_task()]);
 
-        let outcomes = executor.dispatch_backend_tasks(vec![make_task()], Duration::from_millis(1));
+        let mut enqueue_timeout_task = make_task();
+        enqueue_timeout_task.timeout = Duration::from_millis(1);
+        let outcomes = executor.dispatch_backend_tasks(vec![enqueue_timeout_task]);
         assert!(
             matches!(
                 outcomes[0],
@@ -2107,6 +2141,7 @@ mod tests {
                     backend: "slow-assign",
                     backend_handle: Arc::clone(&backend),
                     kind: BackendTaskKind::Assign(make_work()),
+                    timeout: Duration::from_secs(1),
                 },
                 deadline: Instant::now() + Duration::from_secs(1),
                 outcome_tx: prefill_outcome_tx.clone(),
@@ -2120,6 +2155,7 @@ mod tests {
                     backend: "slow-assign",
                     backend_handle: Arc::clone(&backend),
                     kind: BackendTaskKind::Assign(make_work()),
+                    timeout: Duration::from_secs(1),
                 },
                 deadline: Instant::now() + Duration::from_secs(1),
                 outcome_tx: prefill_outcome_tx,
@@ -2133,8 +2169,8 @@ mod tests {
                 backend: "slow-assign",
                 backend_handle: Arc::clone(&backend),
                 kind: BackendTaskKind::Assign(make_work()),
+                timeout: Duration::from_millis(1),
             }],
-            Duration::from_millis(1),
         );
 
         assert!(
@@ -2189,6 +2225,7 @@ mod tests {
                     backend: "slow-assign",
                     backend_handle: Arc::clone(&backend),
                     kind: BackendTaskKind::Assign(make_work()),
+                    timeout: Duration::from_secs(1),
                 },
                 deadline: Instant::now() + Duration::from_secs(1),
                 outcome_tx: prefill_outcome_tx.clone(),
@@ -2202,6 +2239,7 @@ mod tests {
                     backend: "slow-assign",
                     backend_handle: Arc::clone(&backend),
                     kind: BackendTaskKind::Assign(make_work()),
+                    timeout: Duration::from_secs(1),
                 },
                 deadline: Instant::now() + Duration::from_secs(1),
                 outcome_tx: prefill_outcome_tx,
@@ -2215,8 +2253,8 @@ mod tests {
                 backend: "slow-assign",
                 backend_handle: Arc::clone(&backend),
                 kind: BackendTaskKind::Cancel,
+                timeout: Duration::from_millis(20),
             }],
-            Duration::from_millis(20),
         );
 
         assert!(
@@ -2264,8 +2302,8 @@ mod tests {
                 backend: "slow-assign",
                 backend_handle: Arc::clone(&backend),
                 kind: BackendTaskKind::Assign(work),
+                timeout: Duration::from_millis(5),
             }],
-            Duration::from_millis(5),
         );
 
         assert!(matches!(
@@ -2393,8 +2431,8 @@ mod tests {
                 backend: "pending-assign",
                 backend_handle: backend_dyn,
                 kind: BackendTaskKind::Assign(work),
+                timeout: Duration::from_millis(25),
             }],
-            Duration::from_millis(25),
         );
 
         assert!(outcomes[0].as_ref().is_some_and(|outcome| matches!(
