@@ -581,6 +581,7 @@ impl BackendExecutor {
         Some((assignment_sender, control_sender))
     }
 
+    #[cfg(test)]
     fn worker_sender_for_backend(
         &self,
         backend_id: BackendInstanceId,

@@ -132,6 +132,7 @@ pub struct CpuBackend {
 }
 
 impl CpuBackend {
+    #[cfg(test)]
     pub fn new(threads: usize, affinity_mode: CpuAffinityMode) -> Self {
         Self::with_tuning(threads, affinity_mode, CpuBackendTuning::default())
     }
