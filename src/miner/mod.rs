@@ -30,8 +30,8 @@ use crate::api::ApiClient;
 use crate::backend::cpu::CpuBackend;
 use crate::backend::nvidia::NvidiaBackend;
 use crate::backend::{
-    BackendCapabilities, BackendEvent, BackendInstanceId, BackendTelemetry, DeadlineSupport,
-    PowBackend, PreemptionGranularity, WORK_ID_MAX,
+    normalize_backend_capabilities, BackendCapabilities, BackendEvent, BackendInstanceId,
+    BackendTelemetry, DeadlineSupport, PowBackend, PreemptionGranularity, WORK_ID_MAX,
 };
 use crate::config::{BackendKind, Config, UiMode, WorkAllocation};
 use scheduler::NonceReservation;
@@ -255,7 +255,12 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
     );
 
     let shutdown_requested = shutdown.load(Ordering::SeqCst);
-    stop_backend_slots(&mut backends, &backend_executor);
+    stop_backend_slots(
+        &mut backends,
+        &backend_executor,
+        cfg.backend_control_timeout,
+        "BACKEND",
+    );
     shutdown.store(true, Ordering::SeqCst);
     if let Some(listener) = tip_listener {
         if shutdown_requested {
@@ -389,7 +394,11 @@ fn activate_backends(
     Ok((active, event_rx))
 }
 
-fn start_backend_slots(backends: &mut Vec<BackendSlot>) -> Result<()> {
+fn start_backend_slots(
+    backends: &mut Vec<BackendSlot>,
+    backend_executor: &backend_executor::BackendExecutor,
+    stop_timeout: Duration,
+) -> Result<()> {
     let mut failed_indices = Vec::new();
     for (idx, slot) in backends.iter_mut().enumerate() {
         if let Err(err) = slot.backend.start() {
@@ -409,10 +418,20 @@ fn start_backend_slots(backends: &mut Vec<BackendSlot>) -> Result<()> {
         let slot = backends.remove(idx);
         let backend_name = slot.backend.name();
         let backend_id = slot.id;
-        slot.backend.stop();
+        backend_executor.quarantine_backend(backend_id, Arc::clone(&slot.backend));
         warn(
             "BENCH",
             format!("quarantined {backend_name}#{backend_id} after restart failure"),
+        );
+    }
+
+    if !backend_executor.wait_for_quarantine_drain(stop_timeout.max(Duration::from_millis(100))) {
+        warn(
+            "BENCH",
+            format!(
+                "backend restart cleanup exceeded {}ms; detached",
+                stop_timeout.max(Duration::from_millis(100)).as_millis()
+            ),
         );
     }
 
@@ -425,9 +444,22 @@ fn start_backend_slots(backends: &mut Vec<BackendSlot>) -> Result<()> {
 fn stop_backend_slots(
     backends: &mut [BackendSlot],
     backend_executor: &backend_executor::BackendExecutor,
+    stop_timeout: Duration,
+    log_tag: &'static str,
 ) {
-    for slot in backends {
-        slot.backend.stop();
+    for slot in backends.iter() {
+        backend_executor.quarantine_backend(slot.id, Arc::clone(&slot.backend));
+    }
+
+    let wait_timeout = stop_timeout.max(Duration::from_millis(100));
+    if !backend_executor.wait_for_quarantine_drain(wait_timeout) {
+        warn(
+            log_tag,
+            format!(
+                "backend stop did not quiesce within {}ms; detached",
+                wait_timeout.as_millis()
+            ),
+        );
     }
     backend_executor.clear();
 }
@@ -810,32 +842,6 @@ fn backend_capabilities(slot: &BackendSlot) -> BackendCapabilities {
         slot.backend.capabilities(),
         slot.backend.supports_assignment_batching(),
     )
-}
-
-fn normalize_backend_capabilities(
-    mut capabilities: BackendCapabilities,
-    supports_assignment_batching: bool,
-) -> BackendCapabilities {
-    capabilities.max_inflight_assignments = capabilities.max_inflight_assignments.max(1);
-    if capabilities.max_inflight_assignments > 1 && !supports_assignment_batching {
-        capabilities.max_inflight_assignments = 1;
-    }
-
-    capabilities.nonblocking_poll_min = capabilities
-        .nonblocking_poll_min
-        .map(|min_poll| min_poll.max(Duration::from_micros(10)));
-    capabilities.nonblocking_poll_max = capabilities
-        .nonblocking_poll_max
-        .map(|max_poll| max_poll.max(Duration::from_micros(10)));
-    if let (Some(min_poll), Some(max_poll)) = (
-        capabilities.nonblocking_poll_min,
-        capabilities.nonblocking_poll_max,
-    ) {
-        if max_poll < min_poll {
-            capabilities.nonblocking_poll_max = Some(min_poll);
-        }
-    }
-    capabilities
 }
 
 fn cpu_lane_count(backends: &[BackendSlot]) -> u64 {
@@ -1563,7 +1569,10 @@ mod tests {
             .expect("activation should continue with the healthy backend");
 
         assert_eq!(active.len(), 1);
-        assert_eq!(failed_state.stop_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            wait_for_stop_call(&failed_state, Duration::from_millis(250)),
+            "failing backend should be stopped after restart quarantine"
+        );
         assert_eq!(healthy_state.stop_calls.load(Ordering::Relaxed), 0);
     }
 
@@ -1586,11 +1595,16 @@ mod tests {
             ),
         ];
 
-        start_backend_slots(&mut backends).expect("restart should continue with healthy backend");
+        let backend_executor = backend_executor::BackendExecutor::new();
+        start_backend_slots(&mut backends, &backend_executor, Duration::from_secs(1))
+            .expect("restart should continue with healthy backend");
 
         assert_eq!(backends.len(), 1);
         assert_eq!(backends[0].id, 2);
-        assert_eq!(failed_state.stop_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            wait_for_stop_call(&failed_state, Duration::from_millis(250)),
+            "failing backend should be stopped after restart quarantine"
+        );
         assert_eq!(healthy_state.stop_calls.load(Ordering::Relaxed), 0);
     }
 

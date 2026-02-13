@@ -458,7 +458,12 @@ fn run_worker_benchmark(
     startup_banner(&lines);
 
     if restart_each_round {
-        stop_backend_slots(&mut backends, backend_executor);
+        stop_backend_slots(
+            &mut backends,
+            backend_executor,
+            cfg.backend_control_timeout,
+            "BENCH",
+        );
     }
 
     let result = run_worker_benchmark_inner(
@@ -470,7 +475,12 @@ fn run_worker_benchmark(
         &identity,
         backend_executor,
     );
-    stop_backend_slots(&mut backends, backend_executor);
+    stop_backend_slots(
+        &mut backends,
+        backend_executor,
+        cfg.backend_control_timeout,
+        "BENCH",
+    );
     result
 }
 
@@ -509,7 +519,7 @@ fn run_worker_benchmark_inner(
         };
 
         if restart_each_round {
-            start_backend_slots(backends)?;
+            start_backend_slots(backends, backend_executor, cfg.backend_control_timeout)?;
             ensure_worker_topology_identity(backends, identity, "backend restart")?;
         }
 
@@ -711,7 +721,12 @@ fn run_worker_benchmark_inner(
         );
 
         if restart_each_round {
-            stop_backend_slots(backends, backend_executor);
+            stop_backend_slots(
+                backends,
+                backend_executor,
+                cfg.backend_control_timeout,
+                "BENCH",
+            );
         }
     }
 

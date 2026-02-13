@@ -813,6 +813,302 @@ fn prepare_round_template(
     }
 }
 
+struct DispatchRoundInputs<'a> {
+    cfg: &'a Config,
+    epoch: u64,
+    work_id: u64,
+    header_base: &'a Arc<[u8]>,
+    target: [u8; 32],
+    reservation: super::scheduler::NonceReservation,
+    stop_at: Instant,
+    backend_weights: &'a BTreeMap<u64, f64>,
+}
+
+fn dispatch_round_assignments(
+    inputs: DispatchRoundInputs<'_>,
+    backends: &mut Vec<BackendSlot>,
+    nonce_scheduler: &mut NonceScheduler,
+    backend_executor: &super::backend_executor::BackendExecutor,
+) -> Result<()> {
+    let additional_span = distribute_work(
+        backends,
+        super::DistributeWorkOptions {
+            epoch: inputs.epoch,
+            work_id: inputs.work_id,
+            header_base: Arc::clone(inputs.header_base),
+            target: inputs.target,
+            reservation: inputs.reservation,
+            stop_at: inputs.stop_at,
+            assignment_timeout: inputs.cfg.backend_assign_timeout,
+            backend_weights: work_distribution_weights(
+                inputs.cfg.work_allocation,
+                inputs.backend_weights,
+            ),
+        },
+        backend_executor,
+    )?;
+    nonce_scheduler.consume_additional_span(additional_span);
+    Ok(())
+}
+
+struct ExecuteRoundPhase<'a, 'cp> {
+    cfg: &'a Config,
+    shutdown: &'a Arc<AtomicBool>,
+    tip_signal: Option<&'a TipSignal>,
+    epoch: u64,
+    work_id: u64,
+    stop_at: Instant,
+    round_start: Instant,
+    height: &'a str,
+    difficulty: &'a str,
+    header_base: &'a Arc<[u8]>,
+    target: [u8; 32],
+    current_submit_template: &'a SubmitTemplate,
+    control_plane: &'a mut MiningControlPlane<'cp>,
+    backends: &'a mut Vec<BackendSlot>,
+    backend_events: &'a Receiver<BackendEvent>,
+    backend_executor: &'a super::backend_executor::BackendExecutor,
+    stats: &'a Stats,
+    tui: &'a mut Option<TuiDisplay>,
+    last_stats_print: &'a mut Instant,
+    nonce_scheduler: &'a mut NonceScheduler,
+    backend_weights: &'a mut BTreeMap<u64, f64>,
+    recent_templates: &'a VecDeque<RecentTemplateEntry>,
+    deferred_solutions: &'a mut Vec<MiningSolution>,
+    submitted_solution_order: &'a mut VecDeque<(u64, u64)>,
+    submitted_solution_keys: &'a mut HashSet<(u64, u64)>,
+}
+
+fn execute_round_phase(phase: ExecuteRoundPhase<'_, '_>) -> Result<()> {
+    let ExecuteRoundPhase {
+        cfg,
+        shutdown,
+        tip_signal,
+        epoch,
+        work_id,
+        stop_at,
+        round_start,
+        height,
+        difficulty,
+        header_base,
+        target,
+        current_submit_template,
+        control_plane,
+        backends,
+        backend_events,
+        backend_executor,
+        stats,
+        tui,
+        last_stats_print,
+        nonce_scheduler,
+        backend_weights,
+        recent_templates,
+        deferred_solutions,
+        submitted_solution_order,
+        submitted_solution_keys,
+    } = phase;
+
+    let mut round_runtime = RoundRuntime {
+        cfg,
+        shutdown: shutdown.as_ref(),
+        backends,
+        backend_events,
+        tip_signal,
+        backend_executor,
+        stats,
+        tui,
+        last_stats_print,
+        nonce_scheduler,
+        backend_weights,
+        deferred_solutions,
+    };
+    let mut round_state = round_runtime.run(RoundInput {
+        epoch,
+        work_id,
+        stop_at,
+        round_start,
+        height,
+        difficulty,
+        header_base,
+        target,
+    })?;
+
+    let mut submitted_solution = None;
+    let mut pending_solution = round_state.solved.take();
+    let _ = drain_mining_backend_events(
+        backend_events,
+        epoch,
+        &mut pending_solution,
+        deferred_solutions,
+        backends,
+        backend_executor,
+    )?;
+    let solved_found = pending_solution.is_some();
+    let append_semantics_active = super::backends_have_append_assignment_semantics(backends);
+
+    if cfg.strict_round_accounting {
+        let _ = quiesce_backend_slots(
+            backends,
+            RuntimeMode::Mining,
+            cfg.backend_control_timeout,
+            backend_executor,
+        )?;
+    } else if should_cancel_relaxed_round(
+        round_state.stale_tip_event,
+        solved_found,
+        append_semantics_active,
+    ) {
+        let _ = cancel_backend_slots(
+            backends,
+            RuntimeMode::Mining,
+            cfg.backend_control_timeout,
+            backend_executor,
+        )?;
+    }
+    let _ = drain_mining_backend_events(
+        backend_events,
+        epoch,
+        &mut pending_solution,
+        deferred_solutions,
+        backends,
+        backend_executor,
+    )?;
+    if let Some(solution) = pending_solution.take() {
+        if already_submitted_solution(submitted_solution_keys, &solution) {
+            warn(
+                "SUBMIT",
+                format!(
+                    "skipping duplicate solution epoch={} nonce={}",
+                    solution.epoch, solution.nonce
+                ),
+            );
+        } else {
+            control_plane.submit_template(
+                current_submit_template.clone(),
+                solution.clone(),
+                stats,
+                tui,
+            );
+            remember_submitted_solution(
+                submitted_solution_order,
+                submitted_solution_keys,
+                &solution,
+            );
+        }
+        submitted_solution = Some(solution);
+    }
+    drop_solution_from_deferred(deferred_solutions, submitted_solution.as_ref());
+    submit_deferred_solutions(
+        control_plane,
+        epoch,
+        current_submit_template,
+        DeferredSubmitState {
+            recent_templates,
+            deferred_solutions,
+            submitted_solution_order,
+            submitted_solution_keys,
+            stats,
+            tui,
+        },
+    );
+    control_plane.drain_submit_results(stats, tui);
+    collect_backend_hashes(
+        backends,
+        Some(stats),
+        &mut round_state.round_hashes,
+        Some(&mut round_state.round_backend_hashes),
+        Some(&mut round_state.round_backend_telemetry),
+    );
+    round_state.stale_tip_event |= tip_signal.is_some_and(TipSignal::take_stale);
+    let round_end_reason = if shutdown.load(Ordering::Relaxed) {
+        RoundEndReason::Shutdown
+    } else if submitted_solution.is_some() {
+        RoundEndReason::Solved
+    } else if round_state.stale_tip_event {
+        RoundEndReason::StaleTip
+    } else {
+        RoundEndReason::Refresh
+    };
+    let round_elapsed_secs = round_start.elapsed().as_secs_f64();
+    update_backend_weights(
+        backend_weights,
+        WeightUpdateInputs {
+            backends,
+            round_backend_hashes: &round_state.round_backend_hashes,
+            round_backend_telemetry: Some(&round_state.round_backend_telemetry),
+            round_elapsed_secs,
+            mode: cfg.work_allocation,
+            round_end_reason,
+            refresh_interval: cfg.refresh_interval,
+        },
+    );
+    let telemetry_line =
+        format_round_backend_telemetry(backends, &round_state.round_backend_telemetry);
+    if telemetry_line != "none" {
+        info("BACKEND", format!("telemetry | {telemetry_line}"));
+    }
+
+    if let Some(solution) = submitted_solution {
+        update_tui(
+            tui,
+            stats,
+            RoundUiView {
+                backends,
+                round_backend_hashes: &round_state.round_backend_hashes,
+                round_hashes: round_state.round_hashes,
+                round_start,
+                height,
+                difficulty,
+                epoch,
+                state_label: "solved",
+            },
+        );
+        mined(
+            "SOLVE",
+            format!(
+                "solution found! elapsed={:.2}s backend={}#{}",
+                round_start.elapsed().as_secs_f64(),
+                solution.backend,
+                solution.backend_id,
+            ),
+        );
+    } else if round_state.stale_tip_event {
+        update_tui(
+            tui,
+            stats,
+            RoundUiView {
+                backends,
+                round_backend_hashes: &round_state.round_backend_hashes,
+                round_hashes: round_state.round_hashes,
+                round_start,
+                height,
+                difficulty,
+                epoch,
+                state_label: "stale-refresh",
+            },
+        );
+    } else {
+        update_tui(
+            tui,
+            stats,
+            RoundUiView {
+                backends,
+                round_backend_hashes: &round_state.round_backend_hashes,
+                round_hashes: round_state.round_hashes,
+                round_start,
+                height,
+                difficulty,
+                epoch,
+                state_label: "refresh",
+            },
+        );
+    }
+
+    maybe_print_stats(stats, last_stats_print, cfg.stats_interval, tui.is_none());
+
+    Ok(())
+}
+
 pub(super) fn run_mining_loop(
     cfg: &Config,
     client: &ApiClient,
@@ -893,39 +1189,28 @@ pub(super) fn run_mining_loop(
 
         stats.bump_templates();
 
-        let additional_span = distribute_work(
-            backends,
-            super::DistributeWorkOptions {
+        dispatch_round_assignments(
+            DispatchRoundInputs {
+                cfg,
                 epoch,
                 work_id,
-                header_base: Arc::clone(&header_base),
+                header_base: &header_base,
                 target,
                 reservation,
                 stop_at,
-                assignment_timeout: cfg.backend_assign_timeout,
-                backend_weights: work_distribution_weights(cfg.work_allocation, &backend_weights),
+                backend_weights: &backend_weights,
             },
+            backends,
+            &mut nonce_scheduler,
             backend_executor,
         )?;
-        nonce_scheduler.consume_additional_span(additional_span);
         control_plane.spawn_prefetch_if_needed();
 
         let round_start = Instant::now();
-        let mut round_runtime = RoundRuntime {
+        execute_round_phase(ExecuteRoundPhase {
             cfg,
-            shutdown: shutdown.as_ref(),
-            backends,
-            backend_events,
+            shutdown: &shutdown,
             tip_signal,
-            backend_executor,
-            stats: &stats,
-            tui: &mut tui,
-            last_stats_print: &mut last_stats_print,
-            nonce_scheduler: &mut nonce_scheduler,
-            backend_weights: &backend_weights,
-            deferred_solutions: &mut deferred_solutions,
-        };
-        let mut round_state = round_runtime.run(RoundInput {
             epoch,
             work_id,
             stop_at,
@@ -934,184 +1219,21 @@ pub(super) fn run_mining_loop(
             difficulty: &difficulty,
             header_base: &header_base,
             target,
+            current_submit_template: &current_submit_template,
+            control_plane: &mut control_plane,
+            backends,
+            backend_events,
+            backend_executor,
+            stats: &stats,
+            tui: &mut tui,
+            last_stats_print: &mut last_stats_print,
+            nonce_scheduler: &mut nonce_scheduler,
+            backend_weights: &mut backend_weights,
+            recent_templates: &recent_templates,
+            deferred_solutions: &mut deferred_solutions,
+            submitted_solution_order: &mut submitted_solution_order,
+            submitted_solution_keys: &mut submitted_solution_keys,
         })?;
-        let mut submitted_solution = None;
-        let mut pending_solution = round_state.solved.take();
-        let _ = drain_mining_backend_events(
-            backend_events,
-            epoch,
-            &mut pending_solution,
-            &mut deferred_solutions,
-            backends,
-            backend_executor,
-        )?;
-        let solved_found = pending_solution.is_some();
-        let append_semantics_active = super::backends_have_append_assignment_semantics(backends);
-
-        if cfg.strict_round_accounting {
-            let _ = quiesce_backend_slots(
-                backends,
-                RuntimeMode::Mining,
-                cfg.backend_control_timeout,
-                backend_executor,
-            )?;
-        } else if should_cancel_relaxed_round(
-            round_state.stale_tip_event,
-            solved_found,
-            append_semantics_active,
-        ) {
-            let _ = cancel_backend_slots(
-                backends,
-                RuntimeMode::Mining,
-                cfg.backend_control_timeout,
-                backend_executor,
-            )?;
-        }
-        let _ = drain_mining_backend_events(
-            backend_events,
-            epoch,
-            &mut pending_solution,
-            &mut deferred_solutions,
-            backends,
-            backend_executor,
-        )?;
-        if let Some(solution) = pending_solution.take() {
-            if already_submitted_solution(&submitted_solution_keys, &solution) {
-                warn(
-                    "SUBMIT",
-                    format!(
-                        "skipping duplicate solution epoch={} nonce={}",
-                        solution.epoch, solution.nonce
-                    ),
-                );
-            } else {
-                control_plane.submit_template(
-                    current_submit_template.clone(),
-                    solution.clone(),
-                    &stats,
-                    &mut tui,
-                );
-                remember_submitted_solution(
-                    &mut submitted_solution_order,
-                    &mut submitted_solution_keys,
-                    &solution,
-                );
-            }
-            submitted_solution = Some(solution);
-        }
-        drop_solution_from_deferred(&mut deferred_solutions, submitted_solution.as_ref());
-        submit_deferred_solutions(
-            &mut control_plane,
-            epoch,
-            &current_submit_template,
-            DeferredSubmitState {
-                recent_templates: &recent_templates,
-                deferred_solutions: &mut deferred_solutions,
-                submitted_solution_order: &mut submitted_solution_order,
-                submitted_solution_keys: &mut submitted_solution_keys,
-                stats: &stats,
-                tui: &mut tui,
-            },
-        );
-        control_plane.drain_submit_results(&stats, &mut tui);
-        collect_backend_hashes(
-            backends,
-            Some(&stats),
-            &mut round_state.round_hashes,
-            Some(&mut round_state.round_backend_hashes),
-            Some(&mut round_state.round_backend_telemetry),
-        );
-        round_state.stale_tip_event |= tip_signal.is_some_and(TipSignal::take_stale);
-        let round_end_reason = if shutdown.load(Ordering::Relaxed) {
-            RoundEndReason::Shutdown
-        } else if submitted_solution.is_some() {
-            RoundEndReason::Solved
-        } else if round_state.stale_tip_event {
-            RoundEndReason::StaleTip
-        } else {
-            RoundEndReason::Refresh
-        };
-        let round_elapsed_secs = round_start.elapsed().as_secs_f64();
-        update_backend_weights(
-            &mut backend_weights,
-            WeightUpdateInputs {
-                backends,
-                round_backend_hashes: &round_state.round_backend_hashes,
-                round_backend_telemetry: Some(&round_state.round_backend_telemetry),
-                round_elapsed_secs,
-                mode: cfg.work_allocation,
-                round_end_reason,
-                refresh_interval: cfg.refresh_interval,
-            },
-        );
-        let telemetry_line =
-            format_round_backend_telemetry(backends, &round_state.round_backend_telemetry);
-        if telemetry_line != "none" {
-            info("BACKEND", format!("telemetry | {telemetry_line}"));
-        }
-
-        if let Some(solution) = submitted_solution {
-            update_tui(
-                &mut tui,
-                &stats,
-                RoundUiView {
-                    backends,
-                    round_backend_hashes: &round_state.round_backend_hashes,
-                    round_hashes: round_state.round_hashes,
-                    round_start,
-                    height: &height,
-                    difficulty: &difficulty,
-                    epoch,
-                    state_label: "solved",
-                },
-            );
-            mined(
-                "SOLVE",
-                format!(
-                    "solution found! elapsed={:.2}s backend={}#{}",
-                    round_start.elapsed().as_secs_f64(),
-                    solution.backend,
-                    solution.backend_id,
-                ),
-            );
-        } else if round_state.stale_tip_event {
-            update_tui(
-                &mut tui,
-                &stats,
-                RoundUiView {
-                    backends,
-                    round_backend_hashes: &round_state.round_backend_hashes,
-                    round_hashes: round_state.round_hashes,
-                    round_start,
-                    height: &height,
-                    difficulty: &difficulty,
-                    epoch,
-                    state_label: "stale-refresh",
-                },
-            );
-        } else {
-            update_tui(
-                &mut tui,
-                &stats,
-                RoundUiView {
-                    backends,
-                    round_backend_hashes: &round_state.round_backend_hashes,
-                    round_hashes: round_state.round_hashes,
-                    round_start,
-                    height: &height,
-                    difficulty: &difficulty,
-                    epoch,
-                    state_label: "refresh",
-                },
-            );
-        }
-
-        maybe_print_stats(
-            &stats,
-            &mut last_stats_print,
-            cfg.stats_interval,
-            tui.is_none(),
-        );
 
         if shutdown.load(Ordering::Relaxed) {
             break;

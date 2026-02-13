@@ -232,6 +232,33 @@ impl Default for BackendCapabilities {
     }
 }
 
+pub fn normalize_backend_capabilities(
+    mut capabilities: BackendCapabilities,
+    supports_assignment_batching: bool,
+) -> BackendCapabilities {
+    capabilities.max_inflight_assignments = capabilities.max_inflight_assignments.max(1);
+    if capabilities.max_inflight_assignments > 1 && !supports_assignment_batching {
+        capabilities.max_inflight_assignments = 1;
+    }
+
+    capabilities.nonblocking_poll_min = capabilities
+        .nonblocking_poll_min
+        .map(|min_poll| min_poll.max(Duration::from_micros(10)));
+    capabilities.nonblocking_poll_max = capabilities
+        .nonblocking_poll_max
+        .map(|max_poll| max_poll.max(Duration::from_micros(10)));
+    if let (Some(min_poll), Some(max_poll)) = (
+        capabilities.nonblocking_poll_min,
+        capabilities.nonblocking_poll_max,
+    ) {
+        if max_poll < min_poll {
+            capabilities.nonblocking_poll_max = Some(min_poll);
+        }
+    }
+
+    capabilities
+}
+
 pub trait BenchBackend: Send {
     fn kernel_bench(&self, seconds: u64, shutdown: &AtomicBool) -> Result<u64>;
 }

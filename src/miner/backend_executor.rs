@@ -9,8 +9,8 @@ use anyhow::{anyhow, Result};
 use crossbeam_channel::{bounded, RecvTimeoutError, SendTimeoutError, Sender, TrySendError};
 
 use crate::backend::{
-    AssignmentSemantics, BackendCallStatus, BackendCapabilities, BackendInstanceId, PowBackend,
-    WorkAssignment,
+    normalize_backend_capabilities, AssignmentSemantics, BackendCallStatus, BackendCapabilities,
+    BackendInstanceId, PowBackend, WorkAssignment,
 };
 
 use super::ui::warn;
@@ -93,6 +93,7 @@ const BACKEND_WORKER_QUEUE_CAPACITY_MAX: usize = 64;
 const BACKEND_STOP_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 const BACKEND_STOP_ACK_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
 const BACKEND_STOP_ENQUEUE_TIMEOUT: Duration = Duration::from_millis(100);
+const BACKEND_STOP_FALLBACK_TIMEOUT: Duration = Duration::from_secs(2);
 const BACKEND_TASK_ENQUEUE_RETRY_MIN: Duration = Duration::from_micros(50);
 const BACKEND_TASK_ENQUEUE_RETRY_MAX: Duration = Duration::from_millis(1);
 
@@ -139,28 +140,10 @@ fn backend_worker_key(
 }
 
 fn normalized_backend_capabilities(backend_handle: &Arc<dyn PowBackend>) -> BackendCapabilities {
-    let mut capabilities = backend_handle.capabilities();
-    capabilities.max_inflight_assignments = capabilities.max_inflight_assignments.max(1);
-    if capabilities.max_inflight_assignments > 1 && !backend_handle.supports_assignment_batching() {
-        capabilities.max_inflight_assignments = 1;
-    }
-
-    capabilities.nonblocking_poll_min = capabilities
-        .nonblocking_poll_min
-        .map(|min_poll| min_poll.max(Duration::from_micros(10)));
-    capabilities.nonblocking_poll_max = capabilities
-        .nonblocking_poll_max
-        .map(|max_poll| max_poll.max(Duration::from_micros(10)));
-    if let (Some(min_poll), Some(max_poll)) = (
-        capabilities.nonblocking_poll_min,
-        capabilities.nonblocking_poll_max,
-    ) {
-        if max_poll < min_poll {
-            capabilities.nonblocking_poll_max = Some(min_poll);
-        }
-    }
-
-    capabilities
+    normalize_backend_capabilities(
+        backend_handle.capabilities(),
+        backend_handle.supports_assignment_batching(),
+    )
 }
 
 fn backend_worker_queue_capacity(backend_handle: &Arc<dyn PowBackend>) -> usize {
@@ -240,6 +223,27 @@ impl BackendExecutor {
         }
         if let Ok(mut strikes) = self.assignment_timeout_strikes.lock() {
             strikes.clear();
+        }
+    }
+
+    pub(super) fn wait_for_quarantine_drain(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now()
+            .checked_add(timeout.max(Duration::from_millis(1)))
+            .unwrap_or_else(Instant::now);
+
+        loop {
+            let pending = self
+                .quarantined
+                .lock()
+                .map(|inflight| !inflight.is_empty())
+                .unwrap_or(false);
+            if !pending {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -756,9 +760,26 @@ fn spawn_deferred_stop_handoff(
                 backend_handle: Arc::clone(&backend_handle),
                 done_tx,
             };
-            match worker_tx.send(stop_command) {
-                Ok(()) => wait_for_stop_ack(backend_id, backend, &backend_handle, done_rx),
-                Err(_) => run_synchronous_stop_fallback(backend_id, backend, backend_handle),
+            let deadline = Instant::now()
+                .checked_add(BACKEND_STOP_ACK_GRACE_TIMEOUT)
+                .unwrap_or_else(Instant::now);
+            match enqueue_backend_command_until_deadline(&worker_tx, stop_command, deadline) {
+                EnqueueCommandStatus::Enqueued => {
+                    wait_for_stop_ack(backend_id, backend, &backend_handle, done_rx)
+                }
+                EnqueueCommandStatus::DeadlineElapsed => {
+                    warn(
+                        "BACKEND",
+                        format!(
+                            "backend stop handoff enqueue timed out for {backend}#{backend_id}; running fallback stop"
+                        ),
+                    );
+                    request_backend_stop_interrupt(backend_id, backend, &backend_handle);
+                    run_synchronous_stop_fallback(backend_id, backend, backend_handle);
+                }
+                EnqueueCommandStatus::Disconnected => {
+                    run_synchronous_stop_fallback(backend_id, backend, backend_handle);
+                }
             }
         })
         .is_ok()
@@ -769,13 +790,51 @@ fn run_synchronous_stop_fallback(
     backend: &'static str,
     backend_handle: Arc<dyn PowBackend>,
 ) {
-    if panic::catch_unwind(AssertUnwindSafe(|| backend_handle.stop())).is_err() {
-        warn(
-            "BACKEND",
-            format!(
-                "backend stop panicked during synchronous quarantine fallback for {backend}#{backend_id}"
-            ),
-        );
+    let thread_name = format!("seine-backend-stop-fallback-{backend}-{backend_id}");
+    let (done_tx, done_rx) = bounded::<()>(1);
+    let backend_for_stop = Arc::clone(&backend_handle);
+
+    let stop_thread = thread::Builder::new().name(thread_name).spawn(move || {
+        if panic::catch_unwind(AssertUnwindSafe(|| backend_for_stop.stop())).is_err() {
+            warn(
+                "BACKEND",
+                format!(
+                    "backend stop panicked during synchronous quarantine fallback for {backend}#{backend_id}"
+                ),
+            );
+        }
+        let _ = done_tx.send(());
+    });
+
+    match stop_thread {
+        Ok(handle) => match done_rx.recv_timeout(BACKEND_STOP_FALLBACK_TIMEOUT) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                let _ = handle.join();
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                warn(
+                    "BACKEND",
+                    format!("backend stop fallback timed out for {backend}#{backend_id}; detached"),
+                );
+                drop(handle);
+            }
+        },
+        Err(err) => {
+            warn(
+                "BACKEND",
+                format!(
+                    "failed to spawn backend stop fallback thread for {backend}#{backend_id}: {err}; attempting direct stop"
+                ),
+            );
+            if panic::catch_unwind(AssertUnwindSafe(|| backend_handle.stop())).is_err() {
+                warn(
+                    "BACKEND",
+                    format!(
+                        "backend stop panicked during direct fallback for {backend}#{backend_id}"
+                    ),
+                );
+            }
+        }
     }
 }
 
