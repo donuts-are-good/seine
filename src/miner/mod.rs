@@ -396,10 +396,7 @@ fn activate_backends(
     let mut backend_event_sources = Vec::new();
     let (event_tx, event_rx) = bounded::<BackendEvent>(event_capacity.max(1));
     let mut next_backend_id: BackendInstanceId = 1;
-    let per_backend_event_capacity = event_capacity
-        .max(1)
-        .min(BACKEND_EVENT_SOURCE_CAPACITY_MAX)
-        .max(8);
+    let per_backend_event_capacity = event_capacity.clamp(8, BACKEND_EVENT_SOURCE_CAPACITY_MAX);
 
     for (backend_spec, backend) in backends.drain(..) {
         let backend_id = next_backend_id;

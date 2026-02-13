@@ -634,16 +634,21 @@ fn execute_round_phase(phase: ExecuteRoundPhase<'_, '_>) -> Result<()> {
     let mut submitted_solution = None;
     let mut current_submit_template: Option<SubmitTemplate> = None;
     let mut pending_solution = round_state.solved.take();
-    let _ = drain_mining_backend_events(
-        backend_events,
-        epoch,
-        &mut pending_solution,
-        deferred_solutions,
-        deferred_solution_keys,
-        backends,
-        backend_executor,
-        stats,
-    )?;
+    {
+        let mut deferred_state = DeferredQueueState {
+            deferred_solutions,
+            deferred_solution_keys,
+            stats,
+        };
+        let _ = drain_mining_backend_events(
+            backend_events,
+            epoch,
+            &mut pending_solution,
+            &mut deferred_state,
+            backends,
+            backend_executor,
+        )?;
+    }
     let solved_found = pending_solution.is_some();
     let append_semantics_active = super::backends_have_append_assignment_semantics(backends);
 
@@ -656,16 +661,21 @@ fn execute_round_phase(phase: ExecuteRoundPhase<'_, '_>) -> Result<()> {
     ) {
         let _ = cancel_backend_slots(backends, RuntimeMode::Mining, backend_executor)?;
     }
-    let _ = drain_mining_backend_events(
-        backend_events,
-        epoch,
-        &mut pending_solution,
-        deferred_solutions,
-        deferred_solution_keys,
-        backends,
-        backend_executor,
-        stats,
-    )?;
+    {
+        let mut deferred_state = DeferredQueueState {
+            deferred_solutions,
+            deferred_solution_keys,
+            stats,
+        };
+        let _ = drain_mining_backend_events(
+            backend_events,
+            epoch,
+            &mut pending_solution,
+            &mut deferred_state,
+            backends,
+            backend_executor,
+        )?;
+    }
     let mut enqueued_solution = None;
     if let Some(solution) = pending_solution.take() {
         let key = (solution.epoch, solution.nonce);
@@ -997,21 +1007,26 @@ pub(super) fn run_mining_loop(
             Err(err) => warn("BACKEND", format!("final backend quiesce failed: {err:#}")),
         }
         let mut final_pending_solution = None;
-        match drain_mining_backend_events(
-            backend_events,
-            epoch,
-            &mut final_pending_solution,
-            &mut deferred_solutions,
-            &mut deferred_solution_keys,
-            backends,
-            backend_executor,
-            &stats,
-        ) {
-            Ok(_) => {}
-            Err(err) => warn(
-                "BACKEND",
-                format!("final backend event drain failed: {err:#}"),
-            ),
+        {
+            let mut deferred_state = DeferredQueueState {
+                deferred_solutions: &mut deferred_solutions,
+                deferred_solution_keys: &mut deferred_solution_keys,
+                stats: &stats,
+            };
+            match drain_mining_backend_events(
+                backend_events,
+                epoch,
+                &mut final_pending_solution,
+                &mut deferred_state,
+                backends,
+                backend_executor,
+            ) {
+                Ok(_) => {}
+                Err(err) => warn(
+                    "BACKEND",
+                    format!("final backend event drain failed: {err:#}"),
+                ),
+            }
         }
         let mut final_enqueued_solution = None;
         if let Some(solution) = final_pending_solution.as_ref() {
@@ -1298,15 +1313,18 @@ impl<'a> RoundRuntime<'a> {
             );
 
             if let Some(event) = step.event {
+                let mut deferred_state = DeferredQueueState {
+                    deferred_solutions: self.deferred_solutions,
+                    deferred_solution_keys: self.deferred_solution_keys,
+                    stats: self.stats,
+                };
                 if handle_mining_backend_event(
                     event,
                     input.epoch,
                     &mut solved,
-                    self.deferred_solutions,
-                    self.deferred_solution_keys,
+                    &mut deferred_state,
                     self.backends,
                     self.backend_executor,
-                    self.stats,
                 )? == BackendEventAction::TopologyChanged
                 {
                     topology_changed = true;
@@ -1590,15 +1608,19 @@ fn resolve_next_template(
 
     None
 }
+struct DeferredQueueState<'a> {
+    deferred_solutions: &'a mut Vec<MiningSolution>,
+    deferred_solution_keys: &'a mut HashSet<(u64, u64)>,
+    stats: &'a Stats,
+}
+
 fn handle_mining_backend_event(
     event: BackendEvent,
     epoch: u64,
     solved: &mut Option<MiningSolution>,
-    deferred_solutions: &mut Vec<MiningSolution>,
-    deferred_solution_keys: &mut HashSet<(u64, u64)>,
+    deferred_state: &mut DeferredQueueState<'_>,
     backends: &mut Vec<BackendSlot>,
     backend_executor: &super::backend_executor::BackendExecutor,
-    stats: &Stats,
 ) -> Result<BackendEventAction> {
     let (action, maybe_solution) = super::handle_runtime_backend_event(
         event,
@@ -1608,14 +1630,7 @@ fn handle_mining_backend_event(
         backend_executor,
     )?;
     if let Some(solution) = maybe_solution {
-        route_mining_solution(
-            solution,
-            epoch,
-            solved,
-            deferred_solutions,
-            deferred_solution_keys,
-            stats,
-        );
+        route_mining_solution(solution, epoch, solved, deferred_state);
     }
     Ok(action)
 }
@@ -1624,11 +1639,9 @@ fn drain_mining_backend_events(
     backend_events: &Receiver<BackendEvent>,
     epoch: u64,
     solved: &mut Option<MiningSolution>,
-    deferred_solutions: &mut Vec<MiningSolution>,
-    deferred_solution_keys: &mut HashSet<(u64, u64)>,
+    deferred_state: &mut DeferredQueueState<'_>,
     backends: &mut Vec<BackendSlot>,
     backend_executor: &super::backend_executor::BackendExecutor,
-    stats: &Stats,
 ) -> Result<BackendEventAction> {
     let (action, solutions) = super::drain_runtime_backend_events(
         backend_events,
@@ -1638,14 +1651,7 @@ fn drain_mining_backend_events(
         backend_executor,
     )?;
     for solution in solutions {
-        route_mining_solution(
-            solution,
-            epoch,
-            solved,
-            deferred_solutions,
-            deferred_solution_keys,
-            stats,
-        );
+        route_mining_solution(solution, epoch, solved, deferred_state);
     }
     Ok(action)
 }
@@ -1654,20 +1660,28 @@ fn route_mining_solution(
     solution: MiningSolution,
     epoch: u64,
     solved: &mut Option<MiningSolution>,
-    deferred_solutions: &mut Vec<MiningSolution>,
-    deferred_solution_keys: &mut HashSet<(u64, u64)>,
-    stats: &Stats,
+    deferred_state: &mut DeferredQueueState<'_>,
 ) {
     if solution.epoch == epoch {
         if solved.is_none() {
             *solved = Some(solution);
         } else {
-            defer_solution_indexed(deferred_solutions, deferred_solution_keys, solution, stats);
+            defer_solution_indexed(
+                deferred_state.deferred_solutions,
+                deferred_state.deferred_solution_keys,
+                solution,
+                deferred_state.stats,
+            );
         }
     } else if solution.epoch < epoch {
-        defer_solution_indexed(deferred_solutions, deferred_solution_keys, solution, stats);
+        defer_solution_indexed(
+            deferred_state.deferred_solutions,
+            deferred_state.deferred_solution_keys,
+            solution,
+            deferred_state.stats,
+        );
     } else {
-        stats.add_dropped(1);
+        deferred_state.stats.add_dropped(1);
         warn(
             "BACKEND",
             format!(
@@ -1978,21 +1992,26 @@ mod tests {
         let mut deferred_keys = HashSet::new();
         let mut backends = Vec::new();
 
-        let action = handle_mining_backend_event(
-            BackendEvent::Solution(MiningSolution {
-                epoch: 41,
-                nonce: 9,
-                backend_id: 1,
-                backend: "cpu",
-            }),
-            42,
-            &mut solved,
-            &mut deferred,
-            &mut deferred_keys,
-            &mut backends,
-            &backend_executor,
-            &stats,
-        )
+        let action = {
+            let mut deferred_state = DeferredQueueState {
+                deferred_solutions: &mut deferred,
+                deferred_solution_keys: &mut deferred_keys,
+                stats: &stats,
+            };
+            handle_mining_backend_event(
+                BackendEvent::Solution(MiningSolution {
+                    epoch: 41,
+                    nonce: 9,
+                    backend_id: 1,
+                    backend: "cpu",
+                }),
+                42,
+                &mut solved,
+                &mut deferred_state,
+                &mut backends,
+                &backend_executor,
+            )
+        }
         .expect("stale solution handling should succeed");
 
         assert_eq!(action, BackendEventAction::None);
@@ -2019,21 +2038,26 @@ mod tests {
             capabilities: crate::backend::BackendCapabilities::default(),
         }];
 
-        let action = handle_mining_backend_event(
-            BackendEvent::Solution(MiningSolution {
-                epoch: 41,
-                nonce: 9,
-                backend_id: 1,
-                backend: "cpu",
-            }),
-            42,
-            &mut solved,
-            &mut deferred,
-            &mut deferred_keys,
-            &mut backends,
-            &backend_executor,
-            &stats,
-        )
+        let action = {
+            let mut deferred_state = DeferredQueueState {
+                deferred_solutions: &mut deferred,
+                deferred_solution_keys: &mut deferred_keys,
+                stats: &stats,
+            };
+            handle_mining_backend_event(
+                BackendEvent::Solution(MiningSolution {
+                    epoch: 41,
+                    nonce: 9,
+                    backend_id: 1,
+                    backend: "cpu",
+                }),
+                42,
+                &mut solved,
+                &mut deferred_state,
+                &mut backends,
+                &backend_executor,
+            )
+        }
         .expect("stale solution should be deferred");
 
         assert_eq!(action, BackendEventAction::None);
@@ -2054,21 +2078,26 @@ mod tests {
         let mut deferred_keys = HashSet::new();
         let mut backends = Vec::new();
 
-        let action = handle_mining_backend_event(
-            BackendEvent::Solution(MiningSolution {
-                epoch: 43,
-                nonce: 9,
-                backend_id: 1,
-                backend: "cpu",
-            }),
-            42,
-            &mut solved,
-            &mut deferred,
-            &mut deferred_keys,
-            &mut backends,
-            &backend_executor,
-            &stats,
-        )
+        let action = {
+            let mut deferred_state = DeferredQueueState {
+                deferred_solutions: &mut deferred,
+                deferred_solution_keys: &mut deferred_keys,
+                stats: &stats,
+            };
+            handle_mining_backend_event(
+                BackendEvent::Solution(MiningSolution {
+                    epoch: 43,
+                    nonce: 9,
+                    backend_id: 1,
+                    backend: "cpu",
+                }),
+                42,
+                &mut solved,
+                &mut deferred_state,
+                &mut backends,
+                &backend_executor,
+            )
+        }
         .expect("future solution should be dropped");
 
         assert_eq!(action, BackendEventAction::None);
@@ -2099,21 +2128,26 @@ mod tests {
             capabilities: crate::backend::BackendCapabilities::default(),
         }];
 
-        let action = handle_mining_backend_event(
-            BackendEvent::Solution(MiningSolution {
-                epoch: 42,
-                nonce: 11,
-                backend_id: 1,
-                backend: "cpu",
-            }),
-            42,
-            &mut solved,
-            &mut deferred,
-            &mut deferred_keys,
-            &mut backends,
-            &backend_executor,
-            &stats,
-        )
+        let action = {
+            let mut deferred_state = DeferredQueueState {
+                deferred_solutions: &mut deferred,
+                deferred_solution_keys: &mut deferred_keys,
+                stats: &stats,
+            };
+            handle_mining_backend_event(
+                BackendEvent::Solution(MiningSolution {
+                    epoch: 42,
+                    nonce: 11,
+                    backend_id: 1,
+                    backend: "cpu",
+                }),
+                42,
+                &mut solved,
+                &mut deferred_state,
+                &mut backends,
+                &backend_executor,
+            )
+        }
         .expect("extra same-epoch solution should be deferred");
 
         assert_eq!(action, BackendEventAction::None);
@@ -2164,16 +2198,21 @@ mod tests {
             }))
             .expect("enqueue additional current solution");
 
-        let action = drain_mining_backend_events(
-            &event_rx,
-            42,
-            &mut solved,
-            &mut deferred,
-            &mut deferred_keys,
-            &mut backends,
-            &backend_executor,
-            &stats,
-        )
+        let action = {
+            let mut deferred_state = DeferredQueueState {
+                deferred_solutions: &mut deferred,
+                deferred_solution_keys: &mut deferred_keys,
+                stats: &stats,
+            };
+            drain_mining_backend_events(
+                &event_rx,
+                42,
+                &mut solved,
+                &mut deferred_state,
+                &mut backends,
+                &backend_executor,
+            )
+        }
         .expect("drain should succeed");
 
         assert_eq!(action, BackendEventAction::None);
@@ -2511,20 +2550,25 @@ mod tests {
             },
         ];
 
-        let action = handle_mining_backend_event(
-            BackendEvent::Error {
-                backend_id: 1,
-                backend: "cpu",
-                message: "test failure".to_string(),
-            },
-            1,
-            &mut solved,
-            &mut deferred,
-            &mut deferred_keys,
-            &mut backends,
-            &backend_executor,
-            &stats,
-        )
+        let action = {
+            let mut deferred_state = DeferredQueueState {
+                deferred_solutions: &mut deferred,
+                deferred_solution_keys: &mut deferred_keys,
+                stats: &stats,
+            };
+            handle_mining_backend_event(
+                BackendEvent::Error {
+                    backend_id: 1,
+                    backend: "cpu",
+                    message: "test failure".to_string(),
+                },
+                1,
+                &mut solved,
+                &mut deferred_state,
+                &mut backends,
+                &backend_executor,
+            )
+        }
         .expect("backend removal should be handled");
 
         assert_eq!(action, BackendEventAction::TopologyChanged);
