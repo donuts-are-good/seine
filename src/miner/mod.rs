@@ -496,7 +496,7 @@ fn maybe_autotune_cpu_threads(
         info(
             tag,
             format!(
-                "cpu-autotune | loaded threads={} hps={} from {}",
+                "cpu-autotune | using cached result: {} threads at {} (from {})",
                 record.selected_threads,
                 format_hashrate(record.measured_hps),
                 cfg.cpu_autotune_config_path.display()
@@ -508,15 +508,16 @@ fn maybe_autotune_cpu_threads(
     info(
         tag,
         format!(
-            "cpu-autotune | starting profile={} range={}..{} window_secs={} target_hashes={} max_sample_secs={} instances={}",
+            "cpu-autotune | finding the fastest thread count for your CPU (profile={}, testing {}..{} threads, ~{}s per candidate)",
             cpu_profile_label(cfg.cpu_profile),
             min_threads,
             max_threads,
             autotune_secs,
-            CPU_AUTOTUNE_TARGET_HASHES_PER_CANDIDATE,
-            CPU_AUTOTUNE_MAX_SAMPLE_SECS_PER_CANDIDATE,
-            cpu_instance_count
         ),
+    );
+    info(
+        tag,
+        "cpu-autotune | this only runs once — results are cached for future launches",
     );
 
     let candidate_count = max_threads.saturating_sub(min_threads).saturating_add(1);
@@ -526,9 +527,18 @@ fn maybe_autotune_cpu_threads(
     if candidate_count <= CPU_AUTOTUNE_LINEAR_SCAN_MAX_CANDIDATES {
         info(
             tag,
-            format!("cpu-autotune | search=linear candidates={candidate_count} (range is small)"),
+            format!("cpu-autotune | testing all {candidate_count} thread counts in range"),
         );
-        for threads in min_threads..=max_threads {
+        for (step, threads) in (min_threads..=max_threads).enumerate() {
+            info(
+                tag,
+                format!(
+                    "cpu-autotune | [{}/{}] benchmarking {} threads ...",
+                    step + 1,
+                    candidate_count,
+                    threads
+                ),
+            );
             if shutdown.load(Ordering::Relaxed)
                 || !measure_cpu_autotune_candidate(
                     cfg,
@@ -547,19 +557,31 @@ fn maybe_autotune_cpu_threads(
         info(
             tag,
             format!(
-                "cpu-autotune | search=binary-peak candidates={candidate_count} final-sweep=+/-{}",
-                CPU_AUTOTUNE_FINAL_SWEEP_RADIUS
+                "cpu-autotune | {candidate_count} thread counts to search — using binary search to narrow down quickly",
             ),
+        );
+        info(
+            tag,
+            "cpu-autotune | phase 1/2: narrowing down the optimal range ...",
         );
         let mut lo = min_threads;
         let mut hi = max_threads;
+        let mut binary_step: usize = 0;
         while lo < hi {
             if shutdown.load(Ordering::Relaxed) {
                 interrupted = true;
                 break;
             }
+            binary_step += 1;
             let mid = lo + (hi - lo) / 2;
             let right = (mid + 1).min(max_threads);
+            info(
+                tag,
+                format!(
+                    "cpu-autotune | phase 1 step {binary_step}: comparing {mid} vs {right} threads (range {}..{}) ...",
+                    lo, hi
+                ),
+            );
             if !measure_cpu_autotune_candidate(
                 cfg,
                 tag,
@@ -602,13 +624,38 @@ fn maybe_autotune_cpu_threads(
                 final_candidates.insert(threads);
             }
 
-            for threads in final_candidates {
+            // Remove already-measured candidates so the step counter is accurate.
+            let final_candidates: Vec<usize> = final_candidates
+                .into_iter()
+                .filter(|t| !measurements.contains_key(t))
+                .collect();
+            if !final_candidates.is_empty() {
+                info(
+                    tag,
+                    format!(
+                        "cpu-autotune | phase 2/2: fine-tuning around {} threads ({} candidates left) ...",
+                        lo,
+                        final_candidates.len()
+                    ),
+                );
+            }
+
+            for (step, threads) in final_candidates.iter().enumerate() {
+                info(
+                    tag,
+                    format!(
+                        "cpu-autotune | [{}/{}] benchmarking {} threads ...",
+                        step + 1,
+                        final_candidates.len(),
+                        threads
+                    ),
+                );
                 if shutdown.load(Ordering::Relaxed)
                     || !measure_cpu_autotune_candidate(
                         cfg,
                         tag,
                         shutdown,
-                        threads,
+                        *threads,
                         autotune_secs,
                         &mut measurements,
                     )?
@@ -641,7 +688,7 @@ fn maybe_autotune_cpu_threads(
     info(
         tag,
         format!(
-            "cpu-autotune | selected threads={} hps={} (per CPU instance)",
+            "cpu-autotune | done — best: {} threads at {} per CPU instance",
             best_threads,
             format_hashrate(best_hps)
         ),
@@ -693,12 +740,11 @@ fn measure_cpu_autotune_candidate(
     info(
         tag,
         format!(
-            "cpu-autotune | threads={} hashes={} sample={:.0}s wall={:.2}s hps={}",
+            "cpu-autotune |   -> {} threads: {} ({} hashes in {:.1}s)",
             threads,
+            format_hashrate(measurement.hps),
             measurement.hashes,
-            measurement.sample_secs,
             measurement.wall_secs,
-            format_hashrate(measurement.hps)
         ),
     );
     measurements.insert(threads, measurement);
