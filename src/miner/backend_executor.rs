@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use crossbeam_channel::{bounded, RecvTimeoutError, Sender, TrySendError};
+use crossbeam_channel::{bounded, RecvTimeoutError, SendTimeoutError, Sender, TrySendError};
 
 use crate::backend::{BackendCallStatus, BackendInstanceId, PowBackend, WorkAssignment};
 
@@ -75,6 +75,7 @@ pub(super) struct AssignmentTimeoutDecision {
 
 const ASSIGNMENT_TIMEOUT_STRIKES_BEFORE_QUARANTINE: u32 = 3;
 const BACKEND_STOP_ACK_TIMEOUT: Duration = Duration::from_secs(1);
+const BACKEND_STOP_ENQUEUE_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub(super) struct BackendExecutor {
@@ -385,7 +386,22 @@ impl BackendExecutor {
                     });
                     self.quarantine_backend(backend_id, backend_handle);
                 }
-                Err(TrySendError::Full(_)) => {
+                Err(TrySendError::Full(command)) => {
+                    let assignment_dispatch = matches!(
+                        &command,
+                        BackendWorkerCommand::Run {
+                            task: BackendTask {
+                                kind: BackendTaskKind::Assign(_) | BackendTaskKind::AssignBatch(_),
+                                ..
+                            },
+                            ..
+                        }
+                    );
+                    if assignment_dispatch {
+                        // Leave outcome unresolved so assignment timeout handling applies.
+                        continue;
+                    }
+
                     self.remove_backend_worker(backend_id, &backend_handle);
                     let _ = outcome_tx.send(BackendTaskOutcome {
                         idx,
@@ -505,27 +521,37 @@ fn perform_quarantine_stop(
 ) {
     if let Some(worker_tx) = worker_tx {
         let (done_tx, done_rx) = bounded::<()>(1);
-        if worker_tx
-            .send(BackendWorkerCommand::Stop {
-                backend_id,
-                backend,
-                backend_handle: Arc::clone(&backend_handle),
-                done_tx,
-            })
-            .is_ok()
-        {
-            if matches!(
-                done_rx.recv_timeout(BACKEND_STOP_ACK_TIMEOUT),
-                Err(RecvTimeoutError::Timeout)
-            ) {
+        let stop_command = BackendWorkerCommand::Stop {
+            backend_id,
+            backend,
+            backend_handle: Arc::clone(&backend_handle),
+            done_tx,
+        };
+        match worker_tx.send_timeout(stop_command, BACKEND_STOP_ENQUEUE_TIMEOUT) {
+            Ok(()) => {
+                if matches!(
+                    done_rx.recv_timeout(BACKEND_STOP_ACK_TIMEOUT),
+                    Err(RecvTimeoutError::Timeout)
+                ) {
+                    warn(
+                        "BACKEND",
+                        format!(
+                            "backend stop is still in progress for {backend}#{backend_id}; detached"
+                        ),
+                    );
+                }
+                return;
+            }
+            Err(SendTimeoutError::Timeout(_)) => {
                 warn(
                     "BACKEND",
                     format!(
-                        "backend stop is still in progress for {backend}#{backend_id}; detached"
+                        "backend stop command enqueue timed out for {backend}#{backend_id}; detached"
                     ),
                 );
+                return;
             }
-            return;
+            Err(SendTimeoutError::Disconnected(_)) => {}
         }
     }
 

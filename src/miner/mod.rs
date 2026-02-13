@@ -957,6 +957,7 @@ mod tests {
         supports_assignment_batching: bool,
         assign_delay: Option<Duration>,
         deadline_support: crate::backend::DeadlineSupport,
+        assignment_semantics: crate::backend::AssignmentSemantics,
     }
 
     impl MockBackend {
@@ -972,6 +973,7 @@ mod tests {
                 supports_assignment_batching: false,
                 assign_delay: None,
                 deadline_support: crate::backend::DeadlineSupport::Cooperative,
+                assignment_semantics: crate::backend::AssignmentSemantics::Replace,
             }
         }
 
@@ -1003,6 +1005,14 @@ mod tests {
             deadline_support: crate::backend::DeadlineSupport,
         ) -> Self {
             self.deadline_support = deadline_support;
+            self
+        }
+
+        fn with_assignment_semantics(
+            mut self,
+            assignment_semantics: crate::backend::AssignmentSemantics,
+        ) -> Self {
+            self.assignment_semantics = assignment_semantics;
             self
         }
     }
@@ -1079,7 +1089,7 @@ mod tests {
                 preferred_hash_poll_interval: self.preferred_hash_poll_interval,
                 max_inflight_assignments: self.max_inflight_assignments.max(1),
                 deadline_support: self.deadline_support,
-                assignment_semantics: crate::backend::AssignmentSemantics::Replace,
+                assignment_semantics: self.assignment_semantics,
             }
         }
     }
@@ -1322,6 +1332,47 @@ mod tests {
         assert!(
             wait_for_stop_call(&slow_state, Duration::from_millis(250)),
             "timed-out backend should be stopped once late dispatch completes"
+        );
+    }
+
+    #[test]
+    fn distribute_work_timeout_quarantines_append_semantics_backend_immediately() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let slow_state = Arc::new(MockState::default());
+        let mut backends = vec![slot(
+            12,
+            1,
+            Arc::new(
+                MockBackend::new("nvidia", 1, Arc::clone(&slow_state))
+                    .with_assign_delay(Duration::from_millis(50))
+                    .with_assignment_semantics(crate::backend::AssignmentSemantics::Append),
+            ),
+        )];
+
+        let err = distribute_work(
+            &mut backends,
+            DistributeWorkOptions {
+                epoch: 1,
+                work_id: 1,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                target: [0xFF; 32],
+                reservation: NonceReservation {
+                    start_nonce: 10,
+                    max_iters_per_lane: 1,
+                    reserved_span: 1,
+                },
+                stop_at: Instant::now() + Duration::from_secs(1),
+                assignment_timeout: Duration::from_millis(5),
+                backend_weights: None,
+            },
+            &backend_executor,
+        )
+        .expect_err("append semantics backend should be quarantined after first timeout");
+        assert!(format!("{err:#}").contains("all mining backends are unavailable"));
+
+        assert!(
+            wait_for_stop_call(&slow_state, Duration::from_millis(250)),
+            "timed-out append backend should be stopped once late dispatch completes"
         );
     }
 

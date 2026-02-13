@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 
-use crate::backend::{BackendInstanceId, NonceChunk, PowBackend, WorkAssignment, WorkTemplate};
+use crate::backend::{
+    AssignmentSemantics, BackendInstanceId, NonceChunk, PowBackend, WorkAssignment, WorkTemplate,
+};
 
 use super::backend_executor::{self, BackendTask, BackendTaskKind};
 use super::ui::warn;
@@ -210,18 +212,30 @@ fn dispatch_assignment_tasks(
             None => {
                 let timeout_decision =
                     backend_executor.note_assignment_timeout(backend_id, &slot.backend);
-                if timeout_decision.should_quarantine {
+                let append_semantics =
+                    backend_capabilities(&slot).assignment_semantics == AssignmentSemantics::Append;
+                if timeout_decision.should_quarantine || append_semantics {
                     backend_executor.quarantine_backend(backend_id, Arc::clone(&slot.backend));
                     backend_executor.remove_backend_worker(backend_id, &slot.backend);
-                    failures.push(DispatchFailure {
-                        backend_id,
-                        backend,
-                        reason: format!(
+                    let reason = if append_semantics && !timeout_decision.should_quarantine {
+                        format!(
+                            "assignment timed out after {}ms (strike {}/{}); append-assignment backend quarantined to prevent queue carry-over",
+                            timeout.as_millis(),
+                            timeout_decision.strikes,
+                            timeout_decision.threshold,
+                        )
+                    } else {
+                        format!(
                             "assignment timed out after {}ms (strike {}/{}); backend quarantined",
                             timeout.as_millis(),
                             timeout_decision.strikes,
                             timeout_decision.threshold,
-                        ),
+                        )
+                    };
+                    failures.push(DispatchFailure {
+                        backend_id,
+                        backend,
+                        reason,
                         quarantined: true,
                     });
                 } else {
