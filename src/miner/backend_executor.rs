@@ -298,6 +298,7 @@ impl BackendExecutor {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn take_backend_telemetry(
         &self,
         backend_id: BackendInstanceId,
@@ -326,14 +327,13 @@ impl BackendExecutor {
         build_backend_telemetry(counters, latencies, assignment_timeout_strikes)
     }
 
-    pub(super) fn take_backend_telemetry_batch(
+    pub(super) fn take_backend_telemetry_batch<'a, I>(
         &self,
-        backends: &[BackendSlot],
-    ) -> BTreeMap<BackendInstanceId, BackendTelemetry> {
-        if backends.is_empty() {
-            return BTreeMap::new();
-        }
-
+        backends: I,
+    ) -> BTreeMap<BackendInstanceId, BackendTelemetry>
+    where
+        I: IntoIterator<Item = &'a BackendSlot>,
+    {
         let mut timeout_counters = self.task_timeout_counters.lock().ok();
         let mut latency_counters = self.task_latency_counters.lock().ok();
         let assignment_timeout_strikes = self.assignment_timeout_strikes.lock().ok();

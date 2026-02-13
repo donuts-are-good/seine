@@ -1,12 +1,15 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use crate::backend::{BackendInstanceId, BackendTelemetry};
+use crate::backend::BackendInstanceId;
+#[cfg(test)]
+use crate::backend::BackendTelemetry;
 
 use super::{backend_capabilities, BackendSlot};
 
 pub(super) type BackendPollState = BTreeMap<BackendInstanceId, (Duration, Instant)>;
 
+#[cfg(test)]
 pub(super) struct BackendPollSample<'a> {
     pub slot: &'a BackendSlot,
     pub hashes: u64,
@@ -43,6 +46,7 @@ pub(super) fn next_backend_poll_deadline(poll_state: &BackendPollState) -> Insta
         .unwrap_or_else(Instant::now)
 }
 
+#[cfg(test)]
 pub(super) fn collect_due_backend_samples<'a, F>(
     backends: &'a [BackendSlot],
     configured: Duration,
@@ -51,7 +55,22 @@ pub(super) fn collect_due_backend_samples<'a, F>(
 ) where
     F: FnMut(BackendPollSample<'a>),
 {
+    for slot in due_backend_slots(backends, configured, poll_state) {
+        on_sample(BackendPollSample {
+            slot,
+            hashes: slot.backend.take_hashes(),
+            telemetry: slot.backend.take_telemetry(),
+        });
+    }
+}
+
+pub(super) fn due_backend_slots<'a>(
+    backends: &'a [BackendSlot],
+    configured: Duration,
+    poll_state: &mut BackendPollState,
+) -> Vec<&'a BackendSlot> {
     let now = Instant::now();
+    let mut due = Vec::new();
     for slot in backends {
         let (interval, next_poll) = poll_state.entry(slot.id).or_insert_with(|| {
             let interval = backend_poll_interval(slot, configured);
@@ -60,14 +79,10 @@ pub(super) fn collect_due_backend_samples<'a, F>(
         if now < *next_poll {
             continue;
         }
-
-        on_sample(BackendPollSample {
-            slot,
-            hashes: slot.backend.take_hashes(),
-            telemetry: slot.backend.take_telemetry(),
-        });
         *next_poll = now + *interval;
+        due.push(slot);
     }
+    due
 }
 
 #[cfg(test)]
@@ -191,6 +206,7 @@ mod tests {
             |sample| {
                 sampled_backend_ids.push(sample.slot.id);
                 sampled_hashes = sampled_hashes.saturating_add(sample.hashes);
+                let _ = sample.telemetry;
             },
         );
 

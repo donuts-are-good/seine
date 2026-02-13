@@ -17,7 +17,7 @@ pub(super) struct RoundDriverStep {
 }
 
 pub(super) struct RoundDriverInput<'a> {
-    pub backends: &'a [BackendSlot],
+    pub backends: &'a mut Vec<BackendSlot>,
     pub backend_events: &'a Receiver<BackendEvent>,
     pub backend_executor: &'a BackendExecutor,
     pub configured_hash_poll_interval: Duration,
@@ -110,35 +110,14 @@ where
 }
 
 pub(super) fn drive_round_step(input: RoundDriverInput<'_>) -> Result<RoundDriverStep> {
-    let collected_hashes = collect_round_backend_samples(
-        input.backends,
-        input.backend_executor,
-        input.configured_hash_poll_interval,
-        input.poll_state,
-        input.round_backend_hashes,
-        input.round_backend_telemetry,
-    );
-
-    let now = Instant::now();
-    let next_hash_poll_at = next_backend_poll_deadline(input.poll_state);
-    let mut wait_until = input.stop_at.min(next_hash_poll_at);
-    if let Some(extra_deadline) = input.extra_deadline {
-        wait_until = wait_until.min(extra_deadline);
-    }
-    let wait_for = wait_until
-        .saturating_duration_since(now)
-        .max(MIN_EVENT_WAIT);
-
-    let mut event = None;
-    crossbeam_channel::select! {
-        recv(input.backend_events) -> backend_event => {
-            event = Some(backend_event.map_err(|_| anyhow!("backend event channel closed"))?);
-        }
-        default(wait_for) => {}
-    }
-
-    Ok(RoundDriverStep {
-        collected_hashes,
-        event,
-    })
+    let mut context = RoundDriverContext {
+        backends: input.backends,
+        backend_events: input.backend_events,
+        backend_executor: input.backend_executor,
+        configured_hash_poll_interval: input.configured_hash_poll_interval,
+        poll_state: input.poll_state,
+        round_backend_hashes: input.round_backend_hashes,
+        round_backend_telemetry: input.round_backend_telemetry,
+    };
+    context.drive_step(input.stop_at, input.extra_deadline)
 }

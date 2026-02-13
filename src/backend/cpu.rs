@@ -10,7 +10,7 @@ use crossbeam_channel::{bounded, Sender};
 
 use crate::backend::{
     AssignmentSemantics, BackendCapabilities, BackendEvent, BackendExecutionModel,
-    BackendInstanceId, BackendTelemetry, BenchBackend, DeadlineSupport, MiningSolution, PowBackend,
+    BackendInstanceId, BackendTelemetry, BenchBackend, DeadlineSupport, PowBackend,
     PreemptionGranularity, WorkAssignment, WORK_ID_MAX,
 };
 use crate::config::CpuAffinityMode;
@@ -883,9 +883,9 @@ fn forward_event(shared: &Shared, event: BackendEvent) {
 mod tests {
     use super::{
         emit_error, forward_event, lane_quota_for_chunk, should_flush_hashes, start_assignment,
-        BackendEvent, CpuBackend, MiningSolution, ERROR_EVENT_MAX_BLOCK, HASH_BATCH_SIZE,
+        BackendEvent, CpuBackend, ERROR_EVENT_MAX_BLOCK, HASH_BATCH_SIZE,
     };
-    use crate::backend::PowBackend;
+    use crate::backend::{MiningSolution, PowBackend};
     use crate::config::CpuAffinityMode;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;

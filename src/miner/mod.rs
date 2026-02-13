@@ -571,7 +571,7 @@ fn collect_backend_hashes(
     mut round_backend_telemetry: Option<&mut BTreeMap<BackendInstanceId, BackendRoundTelemetry>>,
 ) {
     let mut collected = 0u64;
-    let mut runtime_telemetry = backend_executor.take_backend_telemetry_batch(backends);
+    let mut runtime_telemetry = backend_executor.take_backend_telemetry_batch(backends.iter());
     for slot in backends {
         let slot_hashes = slot.backend.take_hashes();
         let telemetry = slot.backend.take_telemetry();
@@ -611,25 +611,29 @@ fn collect_round_backend_samples(
     round_backend_hashes: &mut BTreeMap<BackendInstanceId, u64>,
     round_backend_telemetry: &mut BTreeMap<BackendInstanceId, BackendRoundTelemetry>,
 ) -> u64 {
+    let due_slots =
+        hash_poll::due_backend_slots(backends, configured_hash_poll_interval, poll_state);
+    if due_slots.is_empty() {
+        return 0;
+    }
+
     let mut collected = 0u64;
-    let mut runtime_telemetry = backend_executor.take_backend_telemetry_batch(backends);
-    hash_poll::collect_due_backend_samples(
-        backends,
-        configured_hash_poll_interval,
-        poll_state,
-        |sample| {
-            let backend_id = sample.slot.id;
-            merge_backend_telemetry(round_backend_telemetry, backend_id, sample.telemetry);
-            if let Some(runtime) = runtime_telemetry.remove(&backend_id) {
-                merge_backend_telemetry(round_backend_telemetry, backend_id, runtime);
-            }
-            if sample.hashes > 0 {
-                collected = collected.saturating_add(sample.hashes);
-                let entry = round_backend_hashes.entry(backend_id).or_insert(0);
-                *entry = entry.saturating_add(sample.hashes);
-            }
-        },
-    );
+    let mut runtime_telemetry =
+        backend_executor.take_backend_telemetry_batch(due_slots.iter().copied());
+    for slot in due_slots {
+        let backend_id = slot.id;
+        let hashes = slot.backend.take_hashes();
+        let telemetry = slot.backend.take_telemetry();
+        merge_backend_telemetry(round_backend_telemetry, backend_id, telemetry);
+        if let Some(runtime) = runtime_telemetry.remove(&backend_id) {
+            merge_backend_telemetry(round_backend_telemetry, backend_id, runtime);
+        }
+        if hashes > 0 {
+            collected = collected.saturating_add(hashes);
+            let entry = round_backend_hashes.entry(backend_id).or_insert(0);
+            *entry = entry.saturating_add(hashes);
+        }
+    }
     collected
 }
 
@@ -1208,7 +1212,7 @@ fn next_work_id(next_id: &mut u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{NonceChunk, WorkAssignment};
+    use crate::backend::{NonceChunk, WorkAssignment, WorkTemplate};
     use anyhow::anyhow;
     use blocknet_pow_spec::POW_HEADER_BASE_LEN;
     use crossbeam_channel::Sender;
@@ -2120,6 +2124,119 @@ mod tests {
 
         let effective = effective_hash_poll_interval(&backends, Duration::from_millis(200));
         assert_eq!(effective, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn collect_round_backend_samples_keeps_runtime_telemetry_until_backend_is_due() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let state_a = Arc::new(MockState::default());
+        let state_b = Arc::new(MockState::default());
+        let backend_a: Arc<dyn PowBackend> = Arc::new(
+            MockBackend::new("cpu-a", 1, Arc::clone(&state_a))
+                .with_assign_delay(Duration::from_millis(40)),
+        );
+        let backend_b: Arc<dyn PowBackend> = Arc::new(
+            MockBackend::new("cpu-b", 1, Arc::clone(&state_b))
+                .with_assign_delay(Duration::from_millis(40)),
+        );
+        let backends = vec![
+            slot(1, 1, Arc::clone(&backend_a)),
+            slot(2, 1, Arc::clone(&backend_b)),
+        ];
+
+        let make_work = || WorkAssignment {
+            template: Arc::new(WorkTemplate {
+                work_id: 1,
+                epoch: 1,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                target: [0xFF; 32],
+                stop_at: Instant::now() + Duration::from_secs(1),
+            }),
+            nonce_chunk: NonceChunk {
+                start_nonce: 0,
+                nonce_count: 1,
+            },
+        };
+
+        let outcomes = backend_executor.dispatch_backend_tasks(vec![
+            backend_executor::BackendTask {
+                idx: 0,
+                backend_id: 1,
+                backend: "cpu-a",
+                backend_handle: Arc::clone(&backend_a),
+                kind: backend_executor::BackendTaskKind::Assign(make_work()),
+                timeout: Duration::from_millis(5),
+            },
+            backend_executor::BackendTask {
+                idx: 1,
+                backend_id: 2,
+                backend: "cpu-b",
+                backend_handle: Arc::clone(&backend_b),
+                kind: backend_executor::BackendTaskKind::Assign(make_work()),
+                timeout: Duration::from_millis(5),
+            },
+        ]);
+        assert!(matches!(
+            outcomes[0],
+            Some(backend_executor::BackendTaskDispatchResult::TimedOut(
+                backend_executor::BackendTaskTimeoutKind::Execution
+            ))
+        ));
+        assert!(matches!(
+            outcomes[1],
+            Some(backend_executor::BackendTaskDispatchResult::TimedOut(
+                backend_executor::BackendTaskTimeoutKind::Execution
+            ))
+        ));
+
+        let poll_interval = Duration::from_millis(200);
+        let mut poll_state = hash_poll::build_backend_poll_state(&backends, poll_interval);
+        poll_state.insert(
+            1,
+            (poll_interval, Instant::now() - Duration::from_millis(1)),
+        );
+        poll_state.insert(2, (poll_interval, Instant::now() + Duration::from_secs(30)));
+
+        let mut round_backend_hashes = BTreeMap::new();
+        let mut round_backend_telemetry = BTreeMap::new();
+        let _ = collect_round_backend_samples(
+            &backends,
+            &backend_executor,
+            poll_interval,
+            &mut poll_state,
+            &mut round_backend_hashes,
+            &mut round_backend_telemetry,
+        );
+        assert_eq!(
+            round_backend_telemetry
+                .get(&1)
+                .map(|telemetry| telemetry.assignment_execution_timeouts),
+            Some(1)
+        );
+        assert!(
+            !round_backend_telemetry.contains_key(&2),
+            "backend 2 should not be merged until it is due for polling"
+        );
+
+        poll_state.insert(
+            2,
+            (poll_interval, Instant::now() - Duration::from_millis(1)),
+        );
+        let _ = collect_round_backend_samples(
+            &backends,
+            &backend_executor,
+            poll_interval,
+            &mut poll_state,
+            &mut round_backend_hashes,
+            &mut round_backend_telemetry,
+        );
+        assert_eq!(
+            round_backend_telemetry
+                .get(&2)
+                .map(|telemetry| telemetry.assignment_execution_timeouts),
+            Some(1),
+            "runtime telemetry for non-due backends must remain until they are sampled"
+        );
     }
 
     #[test]
