@@ -31,7 +31,6 @@ const CUDA_KERNEL_SRC: &str = include_str!("nvidia_kernel.cu");
 const MAX_RECOMMENDED_LANES: usize = 16;
 const CMD_CHANNEL_CAPACITY: usize = 256;
 const EVENT_SEND_WAIT: Duration = Duration::from_millis(5);
-const KERNEL_THREADS: u32 = 128;
 const ARGON2_VERSION_V13: u32 = 0x13;
 const ARGON2_ALGORITHM_ID: u32 = 2; // Argon2id
 
@@ -141,7 +140,7 @@ impl CudaArgon2Engine {
             "--use_fast_math".to_string(),
             "--ftz=true".to_string(),
             "--fmad=true".to_string(),
-            "--maxrregcount=128".to_string(),
+            "--maxrregcount=224".to_string(),
             format!("--gpu-architecture=sm_{}{}", cc_major, cc_minor),
         ];
         let cubin =
@@ -153,6 +152,9 @@ impl CudaArgon2Engine {
         let kernel = module
             .load_function("argon2id_fill_kernel")
             .map_err(|err| anyhow!("failed to load CUDA kernel function: {err:?}"))?;
+        let touch_kernel = module
+            .load_function("touch_lane_memory_kernel")
+            .map_err(|err| anyhow!("failed to load CUDA probe kernel function: {err:?}"))?;
 
         let params = pow_params()
             .map_err(|err| anyhow!("invalid Argon2 parameters for CUDA backend: {err}"))?;
@@ -163,16 +165,39 @@ impl CudaArgon2Engine {
         let lane_bytes = CPU_LANE_MEMORY_BYTES.max(u64::from(m_blocks) * 1024);
         let memory_budget_mib = memory_free_mib.unwrap_or(memory_total_mib).max(1);
         let memory_budget_bytes = memory_budget_mib.saturating_mul(1024 * 1024);
-        let usable_bytes = memory_budget_bytes.saturating_mul(85) / 100;
+        let usable_bytes = memory_budget_bytes;
         let by_memory = usize::try_from((usable_bytes / lane_bytes).max(1)).unwrap_or(1);
         let max_lanes = by_memory.max(1).min(MAX_RECOMMENDED_LANES);
+        let lane_stride_words = u64::from(m_blocks).saturating_mul(128);
 
         let mut selected = None;
         for lanes in (1..=max_lanes).rev() {
             match try_allocate_cuda_buffers(&stream, m_blocks, lanes) {
-                Ok(buffers) => {
-                    selected = Some((lanes, buffers));
-                    break;
+                Ok((mut lane_memory, seed_blocks, last_blocks, hashes_done)) => {
+                    match probe_cuda_lane_memory(
+                        &stream,
+                        &touch_kernel,
+                        &mut lane_memory,
+                        lane_stride_words,
+                        lanes,
+                    ) {
+                        Ok(()) => {
+                            selected =
+                                Some((lanes, (lane_memory, seed_blocks, last_blocks, hashes_done)));
+                            break;
+                        }
+                        Err(err)
+                            if lanes > 1
+                                && format!("{err:?}").contains("CUDA_ERROR_OUT_OF_MEMORY") =>
+                        {
+                            continue;
+                        }
+                        Err(err) => {
+                            return Err(anyhow!(
+                                "failed to validate CUDA buffers for {lanes} lanes on device {device_index}: {err:?}"
+                            ));
+                        }
+                    }
                 }
                 Err(err)
                     if lanes > 1 && format!("{err:?}").contains("CUDA_ERROR_OUT_OF_MEMORY") =>
@@ -272,8 +297,10 @@ impl CudaArgon2Engine {
 
         let lanes_u32 = u32::try_from(lanes).map_err(|_| anyhow!("lane count overflow"))?;
         let cfg = LaunchConfig {
-            grid_dim: (lanes_u32.div_ceil(KERNEL_THREADS), 1, 1),
-            block_dim: (KERNEL_THREADS, 1, 1),
+            // One lane per CUDA block keeps each long-running lane independent and avoids
+            // burning per-thread local memory on inactive threads.
+            grid_dim: (lanes_u32, 1, 1),
+            block_dim: (1, 1, 1),
             shared_mem_bytes: 0,
         };
 
@@ -1284,6 +1311,33 @@ fn try_allocate_cuda_buffers(
     let last_blocks = unsafe { stream.alloc::<u64>(lanes.saturating_mul(128)) }?;
     let hashes_done = stream.alloc_zeros::<u64>(1)?;
     Ok((lane_memory, seed_blocks, last_blocks, hashes_done))
+}
+
+fn probe_cuda_lane_memory(
+    stream: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    lane_memory: &mut CudaSlice<u64>,
+    lane_stride_words: u64,
+    lanes: usize,
+) -> std::result::Result<(), DriverError> {
+    let lanes_u32 = u32::try_from(lanes).unwrap_or(u32::MAX);
+    let cfg = LaunchConfig {
+        grid_dim: (lanes_u32, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        let mut launch = stream.launch_builder(kernel);
+        launch
+            .arg(lane_memory)
+            .arg(&lanes_u32)
+            .arg(&lane_stride_words);
+        launch.launch(cfg)?;
+    }
+
+    stream.synchronize()?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -124,6 +124,30 @@ __device__ __forceinline__ void update_address_block(
     );
 }
 
+__global__ void touch_lane_memory_kernel(
+    unsigned long long *lane_memory,
+    unsigned int lanes_active,
+    unsigned long long lane_stride_words
+) {
+    const unsigned int lane = blockIdx.x * blockDim.x + threadIdx.x;
+    if (lane >= lanes_active || lane_stride_words == 0ULL) {
+        return;
+    }
+
+    volatile unsigned long long *lane_ptr =
+        lane_memory + static_cast<unsigned long long>(lane) * lane_stride_words;
+
+    // Touch one 4 KiB page at a time (512 x u64) to force physical commit.
+    for (unsigned long long word = 0ULL; word < lane_stride_words; word += 512ULL) {
+        unsigned long long v = lane_ptr[word];
+        lane_ptr[word] = v;
+    }
+
+    const unsigned long long tail = lane_stride_words - 1ULL;
+    unsigned long long tail_v = lane_ptr[tail];
+    lane_ptr[tail] = tail_v;
+}
+
 __global__ void argon2id_fill_kernel(
     const unsigned long long *seed_blocks,
     unsigned int lanes_active,
