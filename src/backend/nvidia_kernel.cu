@@ -4,6 +4,11 @@
 extern "C" {
 
 constexpr unsigned int ARGON2_COOP_THREADS = 32U;
+constexpr unsigned int ARGON2_COOP_WARP_MASK = 0xFFFFFFFFU;
+
+__device__ __forceinline__ void coop_sync() {
+    __syncwarp(ARGON2_COOP_WARP_MASK);
+}
 
 __device__ __forceinline__ unsigned long long blamka(
     unsigned long long x,
@@ -59,11 +64,11 @@ __device__ __forceinline__ void permute_round(
 }
 
 __device__ __forceinline__ void compress_block_coop(
-    const unsigned long long *rhs,
-    const unsigned long long *lhs,
-    unsigned long long *out,
-    unsigned long long *scratch_r,
-    unsigned long long *scratch_q,
+    const unsigned long long *__restrict__ rhs,
+    const unsigned long long *__restrict__ lhs,
+    unsigned long long *__restrict__ out,
+    unsigned long long *__restrict__ scratch_r,
+    unsigned long long *__restrict__ scratch_q,
     unsigned int tid
 ) {
     for (unsigned int i = tid; i < 128U; i += ARGON2_COOP_THREADS) {
@@ -71,7 +76,7 @@ __device__ __forceinline__ void compress_block_coop(
         scratch_r[i] = r;
         scratch_q[i] = r;
     }
-    __syncthreads();
+    coop_sync();
 
     if (tid < 8U) {
         const unsigned int base = tid * 16U;
@@ -114,7 +119,7 @@ __device__ __forceinline__ void compress_block_coop(
         scratch_q[base + 14U] = v14;
         scratch_q[base + 15U] = v15;
     }
-    __syncthreads();
+    coop_sync();
 
     if (tid < 8U) {
         const unsigned int b = tid * 2U;
@@ -157,26 +162,25 @@ __device__ __forceinline__ void compress_block_coop(
         scratch_q[b + 112U] = v14;
         scratch_q[b + 113U] = v15;
     }
-    __syncthreads();
+    coop_sync();
 
     for (unsigned int i = tid; i < 128U; i += ARGON2_COOP_THREADS) {
         out[i] = scratch_q[i] ^ scratch_r[i];
     }
-    __syncthreads();
 }
 
 __device__ __forceinline__ void update_address_block_coop(
-    unsigned long long *address_block,
-    unsigned long long *input_block,
-    const unsigned long long *zero_block,
-    unsigned long long *scratch_r,
-    unsigned long long *scratch_q,
+    unsigned long long *__restrict__ address_block,
+    unsigned long long *__restrict__ input_block,
+    const unsigned long long *__restrict__ zero_block,
+    unsigned long long *__restrict__ scratch_r,
+    unsigned long long *__restrict__ scratch_q,
     unsigned int tid
 ) {
     if (tid == 0U) {
         input_block[6] += 1ULL;
     }
-    __syncthreads();
+    coop_sync();
     compress_block_coop(
         zero_block,
         input_block,
@@ -220,17 +224,16 @@ __global__ void touch_lane_memory_kernel(
 }
 
 __global__ void argon2id_fill_kernel(
-    const unsigned long long *seed_blocks,
+    const unsigned long long *__restrict__ seed_blocks,
     unsigned int lanes_active,
     unsigned int m_blocks,
     unsigned int t_cost,
-    unsigned long long *lane_memory,
-    unsigned long long *out_last_blocks,
-    unsigned long long *out_hashes_done
+    unsigned long long *__restrict__ lane_memory,
+    unsigned long long *__restrict__ out_last_blocks
 ) {
     const unsigned int lane = blockIdx.x;
     const unsigned int tid = threadIdx.x;
-    if (lane >= lanes_active || tid >= ARGON2_COOP_THREADS || m_blocks < 8U) {
+    if (lane >= lanes_active || m_blocks < 8U) {
         return;
     }
 
@@ -244,7 +247,7 @@ __global__ void argon2id_fill_kernel(
     for (unsigned int i = tid; i < 256U; i += ARGON2_COOP_THREADS) {
         memory[i] = seed[i];
     }
-    __syncthreads();
+    coop_sync();
 
     const unsigned int segment_length = m_blocks / 4U;
     const unsigned int lane_length = m_blocks;
@@ -260,11 +263,8 @@ __global__ void argon2id_fill_kernel(
         address_block[i] = 0ULL;
         input_block[i] = 0ULL;
         zero_block[i] = 0ULL;
-        block_tmp[i] = 0ULL;
-        scratch_r[i] = 0ULL;
-        scratch_q[i] = 0ULL;
     }
-    __syncthreads();
+    coop_sync();
 
     for (unsigned int pass = 0; pass < t_cost; ++pass) {
         for (unsigned int slice = 0; slice < 4U; ++slice) {
@@ -282,7 +282,7 @@ __global__ void argon2id_fill_kernel(
                     input_block[4] = static_cast<unsigned long long>(t_cost);
                     input_block[5] = 2ULL; // Argon2id
                 }
-                __syncthreads();
+                coop_sync();
             }
 
             const unsigned int first_block =
@@ -309,7 +309,7 @@ __global__ void argon2id_fill_kernel(
                             tid
                         );
                     }
-                    __syncthreads();
+                    coop_sync();
                     rand64 = address_block[address_index];
                 } else {
                     rand64 = memory[static_cast<unsigned long long>(prev_index) * 128ULL];
@@ -365,7 +365,7 @@ __global__ void argon2id_fill_kernel(
                         memory[dst_offset + static_cast<unsigned long long>(i)] ^= block_tmp[i];
                     }
                 }
-                __syncthreads();
+                coop_sync();
 
                 prev_index = cur_index;
                 cur_index += 1U;
@@ -379,11 +379,6 @@ __global__ void argon2id_fill_kernel(
         out_last_blocks + static_cast<unsigned long long>(lane) * 128ULL;
     for (unsigned int i = tid; i < 128U; i += ARGON2_COOP_THREADS) {
         out[i] = last[i];
-    }
-    __syncthreads();
-
-    if (tid == 0U && out_hashes_done != nullptr) {
-        atomicAdd(out_hashes_done, 1ULL);
     }
 }
 

@@ -9,10 +9,11 @@ This log tracks every measurable NVIDIA backend optimization attempt so we can i
 - Variance note: results move with clocks/thermals; prioritize 3-round averages over single-round samples.
 
 ## Current Best Known Config
-- Commit: `1198bd2`
+- Commit: `working tree` (post-pass)
 - Kernel model: cooperative per-lane execution (`32` threads/lane block)
 - NVRTC flags include: `--maxrregcount=224`
-- Observed best 3-round average so far: `1.007 H/s` (2026-02-13)
+- Runtime hot path: no explicit pre-`memcpy_dtoh` stream synchronize in `run_fill_batch`
+- Observed best 3-round average so far: `1.027 H/s` (2026-02-13)
 
 ## Attempt History
 | Date | Commit/State | Change | Result | Outcome |
@@ -29,6 +30,8 @@ This log tracks every measurable NVIDIA backend optimization attempt so we can i
 | 2026-02-13 | working tree | PTXAS cache hint `-dlcm=ca` | `0.985 H/s` avg | Reverted |
 | 2026-02-13 | working tree | Thread-0-only ref-index mapping micro-opt | `0.849 H/s` avg | Reverted |
 | 2026-02-13 | working tree | Cooperative loop unroll pragma pass | `0.583 H/s` | Reverted |
+| 2026-02-13 | working tree | Warp-sync + device hash-counter removal + lane-0 ref-index broadcast | `0.977 H/s` avg | Reverted (slower than baseline) |
+| 2026-02-13 | working tree | Keep warp-sync + drop device hash-counter + restore per-thread ref-index + remove pre-D2H stream sync | `1.027 H/s` avg | Kept (new best, stable over rerun) |
 
 ## New Entry Template
 Copy this row and fill in all fields after each pass:

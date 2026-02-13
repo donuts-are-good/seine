@@ -160,7 +160,6 @@ struct CudaArgon2Engine {
     lane_memory: CudaSlice<u64>,
     seed_blocks: CudaSlice<u64>,
     last_blocks: CudaSlice<u64>,
-    hashes_done: CudaSlice<u64>,
     host_seed_words: Vec<u64>,
     host_last_words: Vec<u64>,
     host_hashes: Vec<[u8; POW_OUTPUT_LEN]>,
@@ -222,7 +221,7 @@ impl CudaArgon2Engine {
         let mut selected = None;
         for lanes in (1..=max_lanes).rev() {
             match try_allocate_cuda_buffers(&stream, m_blocks, lanes) {
-                Ok((mut lane_memory, seed_blocks, last_blocks, hashes_done)) => {
+                Ok((mut lane_memory, seed_blocks, last_blocks)) => {
                     match probe_cuda_lane_memory(
                         &stream,
                         &touch_kernel,
@@ -232,7 +231,7 @@ impl CudaArgon2Engine {
                     ) {
                         Ok(()) => {
                             selected =
-                                Some((lanes, (lane_memory, seed_blocks, last_blocks, hashes_done)));
+                                Some((lanes, (lane_memory, seed_blocks, last_blocks)));
                             break;
                         }
                         Err(err)
@@ -261,7 +260,7 @@ impl CudaArgon2Engine {
             }
         }
 
-        let (max_lanes, (lane_memory, seed_blocks, last_blocks, hashes_done)) = selected
+        let (max_lanes, (lane_memory, seed_blocks, last_blocks)) = selected
             .ok_or_else(|| anyhow!("failed to allocate CUDA buffers for any lane count"))?;
 
         Ok(Self {
@@ -274,7 +273,6 @@ impl CudaArgon2Engine {
             lane_memory,
             seed_blocks,
             last_blocks,
-            hashes_done,
             host_seed_words: vec![0u64; max_lanes * 256],
             host_last_words: vec![0u64; max_lanes * 128],
             host_hashes: vec![[0u8; POW_OUTPUT_LEN]; max_lanes],
@@ -335,39 +333,27 @@ impl CudaArgon2Engine {
         }
 
         {
-            let mut hashes_view = self
-                .hashes_done
-                .try_slice_mut(0..1)
-                .ok_or_else(|| anyhow!("failed to slice CUDA hash counter"))?;
-            self.stream
-                .memcpy_htod(&[0u64], &mut hashes_view)
-                .map_err(cuda_driver_err)?;
+            let lanes_u32 = u32::try_from(lanes).map_err(|_| anyhow!("lane count overflow"))?;
+            let cfg = LaunchConfig {
+                // One cooperative block per lane. Threads in the block collaborate on Argon2
+                // compression and memory transfer for that lane.
+                grid_dim: (lanes_u32, 1, 1),
+                block_dim: (KERNEL_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            unsafe {
+                let mut launch = self.stream.launch_builder(&self.kernel);
+                launch
+                    .arg(&self.seed_blocks)
+                    .arg(&lanes_u32)
+                    .arg(&self.m_blocks)
+                    .arg(&self.t_cost)
+                    .arg(&mut self.lane_memory)
+                    .arg(&mut self.last_blocks);
+                launch.launch(cfg).map_err(cuda_driver_err)?;
+            }
         }
-
-        let lanes_u32 = u32::try_from(lanes).map_err(|_| anyhow!("lane count overflow"))?;
-        let cfg = LaunchConfig {
-            // One cooperative block per lane. Threads in the block collaborate on Argon2
-            // compression and memory transfer for that lane.
-            grid_dim: (lanes_u32, 1, 1),
-            block_dim: (KERNEL_THREADS, 1, 1),
-            shared_mem_bytes: 0,
-        };
-
-        unsafe {
-            let mut launch = self.stream.launch_builder(&self.kernel);
-            launch
-                .arg(&self.seed_blocks)
-                .arg(&lanes_u32)
-                .arg(&self.m_blocks)
-                .arg(&self.t_cost)
-                .arg(&mut self.lane_memory)
-                .arg(&mut self.last_blocks)
-                .arg(&mut self.hashes_done);
-            launch.launch(cfg).map_err(cuda_driver_err)?;
-        }
-
-        self.stream.synchronize().map_err(cuda_driver_err)?;
-
         let last_words = lanes * 128;
         {
             let last_view = self
@@ -379,18 +365,7 @@ impl CudaArgon2Engine {
                 .map_err(cuda_driver_err)?;
         }
 
-        let hashes_done = {
-            let mut done = [0u64; 1];
-            let done_view = self
-                .hashes_done
-                .try_slice(0..1)
-                .ok_or_else(|| anyhow!("failed to slice CUDA hash counter readback"))?;
-            self.stream
-                .memcpy_dtoh(&done_view, &mut done)
-                .map_err(cuda_driver_err)?;
-            usize::try_from(done[0]).unwrap_or(lanes)
-        }
-        .min(lanes);
+        let hashes_done = lanes;
 
         for idx in 0..hashes_done {
             finalize_lane_hash(
@@ -1375,15 +1350,7 @@ fn try_allocate_cuda_buffers(
     stream: &Arc<CudaStream>,
     m_blocks: u32,
     lanes: usize,
-) -> std::result::Result<
-    (
-        CudaSlice<u64>,
-        CudaSlice<u64>,
-        CudaSlice<u64>,
-        CudaSlice<u64>,
-    ),
-    DriverError,
-> {
+) -> std::result::Result<(CudaSlice<u64>, CudaSlice<u64>, CudaSlice<u64>), DriverError> {
     let lane_words_u64 = u64::from(m_blocks).saturating_mul(128);
     let total_lane_words_u64 = lane_words_u64.saturating_mul(lanes as u64);
     let total_lane_words = usize::try_from(total_lane_words_u64).unwrap_or(usize::MAX);
@@ -1391,8 +1358,7 @@ fn try_allocate_cuda_buffers(
     let lane_memory = unsafe { stream.alloc::<u64>(total_lane_words) }?;
     let seed_blocks = unsafe { stream.alloc::<u64>(lanes.saturating_mul(256)) }?;
     let last_blocks = unsafe { stream.alloc::<u64>(lanes.saturating_mul(128)) }?;
-    let hashes_done = stream.alloc_zeros::<u64>(1)?;
-    Ok((lane_memory, seed_blocks, last_blocks, hashes_done))
+    Ok((lane_memory, seed_blocks, last_blocks))
 }
 
 fn probe_cuda_lane_memory(
