@@ -43,9 +43,13 @@ pub(super) fn distribute_work(
     let mut attempt_start_nonce = options.reservation.start_nonce;
     let mut additional_span_consumed = 0u64;
     let mut first_attempt = true;
+    let mut non_quarantined_retry_used = false;
     loop {
         if backends.is_empty() {
             bail!("all mining backends are unavailable");
+        }
+        if std::time::Instant::now() >= options.stop_at {
+            return Ok(additional_span_consumed);
         }
 
         let nonce_counts = compute_backend_nonce_counts(
@@ -75,11 +79,19 @@ pub(super) fn distribute_work(
         for (idx, slot) in std::mem::take(backends).into_iter().enumerate() {
             let nonce_count = *nonce_counts.get(idx).unwrap_or(&slot.lanes.max(1));
             let capabilities = backend_capabilities(&slot);
+            let dispatch_iters_per_lane =
+                backend_dispatch_iters_per_lane(&slot, options.reservation.max_iters_per_lane);
+            let preferred_dispatch_nonce_count = slot
+                .lanes
+                .max(1)
+                .saturating_mul(dispatch_iters_per_lane)
+                .max(slot.lanes.max(1));
             let assignments = build_assignment_batch(
                 Arc::clone(&template),
                 chunk_start,
                 nonce_count,
                 capabilities.max_inflight_assignments,
+                preferred_dispatch_nonce_count,
             );
 
             dispatch_tasks.push(DispatchTask {
@@ -139,11 +151,26 @@ pub(super) fn distribute_work(
         }
 
         if has_non_quarantined_failures {
+            if non_quarantined_retry_used || std::time::Instant::now() >= options.stop_at {
+                warn(
+                    "BACKEND",
+                    "assignment timeout without quarantine; deferring redistribution to next round",
+                );
+                return Ok(additional_span_consumed);
+            }
+
+            non_quarantined_retry_used = true;
+            first_attempt = false;
+            attempt_start_nonce = attempt_start_nonce.wrapping_add(attempt_span);
             warn(
                 "BACKEND",
-                "assignment timeout without quarantine; deferring redistribution to next round",
+                format!(
+                    "assignment timeout without quarantine; redistributing immediately with remaining={} start_nonce={}",
+                    backend_names(backends),
+                    attempt_start_nonce
+                ),
             );
-            return Ok(additional_span_consumed);
+            continue;
         }
 
         first_attempt = false;
@@ -425,9 +452,17 @@ fn build_assignment_batch(
     start_nonce: u64,
     nonce_count: u64,
     max_inflight_assignments: u32,
+    preferred_dispatch_nonce_count: u64,
 ) -> DispatchAssignments {
     let nonce_count = nonce_count.max(1);
-    let parts = (max_inflight_assignments.max(1) as u64).min(nonce_count);
+    let preferred = preferred_dispatch_nonce_count.max(1);
+    let desired_parts = nonce_count
+        .saturating_add(preferred.saturating_sub(1))
+        .saturating_div(preferred)
+        .max(1);
+    let parts = desired_parts
+        .min(max_inflight_assignments.max(1) as u64)
+        .min(nonce_count);
     if parts == 1 {
         return DispatchAssignments::Single(WorkAssignment {
             template,

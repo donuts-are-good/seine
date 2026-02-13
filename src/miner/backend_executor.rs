@@ -536,8 +536,41 @@ fn perform_quarantine_stop(
     backend_handle: Arc<dyn PowBackend>,
     worker_tx: Option<Sender<BackendWorkerCommand>>,
 ) {
-    let mut should_run_fallback_stop = true;
+    let mut should_run_fallback_stop = worker_tx.is_none();
     if let Some(worker_tx) = worker_tx {
+        let wait_for_stop_ack = |done_rx: crossbeam_channel::Receiver<()>| match done_rx
+            .recv_timeout(BACKEND_STOP_ACK_TIMEOUT)
+        {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                warn(
+                        "BACKEND",
+                        format!(
+                            "backend stop is still in progress for {backend}#{backend_id}; requesting interrupt before detach"
+                        ),
+                    );
+                if let Err(err) = backend_handle.request_timeout_interrupt() {
+                    warn(
+                        "BACKEND",
+                        format!(
+                            "backend stop interrupt failed for {backend}#{backend_id}: {err:#}"
+                        ),
+                    );
+                }
+                if matches!(
+                    done_rx.recv_timeout(BACKEND_STOP_ACK_GRACE_TIMEOUT),
+                    Err(RecvTimeoutError::Timeout)
+                ) {
+                    warn(
+                        "BACKEND",
+                        format!(
+                            "backend stop did not acknowledge for {backend}#{backend_id}; detached"
+                        ),
+                    );
+                }
+            }
+        };
+
         let (done_tx, done_rx) = bounded::<()>(1);
         let stop_command = BackendWorkerCommand::Stop {
             backend_id,
@@ -548,46 +581,50 @@ fn perform_quarantine_stop(
         match worker_tx.send_timeout(stop_command, BACKEND_STOP_ENQUEUE_TIMEOUT) {
             Ok(()) => {
                 should_run_fallback_stop = false;
-                match done_rx.recv_timeout(BACKEND_STOP_ACK_TIMEOUT) {
-                    Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
-                    Err(RecvTimeoutError::Timeout) => {
-                        warn(
-                            "BACKEND",
-                            format!(
-                                "backend stop is still in progress for {backend}#{backend_id}; requesting interrupt before detach"
-                            ),
-                        );
-                        if let Err(err) = backend_handle.request_timeout_interrupt() {
-                            warn(
-                                "BACKEND",
-                                format!(
-                                    "backend stop interrupt failed for {backend}#{backend_id}: {err:#}"
-                                ),
-                            );
-                        }
-                        if matches!(
-                            done_rx.recv_timeout(BACKEND_STOP_ACK_GRACE_TIMEOUT),
-                            Err(RecvTimeoutError::Timeout)
-                        ) {
-                            warn(
-                                "BACKEND",
-                                format!(
-                                    "backend stop did not acknowledge for {backend}#{backend_id}; detached"
-                                ),
-                            );
-                        }
-                    }
-                }
+                wait_for_stop_ack(done_rx);
             }
             Err(SendTimeoutError::Timeout(_)) => {
+                should_run_fallback_stop = false;
                 warn(
                     "BACKEND",
                     format!(
-                        "backend stop command enqueue timed out for {backend}#{backend_id}; running synchronous stop fallback"
+                        "backend stop command enqueue timed out for {backend}#{backend_id}; requesting interrupt and retrying stop enqueue"
                     ),
                 );
+                if let Err(err) = backend_handle.request_timeout_interrupt() {
+                    warn(
+                        "BACKEND",
+                        format!(
+                            "backend stop interrupt failed for {backend}#{backend_id}: {err:#}"
+                        ),
+                    );
+                }
+
+                let (retry_done_tx, retry_done_rx) = bounded::<()>(1);
+                let retry_stop_command = BackendWorkerCommand::Stop {
+                    backend_id,
+                    backend,
+                    backend_handle: Arc::clone(&backend_handle),
+                    done_tx: retry_done_tx,
+                };
+                match worker_tx.send_timeout(retry_stop_command, BACKEND_STOP_ACK_GRACE_TIMEOUT) {
+                    Ok(()) => wait_for_stop_ack(retry_done_rx),
+                    Err(SendTimeoutError::Timeout(_)) => {
+                        warn(
+                            "BACKEND",
+                            format!(
+                                "backend stop command is still saturated for {backend}#{backend_id}; detached without synchronous stop fallback"
+                            ),
+                        );
+                    }
+                    Err(SendTimeoutError::Disconnected(_)) => {
+                        should_run_fallback_stop = true;
+                    }
+                }
             }
-            Err(SendTimeoutError::Disconnected(_)) => {}
+            Err(SendTimeoutError::Disconnected(_)) => {
+                should_run_fallback_stop = true;
+            }
         }
     }
 
@@ -816,10 +853,57 @@ mod tests {
         assert_eq!(stops.load(Ordering::Relaxed), 1);
     }
 
+    struct StopInterruptBackend {
+        stops: Arc<AtomicUsize>,
+        interrupts: Arc<AtomicUsize>,
+    }
+
+    impl StopInterruptBackend {
+        fn new(stops: Arc<AtomicUsize>, interrupts: Arc<AtomicUsize>) -> Self {
+            Self { stops, interrupts }
+        }
+    }
+
+    impl PowBackend for StopInterruptBackend {
+        fn name(&self) -> &'static str {
+            "stop-interrupt"
+        }
+
+        fn lanes(&self) -> usize {
+            1
+        }
+
+        fn set_instance_id(&self, _id: BackendInstanceId) {}
+
+        fn set_event_sink(&self, _sink: Sender<BackendEvent>) {}
+
+        fn start(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&self) {
+            self.stops.fetch_add(1, Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(40));
+        }
+
+        fn assign_work(&self, _work: WorkAssignment) -> Result<()> {
+            Ok(())
+        }
+
+        fn request_timeout_interrupt(&self) -> Result<()> {
+            self.interrupts.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
     #[test]
-    fn quarantine_falls_back_to_synchronous_stop_when_stop_enqueue_times_out() {
+    fn quarantine_avoids_synchronous_stop_when_stop_enqueue_times_out() {
         let stops = Arc::new(AtomicUsize::new(0));
-        let backend = Arc::new(StopCountingBackend::new(Arc::clone(&stops))) as Arc<dyn PowBackend>;
+        let interrupts = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(StopInterruptBackend::new(
+            Arc::clone(&stops),
+            Arc::clone(&interrupts),
+        )) as Arc<dyn PowBackend>;
         let (worker_tx, _worker_rx) = bounded::<BackendWorkerCommand>(1);
         let (outcome_tx, _outcome_rx) = bounded::<BackendTaskOutcome>(1);
         worker_tx
@@ -838,7 +922,8 @@ mod tests {
 
         perform_quarantine_stop(5, "stop-counter", backend, Some(worker_tx));
 
-        assert_eq!(stops.load(Ordering::Relaxed), 1);
+        assert_eq!(stops.load(Ordering::Relaxed), 0);
+        assert!(interrupts.load(Ordering::Relaxed) >= 1);
     }
 
     struct CountingBackend {

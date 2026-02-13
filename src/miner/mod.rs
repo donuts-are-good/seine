@@ -986,6 +986,19 @@ mod tests {
             self
         }
 
+        fn with_preferred_dispatch_iters_per_lane(mut self, preferred_iters_per_lane: u64) -> Self {
+            self.preferred_iters_per_lane = Some(preferred_iters_per_lane.max(1));
+            self
+        }
+
+        fn with_preferred_allocation_iters_per_lane(
+            mut self,
+            preferred_iters_per_lane: u64,
+        ) -> Self {
+            self.preferred_allocation_iters_per_lane = Some(preferred_iters_per_lane.max(1));
+            self
+        }
+
         fn with_preferred_hash_poll_interval(mut self, interval: Duration) -> Self {
             self.preferred_hash_poll_interval = Some(interval);
             self
@@ -1252,7 +1265,8 @@ mod tests {
             1,
             Arc::new(
                 MockBackend::new("nvidia", 1, Arc::clone(&state))
-                    .with_preferred_iters_per_lane(12)
+                    .with_preferred_allocation_iters_per_lane(12)
+                    .with_preferred_dispatch_iters_per_lane(3)
                     .with_max_inflight_assignments(4),
             ),
         )];
@@ -1310,35 +1324,11 @@ mod tests {
             ),
         )];
 
-        for round in 0..2u64 {
-            let additional_span = distribute_work(
-                &mut backends,
-                DistributeWorkOptions {
-                    epoch: round + 1,
-                    work_id: round + 1,
-                    header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
-                    target: [0xFF; 32],
-                    reservation: NonceReservation {
-                        start_nonce: 10,
-                        max_iters_per_lane: 1,
-                        reserved_span: 1,
-                    },
-                    stop_at: Instant::now() + Duration::from_secs(1),
-                    assignment_timeout: Duration::from_millis(5),
-                    backend_weights: None,
-                },
-                &backend_executor,
-            )
-            .expect("non-quarantined timeout should keep backend active");
-            assert_eq!(additional_span, 0);
-            std::thread::sleep(Duration::from_millis(60));
-        }
-
-        let err = distribute_work(
+        let first_round = distribute_work(
             &mut backends,
             DistributeWorkOptions {
-                epoch: 3,
-                work_id: 3,
+                epoch: 1,
+                work_id: 1,
                 header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
                 target: [0xFF; 32],
                 reservation: NonceReservation {
@@ -1352,7 +1342,30 @@ mod tests {
             },
             &backend_executor,
         )
-        .expect_err("third timeout strike should quarantine the only backend");
+        .expect("first timeout window should keep backend active");
+        assert!(first_round >= 1);
+
+        std::thread::sleep(Duration::from_millis(60));
+
+        let err = distribute_work(
+            &mut backends,
+            DistributeWorkOptions {
+                epoch: 2,
+                work_id: 2,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                target: [0xFF; 32],
+                reservation: NonceReservation {
+                    start_nonce: 20,
+                    max_iters_per_lane: 1,
+                    reserved_span: 1,
+                },
+                stop_at: Instant::now() + Duration::from_secs(1),
+                assignment_timeout: Duration::from_millis(5),
+                backend_weights: None,
+            },
+            &backend_executor,
+        )
+        .expect_err("repeated timeout strikes should quarantine the only backend");
         assert!(format!("{err:#}").contains("all mining backends are unavailable"));
 
         assert!(
@@ -1362,7 +1375,7 @@ mod tests {
     }
 
     #[test]
-    fn distribute_work_timeout_without_quarantine_keeps_current_window() {
+    fn distribute_work_timeout_without_quarantine_retries_once_then_keeps_backend_active() {
         let backend_executor = backend_executor::BackendExecutor::new();
         let slow_state = Arc::new(MockState::default());
         let mut backends = vec![slot(
@@ -1394,12 +1407,12 @@ mod tests {
         )
         .expect("non-quarantined timeout should keep backend active");
 
-        assert_eq!(additional_span, 0);
+        assert!(additional_span >= 1);
         assert_eq!(backends.len(), 1);
         std::thread::sleep(Duration::from_millis(120));
         assert!(
-            slow_state.assign_calls.load(Ordering::Relaxed) <= 1,
-            "timeout path should not enqueue additional retry work"
+            slow_state.assign_calls.load(Ordering::Relaxed) <= 2,
+            "timeout path should not spin unbounded retries in one distribution call"
         );
     }
 

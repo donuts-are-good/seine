@@ -219,6 +219,23 @@ pub fn is_unauthorized_error(err: &anyhow::Error) -> bool {
     api_err.status() == StatusCode::UNAUTHORIZED
 }
 
+pub fn is_retryable_api_error(err: &anyhow::Error) -> bool {
+    if let Some(api_err) = err.downcast_ref::<ApiStatusError>() {
+        let status = api_err.status();
+        return status == StatusCode::REQUEST_TIMEOUT
+            || status == StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error();
+    }
+
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|req_err| {
+                req_err.is_timeout() || req_err.is_connect() || req_err.is_request()
+            })
+    })
+}
+
 fn decode_json_response<T: serde::de::DeserializeOwned>(
     resp: Response,
     endpoint: &str,
@@ -397,5 +414,35 @@ mod tests {
             .load_wallet("secret")
             .expect("wallet load should succeed");
         mock.assert();
+    }
+
+    #[test]
+    fn retryable_api_error_classifies_retryable_status_codes() {
+        let retryable_statuses = [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_GATEWAY,
+        ];
+        for status in retryable_statuses {
+            let err = anyhow!(ApiStatusError {
+                endpoint: "submitblock".to_string(),
+                status,
+                message: "retry".to_string(),
+            });
+            assert!(
+                is_retryable_api_error(&err),
+                "status {status} should be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn retryable_api_error_rejects_non_retryable_status_codes() {
+        let err = anyhow!(ApiStatusError {
+            endpoint: "submitblock".to_string(),
+            status: StatusCode::BAD_REQUEST,
+            message: "bad nonce".to_string(),
+        });
+        assert!(!is_retryable_api_error(&err));
     }
 }

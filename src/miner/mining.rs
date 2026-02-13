@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -8,7 +9,7 @@ use anyhow::{anyhow, bail, Result};
 use blocknet_pow_spec::POW_HEADER_BASE_LEN;
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 
-use crate::api::ApiClient;
+use crate::api::{is_retryable_api_error, is_unauthorized_error, ApiClient};
 use crate::backend::{BackendEvent, MiningSolution};
 use crate::config::Config;
 use crate::types::{
@@ -16,6 +17,7 @@ use crate::types::{
     BlockTemplateResponse, SubmitBlockResponse, TemplateBlock,
 };
 
+use super::auth::{refresh_api_token_from_cookie, TokenRefreshOutcome};
 use super::hash_poll::{build_backend_poll_state, next_backend_poll_deadline};
 use super::mining_tui::{
     init_tui_display, render_tui_now, set_tui_state_label, update_tui, RoundUiView, TuiDisplay,
@@ -52,6 +54,9 @@ const SUBMIT_REQUEST_CAPACITY: usize = 128;
 const SUBMIT_RESULT_CAPACITY: usize = 128;
 const SUBMIT_BACKLOG_CAPACITY: usize = 512;
 const SUBMIT_BACKLOG_FLUSH_WAIT: Duration = Duration::from_millis(10);
+const SUBMIT_RETRY_MAX_ATTEMPTS: u32 = 4;
+const SUBMIT_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
+const SUBMIT_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct RetryTracker {
@@ -131,6 +136,7 @@ enum SubmitOutcome {
 struct SubmitResult {
     solution: MiningSolution,
     outcome: SubmitOutcome,
+    attempts: u32,
 }
 
 struct SubmitWorker {
@@ -147,7 +153,11 @@ enum SubmitEnqueueOutcome {
 }
 
 impl SubmitWorker {
-    fn spawn(client: ApiClient, shutdown: Arc<AtomicBool>) -> Self {
+    fn spawn(
+        client: ApiClient,
+        shutdown: Arc<AtomicBool>,
+        token_cookie_path: Option<PathBuf>,
+    ) -> Self {
         let (request_tx, request_rx) = bounded::<SubmitRequest>(SUBMIT_REQUEST_CAPACITY);
         let (result_tx, result_rx) = bounded::<SubmitResult>(SUBMIT_RESULT_CAPACITY);
         let (done_tx, done_rx) = bounded::<()>(1);
@@ -157,7 +167,12 @@ impl SubmitWorker {
                 match request_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(request) => {
                         if result_tx
-                            .send(process_submit_request(&client, request))
+                            .send(process_submit_request(
+                                &client,
+                                request,
+                                shutdown.as_ref(),
+                                token_cookie_path.as_ref(),
+                            ))
                             .is_err()
                         {
                             let _ = done_tx.send(());
@@ -171,7 +186,12 @@ impl SubmitWorker {
 
             while let Ok(request) = request_rx.try_recv() {
                 if result_tx
-                    .send(process_submit_request(&client, request))
+                    .send(process_submit_request(
+                        &client,
+                        request,
+                        shutdown.as_ref(),
+                        token_cookie_path.as_ref(),
+                    ))
                     .is_err()
                 {
                     let _ = done_tx.send(());
@@ -236,29 +256,108 @@ impl SubmitWorker {
     }
 }
 
-fn process_submit_request(client: &ApiClient, request: SubmitRequest) -> SubmitResult {
-    let nonce = request.solution.nonce;
-    let outcome = match request.template {
-        SubmitTemplate::Compact { template_id } => {
-            match client.submit_block(&(), Some(template_id.as_str()), nonce) {
-                Ok(resp) => SubmitOutcome::Response(resp),
-                Err(err) => SubmitOutcome::Error(format!("{err:#}")),
+fn process_submit_request(
+    client: &ApiClient,
+    request: SubmitRequest,
+    shutdown: &AtomicBool,
+    token_cookie_path: Option<&PathBuf>,
+) -> SubmitResult {
+    let max_attempts = SUBMIT_RETRY_MAX_ATTEMPTS.max(1);
+    let solution = request.solution.clone();
+    let mut attempts = 0u32;
+
+    loop {
+        attempts = attempts.saturating_add(1);
+        match submit_request_once(client, &request) {
+            Ok(resp) => {
+                return SubmitResult {
+                    solution,
+                    outcome: SubmitOutcome::Response(resp),
+                    attempts,
+                };
             }
+            Err(err) => {
+                if shutdown.load(Ordering::Relaxed) {
+                    return SubmitResult {
+                        solution,
+                        outcome: SubmitOutcome::Error("submit aborted by shutdown".to_string()),
+                        attempts,
+                    };
+                }
+
+                let unauthorized = is_unauthorized_error(&err);
+                let mut error_context = format!("{err:#}");
+                if unauthorized {
+                    match refresh_api_token_from_cookie(
+                        client,
+                        token_cookie_path.map(PathBuf::as_path),
+                    ) {
+                        TokenRefreshOutcome::Refreshed => {
+                            if attempts < max_attempts {
+                                continue;
+                            }
+                            error_context =
+                                "auth refreshed, but submit retry budget was exhausted".to_string();
+                        }
+                        TokenRefreshOutcome::Unchanged => {
+                            error_context =
+                                format!("auth expired and cookie token was unchanged: {err:#}");
+                        }
+                        TokenRefreshOutcome::Unavailable => {
+                            error_context = format!(
+                                "auth expired and no cookie refresh source is available: {err:#}"
+                            );
+                        }
+                        TokenRefreshOutcome::Failed(msg) => {
+                            error_context = format!("{msg}: {err:#}");
+                        }
+                    }
+                }
+
+                let retryable = is_retryable_api_error(&err) || unauthorized;
+                if retryable && attempts < max_attempts {
+                    if !sleep_with_shutdown(shutdown, submit_retry_delay(attempts)) {
+                        return SubmitResult {
+                            solution,
+                            outcome: SubmitOutcome::Error("submit aborted by shutdown".to_string()),
+                            attempts,
+                        };
+                    }
+                    continue;
+                }
+
+                return SubmitResult {
+                    solution,
+                    outcome: SubmitOutcome::Error(format!(
+                        "submit failed after {attempts} attempt(s): {error_context}"
+                    )),
+                    attempts,
+                };
+            }
+        }
+    }
+}
+
+fn submit_request_once(client: &ApiClient, request: &SubmitRequest) -> Result<SubmitBlockResponse> {
+    let nonce = request.solution.nonce;
+    match &request.template {
+        SubmitTemplate::Compact { template_id } => {
+            client.submit_block(&(), Some(template_id), nonce)
         }
         SubmitTemplate::FullBlock { block } => {
-            let mut block = (*block).clone();
+            let mut block = (**block).clone();
             set_block_nonce(&mut block, nonce);
-            match client.submit_block(&block, None, nonce) {
-                Ok(resp) => SubmitOutcome::Response(resp),
-                Err(err) => SubmitOutcome::Error(format!("{err:#}")),
-            }
+            client.submit_block(&block, None, nonce)
         }
-    };
-
-    SubmitResult {
-        solution: request.solution,
-        outcome,
     }
+}
+
+fn submit_retry_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(8);
+    let multiplier = 1u32 << shift;
+    SUBMIT_RETRY_BASE_DELAY
+        .saturating_mul(multiplier)
+        .min(SUBMIT_RETRY_MAX_DELAY)
 }
 
 fn handle_submit_result(result: SubmitResult, stats: &Stats, tui: &mut Option<TuiDisplay>) {
@@ -276,15 +375,25 @@ fn handle_submit_result(result: SubmitResult, stats: &Stats, tui: &mut Option<Tu
                 let hash = resp.hash.unwrap_or_else(|| "unknown".to_string());
                 mined("SUBMIT", format!("block accepted at height {height}"));
                 mined("SUBMIT", format!("hash {}", compact_hash(&hash)));
+                if result.attempts > 1 {
+                    info(
+                        "SUBMIT",
+                        format!(
+                            "accepted epoch={} nonce={} after {} submit attempts",
+                            result.solution.epoch, result.solution.nonce, result.attempts
+                        ),
+                    );
+                }
             } else {
                 warn(
                     "SUBMIT",
                     format!(
-                        "rejected by daemon epoch={} nonce={} backend={}#{}",
+                        "rejected by daemon epoch={} nonce={} backend={}#{} attempts={}",
                         result.solution.epoch,
                         result.solution.nonce,
                         result.solution.backend,
-                        result.solution.backend_id
+                        result.solution.backend_id,
+                        result.attempts
                     ),
                 );
             }
@@ -293,11 +402,12 @@ fn handle_submit_result(result: SubmitResult, stats: &Stats, tui: &mut Option<Tu
             error(
                 "SUBMIT",
                 format!(
-                    "submit failed epoch={} nonce={} backend={}#{}: {}",
+                    "submit failed epoch={} nonce={} backend={}#{} attempts={}: {}",
                     result.solution.epoch,
                     result.solution.nonce,
                     result.solution.backend,
                     result.solution.backend_id,
+                    result.attempts,
                     message
                 ),
             );
@@ -312,6 +422,7 @@ struct MiningControlPlane<'a> {
     prefetch: Option<TemplatePrefetch>,
     submit_worker: Option<SubmitWorker>,
     submit_backlog: VecDeque<SubmitRequest>,
+    submit_backlog_high_watermark_logged: bool,
 }
 
 struct RoundLoopState {
@@ -355,8 +466,13 @@ impl<'a> MiningControlPlane<'a> {
                 cfg.clone(),
                 Arc::clone(&shutdown),
             )),
-            submit_worker: Some(SubmitWorker::spawn(client.clone(), Arc::clone(&shutdown))),
+            submit_worker: Some(SubmitWorker::spawn(
+                client.clone(),
+                Arc::clone(&shutdown),
+                cfg.token_cookie_path.clone(),
+            )),
             submit_backlog: VecDeque::with_capacity(SUBMIT_BACKLOG_CAPACITY),
+            submit_backlog_high_watermark_logged: false,
             shutdown,
             tip_signal,
         }
@@ -369,24 +485,22 @@ impl<'a> MiningControlPlane<'a> {
         self.submit_worker = Some(SubmitWorker::spawn(
             self.client.clone(),
             Arc::clone(&self.shutdown),
+            self.cfg.token_cookie_path.clone(),
         ));
     }
 
     fn enqueue_submit_request(&mut self, request: SubmitRequest) {
-        if self.submit_backlog.len() >= SUBMIT_BACKLOG_CAPACITY {
-            if let Some(dropped) = self.submit_backlog.pop_front() {
-                warn(
-                    "SUBMIT",
-                    format!(
-                        "submit backlog full ({}); dropping oldest epoch={} nonce={} backend={}#{} to keep newest request",
-                        SUBMIT_BACKLOG_CAPACITY,
-                        dropped.solution.epoch,
-                        dropped.solution.nonce,
-                        dropped.solution.backend,
-                        dropped.solution.backend_id
-                    ),
-                );
-            }
+        if self.submit_backlog.len() >= SUBMIT_BACKLOG_CAPACITY
+            && !self.submit_backlog_high_watermark_logged
+        {
+            warn(
+                "SUBMIT",
+                format!(
+                    "submit backlog exceeded soft limit ({}); retaining all requests until worker catches up",
+                    SUBMIT_BACKLOG_CAPACITY
+                ),
+            );
+            self.submit_backlog_high_watermark_logged = true;
         }
         self.submit_backlog.push_back(request);
     }
@@ -417,6 +531,10 @@ impl<'a> MiningControlPlane<'a> {
                     break;
                 }
             }
+        }
+
+        if self.submit_backlog.len() < SUBMIT_BACKLOG_CAPACITY {
+            self.submit_backlog_high_watermark_logged = false;
         }
     }
 
@@ -1580,7 +1698,8 @@ fn remember_recent_template(
             break;
         }
         if let Some(removed) = recent_templates.pop_front() {
-            *recent_templates_bytes = recent_templates_bytes.saturating_sub(removed.estimated_bytes);
+            *recent_templates_bytes =
+                recent_templates_bytes.saturating_sub(removed.estimated_bytes);
         }
     }
 }
