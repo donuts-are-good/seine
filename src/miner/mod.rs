@@ -34,10 +34,12 @@ use crate::backend::cpu::{CpuBackend, CpuBackendTuning};
 use crate::backend::nvidia::NvidiaBackend;
 use crate::backend::{
     normalize_backend_capabilities, BackendCapabilities, BackendEvent, BackendExecutionModel,
-    BackendInstanceId, BackendTelemetry, DeadlineSupport, PowBackend, PreemptionGranularity,
-    WORK_ID_MAX,
+    BackendInstanceId, BackendTelemetry, BenchBackend, DeadlineSupport, PowBackend,
+    PreemptionGranularity, WORK_ID_MAX,
 };
-use crate::config::{BackendKind, BackendSpec, Config, UiMode, WorkAllocation};
+use crate::config::{
+    BackendKind, BackendSpec, Config, CpuPerformanceProfile, UiMode, WorkAllocation,
+};
 use scheduler::NonceReservation;
 use stats::{format_hashrate, Stats};
 use tui::{new_tui_state, TuiState};
@@ -115,6 +117,8 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
     if cfg.bench {
         return bench::run_benchmark(cfg, shutdown.as_ref());
     }
+    let runtime_cfg = prepare_runtime_config(cfg, shutdown.as_ref(), RuntimeMode::Mining)?;
+    let cfg = &runtime_cfg;
 
     let backend_executor = backend_executor::BackendExecutor::new();
 
@@ -212,6 +216,23 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
             "hash-poll | configured={}ms effective={}ms",
             cfg.hash_poll_interval.as_millis(),
             effective_hash_poll_interval(&backends, cfg.hash_poll_interval).as_millis(),
+        ),
+    );
+    info(
+        "MINER",
+        format!(
+            "cpu-profile | {} | auto-cap={} | autotune={} range={}..{} secs={}",
+            cpu_profile_label(cfg.cpu_profile),
+            cfg.cpu_auto_threads_cap,
+            if cfg.cpu_autotune_threads {
+                "on"
+            } else {
+                "off"
+            },
+            cfg.cpu_autotune_min_threads,
+            cfg.cpu_autotune_max_threads
+                .unwrap_or(cfg.cpu_auto_threads_cap.max(1)),
+            cfg.cpu_autotune_secs,
         ),
     );
     info(
@@ -375,6 +396,157 @@ fn build_tui_state(
         s.version = format!("v{}", env!("CARGO_PKG_VERSION"));
     }
     tui_state
+}
+
+pub(super) fn prepare_runtime_config(
+    cfg: &Config,
+    shutdown: &AtomicBool,
+    mode: RuntimeMode,
+) -> Result<Config> {
+    let mut runtime_cfg = cfg.clone();
+    maybe_autotune_cpu_threads(&mut runtime_cfg, shutdown, mode)?;
+    Ok(runtime_cfg)
+}
+
+fn maybe_autotune_cpu_threads(
+    cfg: &mut Config,
+    shutdown: &AtomicBool,
+    mode: RuntimeMode,
+) -> Result<()> {
+    if !cfg.cpu_autotune_threads {
+        return Ok(());
+    }
+
+    let tag = runtime_mode_tag(mode);
+    let cpu_instance_count = cfg
+        .backend_specs
+        .iter()
+        .filter(|spec| spec.kind == BackendKind::Cpu)
+        .count();
+    if cpu_instance_count == 0 {
+        info(tag, "cpu-autotune | skipped (no CPU backend instances)");
+        return Ok(());
+    }
+
+    let safe_threads_cap = cfg.cpu_auto_threads_cap.max(1);
+    let mut min_threads = cfg.cpu_autotune_min_threads.max(1);
+    if min_threads > safe_threads_cap {
+        warn(
+            tag,
+            format!(
+                "cpu-autotune | clamping min threads {} -> {} (safe cap)",
+                min_threads, safe_threads_cap
+            ),
+        );
+        min_threads = safe_threads_cap;
+    }
+
+    let requested_max_threads = cfg.cpu_autotune_max_threads.unwrap_or(safe_threads_cap);
+    let mut max_threads = requested_max_threads.max(min_threads);
+    if max_threads > safe_threads_cap {
+        warn(
+            tag,
+            format!(
+                "cpu-autotune | clamping max threads {} -> {} (safe cap)",
+                max_threads, safe_threads_cap
+            ),
+        );
+        max_threads = safe_threads_cap;
+    }
+
+    let autotune_secs = cfg.cpu_autotune_secs.max(1);
+    info(
+        tag,
+        format!(
+            "cpu-autotune | starting profile={} range={}..{} secs={} instances={}",
+            cpu_profile_label(cfg.cpu_profile),
+            min_threads,
+            max_threads,
+            autotune_secs,
+            cpu_instance_count
+        ),
+    );
+
+    let mut best_threads = cfg.threads.max(1);
+    let mut best_hps = 0.0f64;
+    let mut measured_any = false;
+    for threads in min_threads..=max_threads {
+        if shutdown.load(Ordering::Relaxed) {
+            warn(tag, "cpu-autotune | interrupted by shutdown request");
+            break;
+        }
+
+        let backend = CpuBackend::with_tuning(
+            threads,
+            cfg.cpu_affinity,
+            CpuBackendTuning {
+                hash_batch_size: cfg.cpu_hash_batch_size,
+                control_check_interval_hashes: cfg.cpu_control_check_interval_hashes,
+                hash_flush_interval: cfg.cpu_hash_flush_interval,
+                event_dispatch_capacity: cfg.cpu_event_dispatch_capacity,
+            },
+        );
+        let started_at = Instant::now();
+        let hashes = BenchBackend::kernel_bench(&backend, autotune_secs, shutdown)?;
+        let elapsed_secs = started_at.elapsed().as_secs_f64().max(f64::EPSILON);
+        let hps = (hashes as f64) / elapsed_secs;
+        measured_any = true;
+        info(
+            tag,
+            format!(
+                "cpu-autotune | threads={} hashes={} elapsed={:.2}s hps={}",
+                threads,
+                hashes,
+                elapsed_secs,
+                format_hashrate(hps)
+            ),
+        );
+        if hps > best_hps {
+            best_hps = hps;
+            best_threads = threads;
+        }
+    }
+
+    if !measured_any {
+        warn(
+            tag,
+            "cpu-autotune | no measurements collected; keeping configured thread count",
+        );
+        return Ok(());
+    }
+
+    cfg.threads = best_threads;
+    for spec in cfg
+        .backend_specs
+        .iter_mut()
+        .filter(|spec| spec.kind == BackendKind::Cpu)
+    {
+        spec.cpu_threads = Some(best_threads);
+    }
+    info(
+        tag,
+        format!(
+            "cpu-autotune | selected threads={} hps={} (per CPU instance)",
+            best_threads,
+            format_hashrate(best_hps)
+        ),
+    );
+    Ok(())
+}
+
+fn runtime_mode_tag(mode: RuntimeMode) -> &'static str {
+    match mode {
+        RuntimeMode::Mining => "MINER",
+        RuntimeMode::Bench => "BENCH",
+    }
+}
+
+fn cpu_profile_label(profile: CpuPerformanceProfile) -> &'static str {
+    match profile {
+        CpuPerformanceProfile::Balanced => "balanced",
+        CpuPerformanceProfile::Throughput => "throughput",
+        CpuPerformanceProfile::Efficiency => "efficiency",
+    }
 }
 
 fn build_backend_instances(cfg: &Config) -> Vec<(BackendSpec, Arc<dyn PowBackend>)> {
@@ -867,7 +1039,7 @@ fn remove_backend_by_id(
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum RuntimeMode {
+pub(super) enum RuntimeMode {
     Mining,
     Bench,
 }
@@ -1542,7 +1714,9 @@ mod tests {
                 assign_timeout_strikes_override: None,
             }],
             threads: 1,
+            cpu_auto_threads_cap: 1,
             cpu_affinity: crate::config::CpuAffinityMode::Off,
+            cpu_profile: crate::config::CpuPerformanceProfile::Balanced,
             refresh_interval: Duration::from_secs(20),
             request_timeout: Duration::from_secs(10),
             events_stream_timeout: Duration::from_secs(10),
@@ -1554,6 +1728,10 @@ mod tests {
             cpu_control_check_interval_hashes: 1,
             cpu_hash_flush_interval: Duration::from_millis(50),
             cpu_event_dispatch_capacity: 256,
+            cpu_autotune_threads: false,
+            cpu_autotune_min_threads: 1,
+            cpu_autotune_max_threads: None,
+            cpu_autotune_secs: 2,
             backend_assign_timeout: Duration::from_millis(1_000),
             backend_assign_timeout_strikes: 3,
             backend_control_timeout: Duration::from_millis(60_000),

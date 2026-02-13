@@ -33,6 +33,13 @@ pub enum CpuAffinityMode {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum CpuPerformanceProfile {
+    Balanced,
+    Throughput,
+    Efficiency,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum UiMode {
     Auto,
     Tui,
@@ -43,6 +50,56 @@ pub enum UiMode {
 pub enum WorkAllocation {
     Static,
     Adaptive,
+}
+
+const DEFAULT_HASH_POLL_MS: u64 = 200;
+const DEFAULT_CPU_HASH_BATCH_SIZE: u64 = 64;
+const DEFAULT_CPU_CONTROL_CHECK_INTERVAL_HASHES: u64 = 1;
+const DEFAULT_CPU_HASH_FLUSH_MS: u64 = 50;
+const DEFAULT_CPU_EVENT_DISPATCH_CAPACITY: usize = 256;
+const DEFAULT_CPU_AUTOTUNE_SECS: u64 = 2;
+
+#[derive(Debug, Clone, Copy)]
+struct CpuProfileDefaults {
+    threads: usize,
+    hash_poll_ms: u64,
+    cpu_hash_batch_size: u64,
+    cpu_control_check_interval_hashes: u64,
+    cpu_hash_flush_ms: u64,
+    cpu_event_dispatch_capacity: usize,
+}
+
+fn cpu_profile_defaults(
+    profile: CpuPerformanceProfile,
+    auto_threads_cap: usize,
+) -> CpuProfileDefaults {
+    let auto_threads_cap = auto_threads_cap.max(1);
+    match profile {
+        CpuPerformanceProfile::Balanced => CpuProfileDefaults {
+            threads: auto_threads_cap,
+            hash_poll_ms: DEFAULT_HASH_POLL_MS,
+            cpu_hash_batch_size: DEFAULT_CPU_HASH_BATCH_SIZE,
+            cpu_control_check_interval_hashes: DEFAULT_CPU_CONTROL_CHECK_INTERVAL_HASHES,
+            cpu_hash_flush_ms: DEFAULT_CPU_HASH_FLUSH_MS,
+            cpu_event_dispatch_capacity: DEFAULT_CPU_EVENT_DISPATCH_CAPACITY,
+        },
+        CpuPerformanceProfile::Throughput => CpuProfileDefaults {
+            threads: auto_threads_cap,
+            hash_poll_ms: 100,
+            cpu_hash_batch_size: 256,
+            cpu_control_check_interval_hashes: 8,
+            cpu_hash_flush_ms: 200,
+            cpu_event_dispatch_capacity: 1024,
+        },
+        CpuPerformanceProfile::Efficiency => CpuProfileDefaults {
+            threads: (auto_threads_cap / 2).max(1),
+            hash_poll_ms: 400,
+            cpu_hash_batch_size: 32,
+            cpu_control_check_interval_hashes: 1,
+            cpu_hash_flush_ms: 25,
+            cpu_event_dispatch_capacity: 128,
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -98,13 +155,18 @@ struct Cli {
     #[arg(long = "nvidia-devices", value_delimiter = ',', num_args = 1..)]
     nvidia_devices: Vec<u32>,
 
-    /// Number of CPU mining threads (each uses ~2GB RAM for Argon2id).
-    #[arg(long, alias = "cpu-threads", default_value_t = 1)]
-    threads: usize,
+    /// Number of CPU mining threads per CPU backend instance (each uses ~2GB RAM for Argon2id).
+    /// When omitted, threads auto-size from available CPU parallelism and RAM budget.
+    #[arg(long, alias = "cpu-threads")]
+    threads: Option<usize>,
 
     /// CPU pinning policy for CPU mining workers.
     #[arg(long, value_enum, default_value_t = CpuAffinityMode::Auto)]
     cpu_affinity: CpuAffinityMode,
+
+    /// CPU mining profile preset; applies default threads/poll/flush knobs unless explicitly set.
+    #[arg(long = "cpu-profile", value_enum, default_value_t = CpuPerformanceProfile::Balanced)]
+    cpu_profile: CpuPerformanceProfile,
 
     /// Optional per-CPU-instance thread counts (comma-separated).
     /// Length must match the number of configured CPU backend instances.
@@ -150,24 +212,40 @@ struct Cli {
     backend_event_capacity: usize,
 
     /// Backend hash polling interval in milliseconds.
-    #[arg(long, default_value_t = 200)]
-    hash_poll_ms: u64,
+    #[arg(long)]
+    hash_poll_ms: Option<u64>,
 
     /// CPU worker hash flush batch size.
-    #[arg(long, default_value_t = 64)]
-    cpu_hash_batch_size: u64,
+    #[arg(long)]
+    cpu_hash_batch_size: Option<u64>,
 
     /// CPU worker control polling cadence in hashes (deadline checks are also time-bounded).
-    #[arg(long, default_value_t = 1)]
-    cpu_control_check_interval_hashes: u64,
+    #[arg(long)]
+    cpu_control_check_interval_hashes: Option<u64>,
 
     /// CPU worker hash flush interval in milliseconds.
-    #[arg(long, default_value_t = 50)]
-    cpu_hash_flush_ms: u64,
+    #[arg(long)]
+    cpu_hash_flush_ms: Option<u64>,
 
     /// CPU backend internal event dispatch queue capacity.
-    #[arg(long, default_value_t = 256)]
-    cpu_event_dispatch_capacity: usize,
+    #[arg(long)]
+    cpu_event_dispatch_capacity: Option<usize>,
+
+    /// Enable startup CPU kernel autotuning and select the best thread count by measured H/s.
+    #[arg(long, action = ArgAction::SetTrue)]
+    cpu_autotune_threads: bool,
+
+    /// Minimum per-instance CPU thread count considered by autotuner.
+    #[arg(long, default_value_t = 1)]
+    cpu_autotune_min_threads: usize,
+
+    /// Maximum per-instance CPU thread count considered by autotuner.
+    #[arg(long)]
+    cpu_autotune_max_threads: Option<usize>,
+
+    /// Benchmark duration (seconds) for each autotuner thread candidate.
+    #[arg(long, default_value_t = DEFAULT_CPU_AUTOTUNE_SECS)]
+    cpu_autotune_secs: u64,
 
     /// Maximum time to wait for one backend assignment dispatch call, in milliseconds.
     #[arg(long, default_value_t = 1000)]
@@ -307,7 +385,9 @@ pub struct Config {
     pub wallet_password_file: Option<PathBuf>,
     pub backend_specs: Vec<BackendSpec>,
     pub threads: usize,
+    pub cpu_auto_threads_cap: usize,
     pub cpu_affinity: CpuAffinityMode,
+    pub cpu_profile: CpuPerformanceProfile,
     pub refresh_interval: Duration,
     pub request_timeout: Duration,
     pub events_stream_timeout: Duration,
@@ -319,6 +399,10 @@ pub struct Config {
     pub cpu_control_check_interval_hashes: u64,
     pub cpu_hash_flush_interval: Duration,
     pub cpu_event_dispatch_capacity: usize,
+    pub cpu_autotune_threads: bool,
+    pub cpu_autotune_min_threads: usize,
+    pub cpu_autotune_max_threads: Option<usize>,
+    pub cpu_autotune_secs: u64,
     pub backend_assign_timeout: Duration,
     pub backend_assign_timeout_strikes: u32,
     pub backend_control_timeout: Duration,
@@ -348,8 +432,10 @@ pub struct Config {
 impl Config {
     pub fn parse() -> Result<Self> {
         let cli = Cli::parse();
-        if cli.threads == 0 {
-            bail!("threads must be >= 1");
+        if let Some(threads) = cli.threads {
+            if threads == 0 {
+                bail!("threads must be >= 1");
+            }
         }
         if cli.nonce_iters_per_lane == 0 {
             bail!("nonce-iters-per-lane must be >= 1");
@@ -357,20 +443,47 @@ impl Config {
         if cli.backend_event_capacity == 0 {
             bail!("backend-event-capacity must be >= 1");
         }
-        if cli.hash_poll_ms == 0 {
-            bail!("hash-poll-ms must be >= 1");
+        if let Some(value) = cli.hash_poll_ms {
+            if value == 0 {
+                bail!("hash-poll-ms must be >= 1");
+            }
         }
-        if cli.cpu_hash_batch_size == 0 {
-            bail!("cpu-hash-batch-size must be >= 1");
+        if let Some(value) = cli.cpu_hash_batch_size {
+            if value == 0 {
+                bail!("cpu-hash-batch-size must be >= 1");
+            }
         }
-        if cli.cpu_control_check_interval_hashes == 0 {
-            bail!("cpu-control-check-interval-hashes must be >= 1");
+        if let Some(value) = cli.cpu_control_check_interval_hashes {
+            if value == 0 {
+                bail!("cpu-control-check-interval-hashes must be >= 1");
+            }
         }
-        if cli.cpu_hash_flush_ms == 0 {
-            bail!("cpu-hash-flush-ms must be >= 1");
+        if let Some(value) = cli.cpu_hash_flush_ms {
+            if value == 0 {
+                bail!("cpu-hash-flush-ms must be >= 1");
+            }
         }
-        if cli.cpu_event_dispatch_capacity == 0 {
-            bail!("cpu-event-dispatch-capacity must be >= 1");
+        if let Some(value) = cli.cpu_event_dispatch_capacity {
+            if value == 0 {
+                bail!("cpu-event-dispatch-capacity must be >= 1");
+            }
+        }
+        if cli.cpu_autotune_min_threads == 0 {
+            bail!("cpu-autotune-min-threads must be >= 1");
+        }
+        if let Some(max_threads) = cli.cpu_autotune_max_threads {
+            if max_threads == 0 {
+                bail!("cpu-autotune-max-threads must be >= 1");
+            }
+            if max_threads < cli.cpu_autotune_min_threads {
+                bail!(
+                    "cpu-autotune-max-threads ({max_threads}) must be >= cpu-autotune-min-threads ({})",
+                    cli.cpu_autotune_min_threads
+                );
+            }
+        }
+        if cli.cpu_autotune_secs == 0 {
+            bail!("cpu-autotune-secs must be >= 1");
         }
         if cli.backend_assign_timeout_ms == 0 {
             bail!("backend-assign-timeout-ms must be >= 1");
@@ -418,11 +531,34 @@ impl Config {
         if backends.is_empty() {
             bail!("at least one backend is required");
         }
+        let cpu_backend_instances = backends
+            .iter()
+            .filter(|kind| matches!(kind, BackendKind::Cpu))
+            .count();
+        let auto_threads_cap = match cpu_backend_instances {
+            0 => 1,
+            instances => auto_cpu_threads(instances),
+        };
+        let profile_defaults = cpu_profile_defaults(cli.cpu_profile, auto_threads_cap);
+        let resolved_threads = cli.threads.unwrap_or(profile_defaults.threads);
+        let effective_hash_poll_ms = cli.hash_poll_ms.unwrap_or(profile_defaults.hash_poll_ms);
+        let effective_cpu_hash_batch_size = cli
+            .cpu_hash_batch_size
+            .unwrap_or(profile_defaults.cpu_hash_batch_size);
+        let effective_cpu_control_check_interval_hashes = cli
+            .cpu_control_check_interval_hashes
+            .unwrap_or(profile_defaults.cpu_control_check_interval_hashes);
+        let effective_cpu_hash_flush_ms = cli
+            .cpu_hash_flush_ms
+            .unwrap_or(profile_defaults.cpu_hash_flush_ms);
+        let effective_cpu_event_dispatch_capacity = cli
+            .cpu_event_dispatch_capacity
+            .unwrap_or(profile_defaults.cpu_event_dispatch_capacity);
         let backend_specs = expand_backend_specs(
             &backends,
             &cli.nvidia_devices,
             BackendExpansionOptions {
-                default_cpu_threads: cli.threads,
+                default_cpu_threads: resolved_threads,
                 default_cpu_affinity: cli.cpu_affinity,
                 cpu_threads_per_instance: &cli.cpu_threads_per_instance,
                 cpu_affinity_per_instance: &cli.cpu_affinity_per_instance,
@@ -434,7 +570,7 @@ impl Config {
             },
         )?;
 
-        validate_cpu_memory(&backend_specs, cli.threads, cli.allow_oversubscribe)?;
+        validate_cpu_memory(&backend_specs, resolved_threads, cli.allow_oversubscribe)?;
 
         let (token, token_cookie_path) = if cli.bench {
             (None, None)
@@ -451,19 +587,25 @@ impl Config {
             wallet_password: cli.wallet_password,
             wallet_password_file: cli.wallet_password_file,
             backend_specs,
-            threads: cli.threads,
+            threads: resolved_threads,
+            cpu_auto_threads_cap: auto_threads_cap,
             cpu_affinity: cli.cpu_affinity,
+            cpu_profile: cli.cpu_profile,
             refresh_interval: Duration::from_secs(cli.refresh_secs.max(1)),
             request_timeout: Duration::from_secs(cli.request_timeout_secs.max(1)),
             events_stream_timeout: Duration::from_secs(cli.events_stream_timeout_secs.max(1)),
             events_idle_timeout: Duration::from_secs(cli.events_idle_timeout_secs.max(1)),
             stats_interval: Duration::from_secs(cli.stats_secs.max(1)),
             backend_event_capacity: cli.backend_event_capacity,
-            hash_poll_interval: Duration::from_millis(cli.hash_poll_ms),
-            cpu_hash_batch_size: cli.cpu_hash_batch_size,
-            cpu_control_check_interval_hashes: cli.cpu_control_check_interval_hashes,
-            cpu_hash_flush_interval: Duration::from_millis(cli.cpu_hash_flush_ms),
-            cpu_event_dispatch_capacity: cli.cpu_event_dispatch_capacity,
+            hash_poll_interval: Duration::from_millis(effective_hash_poll_ms),
+            cpu_hash_batch_size: effective_cpu_hash_batch_size,
+            cpu_control_check_interval_hashes: effective_cpu_control_check_interval_hashes,
+            cpu_hash_flush_interval: Duration::from_millis(effective_cpu_hash_flush_ms),
+            cpu_event_dispatch_capacity: effective_cpu_event_dispatch_capacity,
+            cpu_autotune_threads: cli.cpu_autotune_threads,
+            cpu_autotune_min_threads: cli.cpu_autotune_min_threads,
+            cpu_autotune_max_threads: cli.cpu_autotune_max_threads,
+            cpu_autotune_secs: cli.cpu_autotune_secs.max(1),
             backend_assign_timeout: Duration::from_millis(cli.backend_assign_timeout_ms),
             backend_assign_timeout_strikes: cli.backend_assign_timeout_strikes.max(1),
             backend_control_timeout: Duration::from_millis(cli.backend_control_timeout_ms),
@@ -717,6 +859,25 @@ fn expand_backend_specs(
     Ok(specs)
 }
 
+fn auto_cpu_threads(cpu_backend_instances: usize) -> usize {
+    let cpu_parallelism = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+        .max(1);
+    let memory_cap_total = detect_memory_budget_bytes()
+        .map(|budget| (budget.effective_available / CPU_LANE_MEMORY_BYTES) as usize)
+        .unwrap_or(cpu_parallelism)
+        .max(1);
+    let total_lanes_cap = cpu_parallelism.min(memory_cap_total).max(1);
+    distribute_auto_cpu_threads(total_lanes_cap, cpu_backend_instances)
+}
+
+fn distribute_auto_cpu_threads(total_lanes_cap: usize, cpu_backend_instances: usize) -> usize {
+    let lanes = total_lanes_cap.max(1);
+    let instances = cpu_backend_instances.max(1);
+    (lanes / instances).max(1)
+}
+
 fn validate_cpu_memory(
     backend_specs: &[BackendSpec],
     threads: usize,
@@ -834,8 +995,9 @@ mod tests {
             data_dir: PathBuf::from("./data"),
             backends: vec![BackendKind::Cpu],
             nvidia_devices: Vec::new(),
-            threads: 1,
+            threads: Some(1),
             cpu_affinity: CpuAffinityMode::Auto,
+            cpu_profile: CpuPerformanceProfile::Balanced,
             cpu_threads_per_instance: Vec::new(),
             cpu_affinity_per_instance: Vec::new(),
             allow_oversubscribe: false,
@@ -845,11 +1007,15 @@ mod tests {
             events_idle_timeout_secs: 90,
             stats_secs: 10,
             backend_event_capacity: 1024,
-            hash_poll_ms: 200,
-            cpu_hash_batch_size: 64,
-            cpu_control_check_interval_hashes: 1,
-            cpu_hash_flush_ms: 50,
-            cpu_event_dispatch_capacity: 256,
+            hash_poll_ms: Some(DEFAULT_HASH_POLL_MS),
+            cpu_hash_batch_size: Some(DEFAULT_CPU_HASH_BATCH_SIZE),
+            cpu_control_check_interval_hashes: Some(DEFAULT_CPU_CONTROL_CHECK_INTERVAL_HASHES),
+            cpu_hash_flush_ms: Some(DEFAULT_CPU_HASH_FLUSH_MS),
+            cpu_event_dispatch_capacity: Some(DEFAULT_CPU_EVENT_DISPATCH_CAPACITY),
+            cpu_autotune_threads: false,
+            cpu_autotune_min_threads: 1,
+            cpu_autotune_max_threads: None,
+            cpu_autotune_secs: DEFAULT_CPU_AUTOTUNE_SECS,
             backend_assign_timeout_ms: 1000,
             backend_assign_timeout_ms_per_instance: Vec::new(),
             backend_assign_timeout_strikes: 3,
@@ -1075,5 +1241,36 @@ mod tests {
     fn human_bytes_formats_units() {
         assert_eq!(human_bytes(1024 * 1024), "1.00 MiB");
         assert_eq!(human_bytes(1024 * 1024 * 1024), "1.00 GiB");
+    }
+
+    #[test]
+    fn auto_cpu_threads_is_never_zero_and_scales_per_instance() {
+        let single_instance = auto_cpu_threads(1);
+        let dual_instance = auto_cpu_threads(2);
+
+        assert!(single_instance >= 1);
+        assert!(dual_instance >= 1);
+        assert!(dual_instance <= single_instance);
+    }
+
+    #[test]
+    fn distribute_auto_cpu_threads_divides_total_lane_budget() {
+        assert_eq!(distribute_auto_cpu_threads(12, 1), 12);
+        assert_eq!(distribute_auto_cpu_threads(12, 2), 6);
+        assert_eq!(distribute_auto_cpu_threads(12, 5), 2);
+        assert_eq!(distribute_auto_cpu_threads(1, 4), 1);
+    }
+
+    #[test]
+    fn cpu_profile_defaults_adjust_tuning_knobs() {
+        let throughput = cpu_profile_defaults(CpuPerformanceProfile::Throughput, 8);
+        assert_eq!(throughput.threads, 8);
+        assert_eq!(throughput.hash_poll_ms, 100);
+        assert_eq!(throughput.cpu_hash_batch_size, 256);
+
+        let efficiency = cpu_profile_defaults(CpuPerformanceProfile::Efficiency, 8);
+        assert_eq!(efficiency.threads, 4);
+        assert_eq!(efficiency.hash_poll_ms, 400);
+        assert_eq!(efficiency.cpu_hash_batch_size, 32);
     }
 }

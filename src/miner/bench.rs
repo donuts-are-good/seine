@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use sysinfo::System;
 
 use crate::backend::{BackendEvent, BackendInstanceId, DeadlineSupport, PowBackend};
-use crate::config::{BenchBaselinePolicy, BenchKind, Config, CpuAffinityMode, WorkAllocation};
+use crate::config::{
+    BenchBaselinePolicy, BenchKind, Config, CpuAffinityMode, CpuPerformanceProfile, WorkAllocation,
+};
 
 use super::hash_poll::build_backend_poll_state;
 use super::runtime::{
@@ -155,10 +157,16 @@ struct BenchBackendRuntimeFingerprint {
 struct BenchConfigFingerprint {
     backend_event_capacity: usize,
     hash_poll_ms: u64,
+    cpu_profile: String,
     cpu_hash_batch_size: u64,
     cpu_control_check_interval_hashes: u64,
     cpu_hash_flush_ms: u64,
     cpu_event_dispatch_capacity: usize,
+    cpu_autotune_threads: bool,
+    cpu_autotune_min_threads: usize,
+    cpu_autotune_max_threads: Option<usize>,
+    cpu_autotune_secs: u64,
+    cpu_auto_threads_cap: usize,
     backend_assign_timeout_ms: u64,
     backend_assign_timeout_strikes: u32,
     backend_control_timeout_ms: u64,
@@ -217,10 +225,12 @@ struct WorkerBenchmarkIdentity {
 }
 
 type BackendEventAction = RuntimeBackendEventAction;
-const BENCH_REPORT_SCHEMA_VERSION: u32 = 6;
+const BENCH_REPORT_SCHEMA_VERSION: u32 = 7;
 const BENCH_REPORT_COMPAT_MIN_SCHEMA_VERSION: u32 = 2;
 
 pub(super) fn run_benchmark(cfg: &Config, shutdown: &AtomicBool) -> Result<()> {
+    let runtime_cfg = super::prepare_runtime_config(cfg, shutdown, RuntimeMode::Bench)?;
+    let cfg = &runtime_cfg;
     let instances = super::build_backend_instances(cfg);
     let backend_executor = super::backend_executor::BackendExecutor::new();
 
@@ -1016,6 +1026,59 @@ fn baseline_compatibility_issues(
                 baseline.config_fingerprint.hash_poll_ms, current.config_fingerprint.hash_poll_ms
             ));
         }
+        if baseline.schema_version >= 7 && current.schema_version >= 7 {
+            if baseline.config_fingerprint.cpu_profile != current.config_fingerprint.cpu_profile {
+                issues.push(format!(
+                    "cpu_profile mismatch baseline={} current={}",
+                    baseline.config_fingerprint.cpu_profile, current.config_fingerprint.cpu_profile
+                ));
+            }
+            if baseline.config_fingerprint.cpu_autotune_threads
+                != current.config_fingerprint.cpu_autotune_threads
+            {
+                issues.push(format!(
+                    "cpu_autotune_threads mismatch baseline={} current={}",
+                    baseline.config_fingerprint.cpu_autotune_threads,
+                    current.config_fingerprint.cpu_autotune_threads
+                ));
+            }
+            if baseline.config_fingerprint.cpu_autotune_min_threads
+                != current.config_fingerprint.cpu_autotune_min_threads
+            {
+                issues.push(format!(
+                    "cpu_autotune_min_threads mismatch baseline={} current={}",
+                    baseline.config_fingerprint.cpu_autotune_min_threads,
+                    current.config_fingerprint.cpu_autotune_min_threads
+                ));
+            }
+            if baseline.config_fingerprint.cpu_autotune_max_threads
+                != current.config_fingerprint.cpu_autotune_max_threads
+            {
+                issues.push(format!(
+                    "cpu_autotune_max_threads mismatch baseline={:?} current={:?}",
+                    baseline.config_fingerprint.cpu_autotune_max_threads,
+                    current.config_fingerprint.cpu_autotune_max_threads
+                ));
+            }
+            if baseline.config_fingerprint.cpu_autotune_secs
+                != current.config_fingerprint.cpu_autotune_secs
+            {
+                issues.push(format!(
+                    "cpu_autotune_secs mismatch baseline={} current={}",
+                    baseline.config_fingerprint.cpu_autotune_secs,
+                    current.config_fingerprint.cpu_autotune_secs
+                ));
+            }
+            if baseline.config_fingerprint.cpu_auto_threads_cap
+                != current.config_fingerprint.cpu_auto_threads_cap
+            {
+                issues.push(format!(
+                    "cpu_auto_threads_cap mismatch baseline={} current={}",
+                    baseline.config_fingerprint.cpu_auto_threads_cap,
+                    current.config_fingerprint.cpu_auto_threads_cap
+                ));
+            }
+        }
         if baseline.schema_version >= 6 && current.schema_version >= 6 {
             if baseline.config_fingerprint.cpu_hash_batch_size
                 != current.config_fingerprint.cpu_hash_batch_size
@@ -1354,10 +1417,16 @@ fn benchmark_config_fingerprint(
     BenchConfigFingerprint {
         backend_event_capacity: cfg.backend_event_capacity,
         hash_poll_ms: cfg.hash_poll_interval.as_millis() as u64,
+        cpu_profile: cpu_profile_label(cfg.cpu_profile).to_string(),
         cpu_hash_batch_size: cfg.cpu_hash_batch_size,
         cpu_control_check_interval_hashes: cfg.cpu_control_check_interval_hashes,
         cpu_hash_flush_ms: cfg.cpu_hash_flush_interval.as_millis() as u64,
         cpu_event_dispatch_capacity: cfg.cpu_event_dispatch_capacity,
+        cpu_autotune_threads: cfg.cpu_autotune_threads,
+        cpu_autotune_min_threads: cfg.cpu_autotune_min_threads,
+        cpu_autotune_max_threads: cfg.cpu_autotune_max_threads,
+        cpu_autotune_secs: cfg.cpu_autotune_secs,
+        cpu_auto_threads_cap: cfg.cpu_auto_threads_cap,
         backend_assign_timeout_ms: cfg.backend_assign_timeout.as_millis() as u64,
         backend_assign_timeout_strikes: cfg.backend_assign_timeout_strikes,
         backend_control_timeout_ms: cfg.backend_control_timeout.as_millis() as u64,
@@ -1397,6 +1466,14 @@ fn cpu_affinity_label(mode: CpuAffinityMode) -> &'static str {
     match mode {
         CpuAffinityMode::Off => "off",
         CpuAffinityMode::Auto => "auto",
+    }
+}
+
+fn cpu_profile_label(profile: CpuPerformanceProfile) -> &'static str {
+    match profile {
+        CpuPerformanceProfile::Balanced => "balanced",
+        CpuPerformanceProfile::Throughput => "throughput",
+        CpuPerformanceProfile::Efficiency => "efficiency",
     }
 }
 
@@ -1697,10 +1774,16 @@ mod tests {
             config_fingerprint: BenchConfigFingerprint {
                 backend_event_capacity: 1024,
                 hash_poll_ms: 200,
+                cpu_profile: "balanced".to_string(),
                 cpu_hash_batch_size: 64,
                 cpu_control_check_interval_hashes: 256,
                 cpu_hash_flush_ms: 50,
                 cpu_event_dispatch_capacity: 256,
+                cpu_autotune_threads: false,
+                cpu_autotune_min_threads: 1,
+                cpu_autotune_max_threads: None,
+                cpu_autotune_secs: 2,
+                cpu_auto_threads_cap: 1,
                 backend_assign_timeout_ms: 1000,
                 backend_assign_timeout_strikes: 1,
                 backend_control_timeout_ms: 60_000,

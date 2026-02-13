@@ -89,6 +89,7 @@ Run headless/plain logs (no fullscreen TUI):
 ## Notes
 
 - Each CPU thread needs roughly 2GB RAM due to Argon2id parameters.
+- If `--threads` is omitted, Seine auto-sizes CPU lanes per CPU backend instance from host parallelism and available memory.
 - By default, seine refuses to start if configured CPU lanes exceed detected system RAM. Override with `--allow-oversubscribe` if needed.
 - The miner fetches block templates from `/api/mining/blocktemplate` and submits solved blocks to `/api/mining/submitblock` using compact `{template_id, nonce}` payloads when available.
 - When authenticating via cookie (`--cookie` or default `<data-dir>/api.cookie`), the miner automatically refreshes bearer auth after daemon restarts that rotate the API token.
@@ -107,11 +108,15 @@ Run headless/plain logs (no fullscreen TUI):
     - Runtime may tighten this cadence based on backend capability hints (for example non-CPU accelerators) while preserving the configured upper bound.
     - CPU backend does not force a lower poll hint, so CPU-only runs keep `--hash-poll-ms` as the effective poll cadence.
   - CPU backend hot-path tuning knobs for faster perf iteration:
+    - `--cpu-profile` (`balanced`, `throughput`, `efficiency`; default `balanced`) applies preset CPU threading/poll/flush defaults.
+      - Profile defaults apply when related knobs are omitted; explicit flags still override profile defaults.
     - `--cpu-hash-batch-size` (default `64`) controls per-worker hash counter flush batch size.
     - `--cpu-control-check-interval-hashes` (default `1`) controls per-worker control polling cadence.
       - CPU stop/deadline checks are additionally time-bounded to keep round-end late-hash skew stable under coarse hash-interval settings.
     - `--cpu-hash-flush-ms` (default `50`) controls time-based hash counter flush cadence.
     - `--cpu-event-dispatch-capacity` (default `256`) controls internal CPU backend event dispatch buffering.
+    - `--cpu-autotune-threads` enables startup kernel autotuning and selects the best measured per-instance thread count.
+      - `--cpu-autotune-min-threads`, `--cpu-autotune-max-threads`, and `--cpu-autotune-secs` bound autotuner search range and sample length.
   - `--stats-secs` (default `10`) controls periodic stats log emission cadence.
   - `--work-allocation` (`adaptive` or `static`) controls backend nonce-chunk splitting policy in mining mode.
     - Adaptive mode now also incorporates solved/stale rounds with reduced gain so weights stay fresh under frequent tip churn.
