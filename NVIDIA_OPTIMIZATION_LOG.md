@@ -11,7 +11,8 @@ This log tracks every measurable NVIDIA backend optimization attempt so we can i
 ## Current Best Known Config
 - Commit: `working tree` (post-pass)
 - Kernel model: cooperative per-lane execution (`32` threads/lane block)
-- NVRTC flags include: `--maxrregcount=224`, `-DSEINE_FIXED_M_BLOCKS=2097152U`, `-DSEINE_FIXED_T_COST=1U`
+- NVRTC flags include: `--maxrregcount=<autotuned>`, `-DSEINE_FIXED_M_BLOCKS=2097152U`, `-DSEINE_FIXED_T_COST=1U`
+- NVIDIA autotune schema: `2`; regcap sweep: `240/224/208/192/160` (local cache currently selected `160`)
 - Kernel hot path writes compression output directly to destination memory (no `block_tmp` shared staging buffer)
 - Runtime hot path: no explicit pre-`memcpy_dtoh` stream synchronize in `run_fill_batch`
 - Observed best 3-round average so far: `1.214 H/s` (2026-02-13)
@@ -36,6 +37,7 @@ This log tracks every measurable NVIDIA backend optimization attempt so we can i
 | 2026-02-13 | working tree | Remove post-store `coop_sync()` in inner block loop | `1.014 H/s` avg | Reverted (regressed vs 1.026 baseline) |
 | 2026-02-13 | working tree | Direct compression write-to-destination (drop `block_tmp` shared staging) | `1.120 H/s` avg | Kept (clear uplift over baseline) |
 | 2026-02-13 | working tree | Compile-time Argon2 constants via NVRTC defines (`SEINE_FIXED_M_BLOCKS`, `SEINE_FIXED_T_COST`) | `1.214 H/s` avg | Kept (new best, stable over rerun) |
+| 2026-02-13 | working tree | NVIDIA autotune schema bump `1 -> 2` + regcap candidate sweep `240/224/208/192/160` | baseline `1.162 H/s`; candidates `0.896/1.202 H/s`; final rerun `1.208 H/s` | Kept (`+3.44%` best-vs-baseline; first candidate outlier tied to one-time cache rebuild) |
 
 ## New Entry Template
 Copy this row and fill in all fields after each pass:
