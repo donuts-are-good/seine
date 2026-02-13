@@ -1795,6 +1795,7 @@ fn recent_template_cache_size_from_timeouts(
     ) as usize
 }
 
+#[cfg(test)]
 fn compact_hash(hash: &str) -> String {
     let value = hash.trim();
     let len = value.chars().count();

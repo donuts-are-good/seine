@@ -207,7 +207,7 @@ impl TaskLatencyHistogram {
         if self.sample_count == 0 {
             return 0;
         }
-        let target = ((self.sample_count as f64) * 0.95).ceil() as u64;
+        let target = self.sample_count.saturating_mul(95).saturating_add(99) / 100;
         let mut cumulative = 0u64;
         for (idx, bucket_count) in self.buckets.iter().enumerate() {
             cumulative = cumulative.saturating_add(*bucket_count);
