@@ -189,7 +189,6 @@ impl CudaArgon2Engine {
 
         let nvrtc_options = vec![
             "--std=c++14".to_string(),
-            "--extra-device-vectorization".to_string(),
             "--restrict".to_string(),
             "--use_fast_math".to_string(),
             "--ftz=true".to_string(),

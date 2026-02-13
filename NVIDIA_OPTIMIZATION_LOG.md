@@ -38,6 +38,7 @@ This log tracks every measurable NVIDIA backend optimization attempt so we can i
 | 2026-02-13 | working tree | Direct compression write-to-destination (drop `block_tmp` shared staging) | `1.120 H/s` avg | Kept (clear uplift over baseline) |
 | 2026-02-13 | working tree | Compile-time Argon2 constants via NVRTC defines (`SEINE_FIXED_M_BLOCKS`, `SEINE_FIXED_T_COST`) | `1.214 H/s` avg | Kept (new best, stable over rerun) |
 | 2026-02-13 | working tree | NVIDIA autotune schema bump `1 -> 2` + regcap candidate sweep `240/224/208/192/160` | baseline `1.162 H/s`; candidates `0.896/1.202 H/s`; final rerun `1.208 H/s` | Kept (`+3.44%` best-vs-baseline; first candidate outlier tied to one-time cache rebuild) |
+| 2026-02-13 | working tree | Drop NVRTC option `--extra-device-vectorization` from NVIDIA kernel compile flags | baseline `1.094 H/s`; candidates `1.179/1.193 H/s`; final rerun `1.193 H/s` | Kept (`+9.05%` best-vs-baseline, `+8.41%` mean, stable across rerun) |
 
 ## New Entry Template
 Copy this row and fill in all fields after each pass:
