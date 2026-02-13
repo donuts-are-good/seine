@@ -790,7 +790,7 @@ fn execute_round_phase(phase: ExecuteRoundPhase<'_, '_>) -> Result<()> {
             RoundUiView {
                 backends,
                 round_backend_hashes: &round_state.round_backend_hashes,
-                round_hashes: round_state.round_hashes,
+
                 round_start,
                 height,
                 difficulty,
@@ -814,7 +814,7 @@ fn execute_round_phase(phase: ExecuteRoundPhase<'_, '_>) -> Result<()> {
             RoundUiView {
                 backends,
                 round_backend_hashes: &round_state.round_backend_hashes,
-                round_hashes: round_state.round_hashes,
+
                 round_start,
                 height,
                 difficulty,
@@ -829,7 +829,7 @@ fn execute_round_phase(phase: ExecuteRoundPhase<'_, '_>) -> Result<()> {
             RoundUiView {
                 backends,
                 round_backend_hashes: &round_state.round_backend_hashes,
-                round_hashes: round_state.round_hashes,
+
                 round_start,
                 height,
                 difficulty,
@@ -1327,7 +1327,6 @@ impl<'a> RoundRuntime<'a> {
             RoundUiView {
                 backends: self.backends,
                 round_backend_hashes: &progress.round_backend_hashes,
-                round_hashes: progress.round_hashes,
                 round_start: input.round_start,
                 height: input.height,
                 difficulty: input.difficulty,

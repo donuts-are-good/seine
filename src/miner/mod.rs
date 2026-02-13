@@ -3,6 +3,7 @@ mod backend_control;
 mod backend_executor;
 mod bench;
 mod hash_poll;
+mod hashrate_tracker;
 mod mining;
 mod mining_tui;
 mod round_control;
@@ -1788,33 +1789,6 @@ fn backend_names_by_id(backends: &[BackendSlot]) -> BTreeMap<BackendInstanceId, 
         .iter()
         .map(|slot| (slot.id, slot.backend.name()))
         .collect()
-}
-
-fn format_round_backend_hashrate(
-    backends: &[BackendSlot],
-    round_backend_hashes: &BTreeMap<BackendInstanceId, u64>,
-    elapsed_secs: f64,
-) -> String {
-    let elapsed_secs = elapsed_secs.max(0.001);
-    let backend_names = backend_names_by_id(backends);
-    let mut parts = Vec::new();
-    for (backend_id, hashes) in round_backend_hashes {
-        if *hashes == 0 {
-            continue;
-        }
-        let backend_name = backend_names.get(backend_id).copied().unwrap_or("unknown");
-        let hps = (*hashes as f64) / elapsed_secs;
-        parts.push(format!(
-            "{backend_name}#{backend_id}={}",
-            format_hashrate(hps)
-        ));
-    }
-
-    if parts.is_empty() {
-        "none".to_string()
-    } else {
-        parts.join(", ")
-    }
 }
 
 fn format_round_backend_telemetry(

@@ -8,10 +8,11 @@ use anyhow::{anyhow, Result};
 use crossbeam_channel::{bounded, Sender, TrySendError};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 
+use super::hashrate_tracker::HashrateTracker;
 use super::stats::{format_hashrate, Stats};
-use super::tui::{TuiRenderer, TuiState};
+use super::tui::{DeviceHashrate, TuiRenderer, TuiState};
 use super::ui::{set_tui_state, warn};
-use super::{format_round_backend_hashrate, BackendSlot};
+use super::{backend_names_by_id, BackendSlot};
 
 const TUI_RENDER_INTERVAL: Duration = Duration::from_secs(1);
 const TUI_QUIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -41,6 +42,7 @@ pub(super) struct TuiDisplay {
     render_worker: Option<JoinHandle<()>>,
     quit_watcher_stop: Arc<AtomicBool>,
     quit_watcher: Option<JoinHandle<()>>,
+    hashrate_tracker: HashrateTracker,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -51,7 +53,6 @@ enum RenderSignal {
 pub(super) struct RoundUiView<'a> {
     pub backends: &'a [BackendSlot],
     pub round_backend_hashes: &'a BTreeMap<u64, u64>,
-    pub round_hashes: u64,
     pub round_start: Instant,
     pub height: &'a str,
     pub difficulty: &'a str,
@@ -73,6 +74,7 @@ impl TuiDisplay {
             render_worker: Some(render_worker),
             quit_watcher_stop,
             quit_watcher: Some(quit_watcher),
+            hashrate_tracker: HashrateTracker::new(),
         };
         display.request_render();
         Ok(display)
@@ -85,23 +87,43 @@ impl TuiDisplay {
         }
 
         let snapshot = stats.snapshot();
-        let round_elapsed = view.round_start.elapsed().as_secs_f64().max(0.001);
-        let round_rate = format_hashrate(view.round_hashes as f64 / round_elapsed);
-        let backend_rate =
-            format_round_backend_hashrate(view.backends, view.round_backend_hashes, round_elapsed);
+
+        // Record sample in the sliding-window tracker
+        self.hashrate_tracker.record(
+            snapshot.hashes,
+            view.round_start,
+            view.round_backend_hashes,
+        );
+        let rates = self.hashrate_tracker.rates();
+
+        // Build per-device hashrate display data
+        let names = backend_names_by_id(view.backends);
+        let mut device_hashrates = Vec::new();
+        for (&id, &current_rate) in &rates.current_per_device {
+            let avg_rate = rates.average_per_device.get(&id).copied().unwrap_or(0.0);
+            let name = names
+                .get(&id)
+                .map(|n| format!("{n}#{id}"))
+                .unwrap_or_else(|| format!("?#{id}"));
+            device_hashrates.push(DeviceHashrate {
+                name,
+                current: format_hashrate(current_rate),
+                average: format_hashrate(avg_rate),
+            });
+        }
 
         if let Ok(mut s) = self.state.lock() {
             s.height = view.height.to_string();
             s.difficulty = view.difficulty.to_string();
             s.epoch = view.epoch;
             s.state = view.state_label.to_string();
-            s.round_hashrate = round_rate;
-            s.avg_hashrate = format_hashrate(snapshot.hps);
+            s.round_hashrate = format_hashrate(rates.current_total);
+            s.avg_hashrate = format_hashrate(rates.average_total);
             s.total_hashes = snapshot.hashes;
             s.templates = snapshot.templates;
             s.submitted = snapshot.submitted;
             s.accepted = snapshot.accepted;
-            s.backend_rates = backend_rate;
+            s.device_hashrates = device_hashrates;
         }
 
         self.request_render();

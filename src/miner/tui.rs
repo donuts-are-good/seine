@@ -76,6 +76,13 @@ impl LogLevel {
     }
 }
 
+#[derive(Clone)]
+pub struct DeviceHashrate {
+    pub name: String,
+    pub current: String,
+    pub average: String,
+}
+
 pub struct TuiStateInner {
     // Network
     pub height: String,
@@ -90,7 +97,7 @@ pub struct TuiStateInner {
     pub templates: u64,
     pub submitted: u64,
     pub accepted: u64,
-    pub backend_rates: String,
+    pub device_hashrates: Vec<DeviceHashrate>,
 
     // Config (set once at startup)
     pub api_url: String,
@@ -125,7 +132,7 @@ impl TuiStateInner {
             templates: 0,
             submitted: 0,
             accepted: 0,
-            backend_rates: String::new(),
+            device_hashrates: Vec::new(),
 
             api_url: String::new(),
             threads: 0,
@@ -236,16 +243,27 @@ const DIM_STYLE: Style = Style::new().fg(Color::Rgb(90, 90, 90));
 fn draw_dashboard(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner) {
     let wide = area.width >= 80;
 
-    // Compute row heights
-    let stats_height = if wide { 6 } else { 14 };
-    let config_height = 4;
-    let header_height = 4;
+    let stats_height: u16 = if wide { 6 } else { 14 };
+    let device_count = state.device_hashrates.len() as u16;
+    let device_rows = if wide {
+        (device_count + 1) / 2 // 2 per row in wide mode
+    } else {
+        device_count
+    };
+    let devices_height: u16 = if device_count > 0 {
+        2 + device_rows
+    } else {
+        0
+    };
+    let config_height: u16 = 4;
+    let header_height: u16 = 4;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(header_height),
             Constraint::Length(stats_height),
+            Constraint::Length(devices_height),
             Constraint::Length(config_height),
             Constraint::Min(4),
         ])
@@ -253,8 +271,11 @@ fn draw_dashboard(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner)
 
     draw_header(frame, chunks[0], state);
     draw_stats(frame, chunks[1], state, wide);
-    draw_config(frame, chunks[2], state);
-    draw_log(frame, chunks[3], state);
+    if device_count > 0 {
+        draw_devices(frame, chunks[2], state, wide);
+    }
+    draw_config(frame, chunks[3], state);
+    draw_log(frame, chunks[4], state);
 }
 
 fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner) {
@@ -484,6 +505,53 @@ fn draw_stats_narrow(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInn
     frame.render_widget(Paragraph::new(mining_lines).block(mining_block), rows[2]);
 }
 
+fn draw_devices(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner, wide: bool) {
+    let lines: Vec<Line<'static>> = if wide {
+        // Wide: lay out devices side by side, 2 per row
+        state
+            .device_hashrates
+            .chunks(2)
+            .map(|pair| {
+                let mut spans = Vec::new();
+                for (i, dev) in pair.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::styled("    ", Style::default()));
+                    }
+                    spans.push(Span::styled("  ", Style::default()));
+                    spans.push(Span::styled(
+                        "▸ ",
+                        Style::default().fg(Color::Rgb(70, 100, 130)),
+                    ));
+                    spans.push(Span::styled(
+                        format!("{:<10}", dev.name),
+                        DEVICE_NAME_STYLE,
+                    ));
+                    spans.push(Span::styled(
+                        format!("{:<14}", dev.current),
+                        VALUE_STYLE,
+                    ));
+                    spans.push(Span::styled("avg ", DEVICE_AVG_STYLE));
+                    spans.push(Span::styled(dev.average.clone(), DEVICE_AVG_STYLE));
+                }
+                Line::from(spans)
+            })
+            .collect()
+    } else {
+        // Narrow: one device per line
+        state
+            .device_hashrates
+            .iter()
+            .map(|dev| device_line(&dev.name, &dev.current, &dev.average))
+            .collect()
+    };
+
+    let block = Block::default()
+        .title(Span::styled(" DEVICES ", TITLE_STYLE))
+        .borders(Borders::ALL)
+        .border_style(BORDER_STYLE);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_config(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner) {
     let sse_str = if state.sse_enabled { "on" } else { "off" };
     let line1 = Line::from(vec![
@@ -563,6 +631,20 @@ fn kv_line(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("  {:<10} ", label), LABEL_STYLE),
         Span::styled(value.to_string(), VALUE_STYLE),
+    ])
+}
+
+const DEVICE_NAME_STYLE: Style = Style::new().fg(Color::Rgb(100, 140, 160));
+const DEVICE_AVG_STYLE: Style = Style::new().fg(Color::Rgb(130, 140, 155));
+
+fn device_line(name: &str, current: &str, average: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("   ", Style::default()),
+        Span::styled("▸ ", Style::default().fg(Color::Rgb(70, 100, 130))),
+        Span::styled(format!("{:<10}", name), DEVICE_NAME_STYLE),
+        Span::styled(current.to_string(), VALUE_STYLE),
+        Span::styled("  avg ", DEVICE_AVG_STYLE),
+        Span::styled(average.to_string(), DEVICE_AVG_STYLE),
     ])
 }
 
