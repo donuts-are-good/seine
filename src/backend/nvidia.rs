@@ -1,25 +1,38 @@
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::convert::TryFrom;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use blocknet_pow_spec::CPU_LANE_MEMORY_BYTES;
-use crossbeam_channel::{bounded, Receiver, Sender};
-use sysinfo::System;
+use blake2::{
+    digest::{self, Digest, VariableOutput},
+    Blake2b512, Blake2bVar,
+};
+use blocknet_pow_spec::{pow_params, CPU_LANE_MEMORY_BYTES, POW_HEADER_BASE_LEN, POW_OUTPUT_LEN};
+use crossbeam_channel::{bounded, Receiver, SendTimeoutError, Sender};
+use cudarc::{
+    driver::{
+        CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
+    },
+    nvrtc::{compile_ptx_with_opts, CompileOptions},
+};
 
-use crate::backend::cpu::{CpuBackend, CpuBackendTuning};
 use crate::backend::{
     AssignmentSemantics, BackendCapabilities, BackendEvent, BackendExecutionModel,
     BackendInstanceId, BackendTelemetry, BenchBackend, DeadlineSupport, MiningSolution, NonceChunk,
     PowBackend, PreemptionGranularity, WorkAssignment, WorkTemplate,
 };
-use crate::config::CpuAffinityMode;
+use crate::types::hash_meets_target;
 
 const BACKEND_NAME: &str = "nvidia";
-const EVENT_FORWARD_CAPACITY: usize = 1024;
-const MAX_RECOMMENDED_LANES: usize = 8;
+const CUDA_KERNEL_SRC: &str = include_str!("nvidia_kernel.cu");
+const MAX_RECOMMENDED_LANES: usize = 16;
+const CMD_CHANNEL_CAPACITY: usize = 256;
+const EVENT_SEND_WAIT: Duration = Duration::from_millis(5);
+const KERNEL_THREADS: u32 = 128;
+const ARGON2_VERSION_V13: u32 = 0x13;
+const ARGON2_ALGORITHM_ID: u32 = 2; // Argon2id
 
 #[derive(Debug, Clone)]
 struct NvidiaDeviceInfo {
@@ -28,40 +41,307 @@ struct NvidiaDeviceInfo {
     memory_total_mib: u64,
 }
 
+struct NvidiaShared {
+    event_sink: Arc<RwLock<Option<Sender<BackendEvent>>>>,
+    dropped_events: AtomicU64,
+    hashes: AtomicU64,
+    active_lanes: AtomicU64,
+    pending_work: AtomicU64,
+    inflight_assignment_hashes: AtomicU64,
+    inflight_assignment_started_at: Mutex<Option<Instant>>,
+    completed_assignments: AtomicU64,
+    completed_assignment_hashes: AtomicU64,
+    completed_assignment_micros: AtomicU64,
+    error_emitted: AtomicBool,
+}
+
+impl NvidiaShared {
+    fn new() -> Self {
+        Self {
+            event_sink: Arc::new(RwLock::new(None)),
+            dropped_events: AtomicU64::new(0),
+            hashes: AtomicU64::new(0),
+            active_lanes: AtomicU64::new(0),
+            pending_work: AtomicU64::new(0),
+            inflight_assignment_hashes: AtomicU64::new(0),
+            inflight_assignment_started_at: Mutex::new(None),
+            completed_assignments: AtomicU64::new(0),
+            completed_assignment_hashes: AtomicU64::new(0),
+            completed_assignment_micros: AtomicU64::new(0),
+            error_emitted: AtomicBool::new(false),
+        }
+    }
+}
+
+struct NvidiaWorker {
+    tx: Sender<WorkerCommand>,
+    handle: JoinHandle<()>,
+}
+
+enum WorkerCommand {
+    Assign(WorkAssignment),
+    Cancel(Sender<Result<()>>),
+    Fence(Sender<Result<()>>),
+    Stop,
+}
+
+struct ActiveAssignment {
+    work: WorkAssignment,
+    next_nonce: u64,
+    remaining: u64,
+    hashes_done: u64,
+    started_at: Instant,
+}
+
+impl ActiveAssignment {
+    fn new(work: WorkAssignment) -> Self {
+        Self {
+            next_nonce: work.nonce_chunk.start_nonce,
+            remaining: work.nonce_chunk.nonce_count,
+            hashes_done: 0,
+            started_at: Instant::now(),
+            work,
+        }
+    }
+}
+
+struct CudaArgon2Engine {
+    stream: Arc<CudaStream>,
+    kernel: CudaFunction,
+    m_blocks: u32,
+    m_cost_kib: u32,
+    t_cost: u32,
+    max_lanes: usize,
+    lane_memory: CudaSlice<u64>,
+    seed_blocks: CudaSlice<u64>,
+    last_blocks: CudaSlice<u64>,
+    hashes_done: CudaSlice<u64>,
+    host_seed_words: Vec<u64>,
+    host_last_words: Vec<u64>,
+    host_hashes: Vec<[u8; POW_OUTPUT_LEN]>,
+}
+
+impl CudaArgon2Engine {
+    fn new(device_index: u32, memory_total_mib: u64) -> Result<Self> {
+        let ctx = CudaContext::new(device_index as usize).map_err(|err| {
+            anyhow!("failed to open CUDA context on device {device_index}: {err:?}")
+        })?;
+        let stream = ctx.default_stream();
+
+        let (cc_major, cc_minor) = ctx
+            .compute_capability()
+            .map_err(|err| anyhow!("failed to query compute capability: {err:?}"))?;
+
+        let compile_opts = CompileOptions {
+            ftz: Some(true),
+            fmad: Some(true),
+            use_fast_math: Some(true),
+            maxrregcount: Some(128),
+            options: vec![
+                "--std=c++14".to_string(),
+                "--extra-device-vectorization".to_string(),
+                "--restrict".to_string(),
+                format!("--gpu-architecture=compute_{}{}", cc_major, cc_minor),
+            ],
+            name: Some("seine_argon2id_fill.cu".to_string()),
+            ..CompileOptions::default()
+        };
+
+        let ptx = compile_ptx_with_opts(CUDA_KERNEL_SRC, compile_opts)
+            .map_err(|err| anyhow!("failed to compile CUDA kernel with NVRTC: {err:?}"))?;
+        let module = ctx
+            .load_module(ptx)
+            .map_err(|err| anyhow!("failed to load CUDA module: {err:?}"))?;
+        let kernel = module
+            .load_function("argon2id_fill_kernel")
+            .map_err(|err| anyhow!("failed to load CUDA kernel function: {err:?}"))?;
+
+        let params = pow_params()
+            .map_err(|err| anyhow!("invalid Argon2 parameters for CUDA backend: {err}"))?;
+        let m_blocks = params.block_count() as u32;
+        let m_cost_kib = params.m_cost();
+        let t_cost = params.t_cost();
+
+        let lane_bytes = CPU_LANE_MEMORY_BYTES.max(u64::from(m_blocks) * 1024);
+        let memory_total_bytes = memory_total_mib.saturating_mul(1024 * 1024);
+        let usable_bytes = memory_total_bytes.saturating_mul(80) / 100;
+        let by_memory = usize::try_from((usable_bytes / lane_bytes).max(1)).unwrap_or(1);
+        let max_lanes = by_memory.max(1).min(MAX_RECOMMENDED_LANES);
+
+        let lane_words_u64 = u64::from(m_blocks)
+            .checked_mul(128)
+            .ok_or_else(|| anyhow!("lane memory word count overflow"))?;
+        let total_lane_words_u64 = lane_words_u64
+            .checked_mul(max_lanes as u64)
+            .ok_or_else(|| anyhow!("total lane memory word count overflow"))?;
+        let total_lane_words = usize::try_from(total_lane_words_u64)
+            .map_err(|_| anyhow!("total lane memory does not fit in usize"))?;
+
+        let lane_memory = unsafe { stream.alloc::<u64>(total_lane_words) }
+            .map_err(|err| anyhow!("failed to allocate CUDA lane memory: {err:?}"))?;
+        let seed_blocks = unsafe { stream.alloc::<u64>(max_lanes * 256) }
+            .map_err(|err| anyhow!("failed to allocate CUDA seed buffer: {err:?}"))?;
+        let last_blocks = unsafe { stream.alloc::<u64>(max_lanes * 128) }
+            .map_err(|err| anyhow!("failed to allocate CUDA output buffer: {err:?}"))?;
+        let hashes_done = stream
+            .alloc_zeros::<u64>(1)
+            .map_err(|err| anyhow!("failed to allocate CUDA hash counter buffer: {err:?}"))?;
+
+        Ok(Self {
+            stream,
+            kernel,
+            m_blocks,
+            m_cost_kib,
+            t_cost,
+            max_lanes,
+            lane_memory,
+            seed_blocks,
+            last_blocks,
+            hashes_done,
+            host_seed_words: vec![0u64; max_lanes * 256],
+            host_last_words: vec![0u64; max_lanes * 128],
+            host_hashes: vec![[0u8; POW_OUTPUT_LEN]; max_lanes],
+        })
+    }
+
+    fn max_lanes(&self) -> usize {
+        self.max_lanes
+    }
+
+    fn hash_at(&self, idx: usize) -> &[u8; POW_OUTPUT_LEN] {
+        &self.host_hashes[idx]
+    }
+
+    fn run_fill_batch(&mut self, header_base: &[u8], nonces: &[u64]) -> Result<usize> {
+        if header_base.len() != POW_HEADER_BASE_LEN {
+            bail!(
+                "invalid header base length: expected {} bytes, got {}",
+                POW_HEADER_BASE_LEN,
+                header_base.len()
+            );
+        }
+
+        if nonces.is_empty() {
+            return Ok(0);
+        }
+
+        if nonces.len() > self.max_lanes {
+            bail!(
+                "batch size {} exceeds configured CUDA lanes {}",
+                nonces.len(),
+                self.max_lanes
+            );
+        }
+
+        for (idx, nonce) in nonces.iter().copied().enumerate() {
+            let start = idx * 256;
+            let end = start + 256;
+            build_seed_blocks_for_nonce(
+                header_base,
+                nonce,
+                self.m_cost_kib,
+                self.t_cost,
+                &mut self.host_seed_words[start..end],
+            )?;
+        }
+
+        let lanes = nonces.len();
+        let seed_words = lanes * 256;
+        {
+            let mut seed_view = self
+                .seed_blocks
+                .try_slice_mut(0..seed_words)
+                .ok_or_else(|| anyhow!("failed to slice CUDA seed buffer"))?;
+            self.stream
+                .memcpy_htod(&self.host_seed_words[..seed_words], &mut seed_view)
+                .map_err(cuda_driver_err)?;
+        }
+
+        {
+            let mut hashes_view = self
+                .hashes_done
+                .try_slice_mut(0..1)
+                .ok_or_else(|| anyhow!("failed to slice CUDA hash counter"))?;
+            self.stream
+                .memcpy_htod(&[0u64], &mut hashes_view)
+                .map_err(cuda_driver_err)?;
+        }
+
+        let lanes_u32 = u32::try_from(lanes).map_err(|_| anyhow!("lane count overflow"))?;
+        let cfg = LaunchConfig {
+            grid_dim: (lanes_u32.div_ceil(KERNEL_THREADS), 1, 1),
+            block_dim: (KERNEL_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        unsafe {
+            let mut launch = self.stream.launch_builder(&self.kernel);
+            launch
+                .arg(&self.seed_blocks)
+                .arg(&lanes_u32)
+                .arg(&self.m_blocks)
+                .arg(&self.t_cost)
+                .arg(&mut self.lane_memory)
+                .arg(&mut self.last_blocks)
+                .arg(&mut self.hashes_done);
+            launch.launch(cfg).map_err(cuda_driver_err)?;
+        }
+
+        self.stream.synchronize().map_err(cuda_driver_err)?;
+
+        let last_words = lanes * 128;
+        {
+            let last_view = self
+                .last_blocks
+                .try_slice(0..last_words)
+                .ok_or_else(|| anyhow!("failed to slice CUDA output buffer"))?;
+            self.stream
+                .memcpy_dtoh(&last_view, &mut self.host_last_words[..last_words])
+                .map_err(cuda_driver_err)?;
+        }
+
+        let hashes_done = {
+            let mut done = [0u64; 1];
+            let done_view = self
+                .hashes_done
+                .try_slice(0..1)
+                .ok_or_else(|| anyhow!("failed to slice CUDA hash counter readback"))?;
+            self.stream
+                .memcpy_dtoh(&done_view, &mut done)
+                .map_err(cuda_driver_err)?;
+            usize::try_from(done[0]).unwrap_or(lanes)
+        }
+        .min(lanes);
+
+        for idx in 0..hashes_done {
+            finalize_lane_hash(
+                &self.host_last_words[idx * 128..(idx + 1) * 128],
+                &mut self.host_hashes[idx],
+            )?;
+        }
+
+        Ok(hashes_done)
+    }
+}
+
 pub struct NvidiaBackend {
-    instance_id: AtomicU64,
+    instance_id: Arc<AtomicU64>,
     requested_device_index: Option<u32>,
     resolved_device: RwLock<Option<NvidiaDeviceInfo>>,
-    event_sink: Arc<RwLock<Option<Sender<BackendEvent>>>>,
-    event_forward_handle: Mutex<Option<JoinHandle<()>>>,
-    inner: CpuBackend,
+    shared: Arc<NvidiaShared>,
+    worker: Mutex<Option<NvidiaWorker>>,
+    max_lanes: AtomicUsize,
 }
 
 impl NvidiaBackend {
     pub fn new(device_index: Option<u32>) -> Self {
-        let host_threads = std::thread::available_parallelism()
-            .map(|parallelism| parallelism.get())
-            .unwrap_or(1)
-            .max(1);
-        let memory_budget = detect_available_memory_budget_bytes();
-        let estimated_instances = detect_nvidia_instance_count_for_sizing().max(1);
-        let lanes = recommend_worker_lanes(host_threads, memory_budget, estimated_instances);
-
-        let inner = CpuBackend::with_tuning(lanes, CpuAffinityMode::Auto, throughput_tuning(lanes));
-
-        let event_sink = Arc::new(RwLock::new(None));
-        let (inner_event_tx, inner_event_rx) = bounded::<BackendEvent>(EVENT_FORWARD_CAPACITY);
-        inner.set_event_sink(inner_event_tx);
-        let event_forward_handle =
-            spawn_event_forwarder(Arc::clone(&event_sink), inner_event_rx, BACKEND_NAME);
-
         Self {
-            instance_id: AtomicU64::new(0),
+            instance_id: Arc::new(AtomicU64::new(0)),
             requested_device_index: device_index,
             resolved_device: RwLock::new(None),
-            event_sink,
-            event_forward_handle: Mutex::new(Some(event_forward_handle)),
-            inner,
+            shared: Arc::new(NvidiaShared::new()),
+            worker: Mutex::new(None),
+            max_lanes: AtomicUsize::new(1),
         }
     }
 
@@ -102,19 +382,25 @@ impl NvidiaBackend {
         if let Ok(mut slot) = self.resolved_device.write() {
             *slot = Some(selected.clone());
         }
+
         Ok(selected)
+    }
+
+    fn worker_tx(&self) -> Result<Sender<WorkerCommand>> {
+        let guard = self
+            .worker
+            .lock()
+            .map_err(|_| anyhow!("nvidia worker lock poisoned"))?;
+        let Some(worker) = guard.as_ref() else {
+            bail!("NVIDIA backend is not started");
+        };
+        Ok(worker.tx.clone())
     }
 }
 
 impl Drop for NvidiaBackend {
     fn drop(&mut self) {
-        let (tx, _rx) = bounded::<BackendEvent>(1);
-        self.inner.set_event_sink(tx);
-        if let Ok(mut slot) = self.event_forward_handle.lock() {
-            if let Some(handle) = slot.take() {
-                let _ = handle.join();
-            }
-        }
+        self.stop();
     }
 }
 
@@ -124,43 +410,111 @@ impl PowBackend for NvidiaBackend {
     }
 
     fn lanes(&self) -> usize {
-        self.inner.lanes()
+        self.max_lanes.load(Ordering::Acquire).max(1)
+    }
+
+    fn device_memory_bytes(&self) -> Option<u64> {
+        self.resolved_device.read().ok().and_then(|dev| {
+            dev.as_ref()
+                .map(|d| d.memory_total_mib.saturating_mul(1024 * 1024))
+        })
     }
 
     fn set_instance_id(&self, id: BackendInstanceId) {
         self.instance_id.store(id, Ordering::Release);
-        self.inner.set_instance_id(id);
     }
 
     fn set_event_sink(&self, sink: Sender<BackendEvent>) {
-        if let Ok(mut slot) = self.event_sink.write() {
+        if let Ok(mut slot) = self.shared.event_sink.write() {
             *slot = Some(sink);
         }
     }
 
     fn start(&self) -> Result<()> {
+        {
+            let guard = self
+                .worker
+                .lock()
+                .map_err(|_| anyhow!("nvidia worker lock poisoned"))?;
+            if guard.is_some() {
+                return Ok(());
+            }
+        }
+
         let selected = self.validate_or_select_device()?;
-        self.inner.start().with_context(|| {
-            format!(
-                "failed to start NVIDIA backend for device {} ({})",
-                selected.index, selected.name
-            )
-        })
+        let mut engine = CudaArgon2Engine::new(selected.index, selected.memory_total_mib)
+            .with_context(|| {
+                format!(
+                    "failed to initialize CUDA engine on NVIDIA device {} ({})",
+                    selected.index, selected.name
+                )
+            })?;
+
+        self.max_lanes
+            .store(engine.max_lanes().max(1), Ordering::Release);
+
+        self.shared.error_emitted.store(false, Ordering::Release);
+        self.shared.hashes.store(0, Ordering::Release);
+        self.shared.active_lanes.store(0, Ordering::Release);
+        self.shared.pending_work.store(0, Ordering::Release);
+        self.shared
+            .inflight_assignment_hashes
+            .store(0, Ordering::Release);
+        if let Ok(mut slot) = self.shared.inflight_assignment_started_at.lock() {
+            *slot = None;
+        }
+
+        let (tx, rx) = bounded::<WorkerCommand>(CMD_CHANNEL_CAPACITY);
+        let shared = Arc::clone(&self.shared);
+        let instance_id = Arc::clone(&self.instance_id);
+        let handle = thread::Builder::new()
+            .name(format!(
+                "seine-nvidia-worker-{}",
+                self.instance_id.load(Ordering::Acquire)
+            ))
+            .spawn(move || worker_loop(&mut engine, rx, shared, instance_id))
+            .map_err(|err| anyhow!("failed to spawn nvidia worker thread: {err}"))?;
+
+        let mut guard = self
+            .worker
+            .lock()
+            .map_err(|_| anyhow!("nvidia worker lock poisoned"))?;
+        *guard = Some(NvidiaWorker { tx, handle });
+
+        Ok(())
     }
 
     fn stop(&self) {
-        self.inner.stop();
+        let worker = match self.worker.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => None,
+        };
+        if let Some(worker) = worker {
+            let _ = worker.tx.send(WorkerCommand::Stop);
+            let _ = worker.handle.join();
+        }
+
+        self.shared.active_lanes.store(0, Ordering::Release);
+        self.shared.pending_work.store(0, Ordering::Release);
+        self.shared
+            .inflight_assignment_hashes
+            .store(0, Ordering::Release);
+        if let Ok(mut slot) = self.shared.inflight_assignment_started_at.lock() {
+            *slot = None;
+        }
     }
 
     fn assign_work(&self, work: WorkAssignment) -> Result<()> {
-        self.inner.assign_work(work)
+        self.worker_tx()?
+            .send(WorkerCommand::Assign(work))
+            .map_err(|_| anyhow!("nvidia worker channel closed while assigning work"))
     }
 
     fn assign_work_batch(&self, work: &[WorkAssignment]) -> Result<()> {
         let Some(collapsed) = collapse_assignment_batch(work)? else {
             return Ok(());
         };
-        self.inner.assign_work(collapsed)
+        self.assign_work(collapsed)
     }
 
     fn assign_work_batch_with_deadline(
@@ -171,7 +525,7 @@ impl PowBackend for NvidiaBackend {
         let Some(collapsed) = collapse_assignment_batch(work)? else {
             return Ok(());
         };
-        self.inner.assign_work_with_deadline(&collapsed, deadline)
+        self.assign_work_with_deadline(&collapsed, deadline)
     }
 
     fn supports_assignment_batching(&self) -> bool {
@@ -179,47 +533,86 @@ impl PowBackend for NvidiaBackend {
     }
 
     fn cancel_work(&self) -> Result<()> {
-        self.inner.cancel_work()
+        let tx = self.worker_tx()?;
+        let (ack_tx, ack_rx) = bounded::<Result<()>>(1);
+        tx.send(WorkerCommand::Cancel(ack_tx))
+            .map_err(|_| anyhow!("nvidia worker channel closed while cancelling"))?;
+        ack_rx
+            .recv()
+            .map_err(|_| anyhow!("nvidia worker did not acknowledge cancellation"))??;
+        Ok(())
     }
 
     fn request_timeout_interrupt(&self) -> Result<()> {
-        self.inner.request_timeout_interrupt()
-    }
-
-    fn cancel_work_with_deadline(&self, deadline: Instant) -> Result<()> {
-        self.inner.cancel_work_with_deadline(deadline)
+        self.cancel_work()
     }
 
     fn fence(&self) -> Result<()> {
-        self.inner.fence()
-    }
-
-    fn fence_with_deadline(&self, deadline: Instant) -> Result<()> {
-        self.inner.fence_with_deadline(deadline)
+        let tx = self.worker_tx()?;
+        let (ack_tx, ack_rx) = bounded::<Result<()>>(1);
+        tx.send(WorkerCommand::Fence(ack_tx))
+            .map_err(|_| anyhow!("nvidia worker channel closed while fencing"))?;
+        ack_rx
+            .recv()
+            .map_err(|_| anyhow!("nvidia worker did not acknowledge fence"))??;
+        Ok(())
     }
 
     fn take_hashes(&self) -> u64 {
-        self.inner.take_hashes()
+        self.shared.hashes.swap(0, Ordering::AcqRel)
     }
 
     fn take_telemetry(&self) -> BackendTelemetry {
-        self.inner.take_telemetry()
+        let inflight_assignment_micros = if self.shared.pending_work.load(Ordering::Acquire) > 0 {
+            self.shared
+                .inflight_assignment_started_at
+                .lock()
+                .ok()
+                .and_then(|slot| {
+                    slot.as_ref()
+                        .map(|started| started.elapsed().as_micros().min(u64::MAX as u128) as u64)
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        BackendTelemetry {
+            active_lanes: self.shared.active_lanes.load(Ordering::Acquire),
+            pending_work: self.shared.pending_work.load(Ordering::Acquire),
+            dropped_events: self.shared.dropped_events.swap(0, Ordering::AcqRel),
+            completed_assignments: self.shared.completed_assignments.swap(0, Ordering::AcqRel),
+            completed_assignment_hashes: self
+                .shared
+                .completed_assignment_hashes
+                .swap(0, Ordering::AcqRel),
+            completed_assignment_micros: self
+                .shared
+                .completed_assignment_micros
+                .swap(0, Ordering::AcqRel),
+            inflight_assignment_hashes: self
+                .shared
+                .inflight_assignment_hashes
+                .load(Ordering::Acquire),
+            inflight_assignment_micros,
+            ..BackendTelemetry::default()
+        }
     }
 
     fn preemption_granularity(&self) -> PreemptionGranularity {
-        self.inner.preemption_granularity()
+        PreemptionGranularity::Hashes(self.lanes() as u64)
     }
 
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
-            preferred_iters_per_lane: Some(1 << 18),
-            preferred_allocation_iters_per_lane: Some(1 << 20),
-            preferred_hash_poll_interval: Some(Duration::from_millis(20)),
+            preferred_iters_per_lane: Some(1 << 20),
+            preferred_allocation_iters_per_lane: Some(1 << 21),
+            preferred_hash_poll_interval: Some(Duration::from_millis(25)),
             preferred_assignment_timeout: None,
             preferred_control_timeout: None,
             preferred_assignment_timeout_strikes: None,
-            preferred_worker_queue_depth: Some(16),
-            max_inflight_assignments: 8,
+            preferred_worker_queue_depth: Some(32),
+            max_inflight_assignments: 32,
             deadline_support: DeadlineSupport::Cooperative,
             assignment_semantics: AssignmentSemantics::Replace,
             execution_model: BackendExecutionModel::Blocking,
@@ -235,96 +628,410 @@ impl PowBackend for NvidiaBackend {
 
 impl BenchBackend for NvidiaBackend {
     fn kernel_bench(&self, seconds: u64, shutdown: &AtomicBool) -> Result<u64> {
-        self.validate_or_select_device()?;
-        self.inner.kernel_bench(seconds, shutdown)
-    }
-}
+        let selected = self.validate_or_select_device()?;
+        let mut engine = CudaArgon2Engine::new(selected.index, selected.memory_total_mib)
+            .with_context(|| {
+                format!(
+                    "failed to initialize CUDA engine for benchmark on device {} ({})",
+                    selected.index, selected.name
+                )
+            })?;
 
-fn throughput_tuning(lanes: usize) -> CpuBackendTuning {
-    let lanes = lanes.max(1);
-    let hash_batch_size = if lanes >= 8 {
-        2048
-    } else if lanes >= 4 {
-        1024
-    } else {
-        512
-    };
-    let control_check_interval_hashes = if lanes >= 8 { 32 } else { 16 };
-    let hash_flush_interval = if lanes >= 4 {
-        Duration::from_millis(200)
-    } else {
-        Duration::from_millis(150)
-    };
-    let event_dispatch_capacity = (lanes.saturating_mul(256)).clamp(256, 4096);
+        let header = [0u8; POW_HEADER_BASE_LEN];
+        let deadline = Instant::now() + Duration::from_secs(seconds.max(1));
+        let mut nonce_cursor = 0u64;
+        let mut total = 0u64;
+        let mut nonces = vec![0u64; engine.max_lanes().max(1)];
 
-    CpuBackendTuning {
-        hash_batch_size,
-        control_check_interval_hashes,
-        hash_flush_interval,
-        event_dispatch_capacity,
-    }
-}
+        while Instant::now() < deadline && !shutdown.load(Ordering::Acquire) {
+            let lanes = engine.max_lanes().max(1);
+            if nonces.len() < lanes {
+                nonces.resize(lanes, 0);
+            }
+            for nonce in nonces.iter_mut().take(lanes) {
+                *nonce = nonce_cursor;
+                nonce_cursor = nonce_cursor.wrapping_add(1);
+            }
 
-fn recommend_worker_lanes(
-    host_threads: usize,
-    available_memory_bytes: Option<u64>,
-    nvidia_instance_count: usize,
-) -> usize {
-    let instances = nvidia_instance_count.max(1);
-    let host_threads = host_threads.max(1);
-    let host_per_instance = host_threads.saturating_div(instances).max(1);
-
-    let memory_total_lanes = available_memory_bytes
-        .map(|available| {
-            let usable = available.saturating_mul(3) / 4;
-            usable.saturating_div(CPU_LANE_MEMORY_BYTES).max(1)
-        })
-        .unwrap_or(host_threads as u64);
-    let memory_per_instance = (memory_total_lanes / instances as u64).max(1) as usize;
-
-    host_per_instance
-        .min(memory_per_instance)
-        .max(1)
-        .min(MAX_RECOMMENDED_LANES)
-}
-
-fn detect_nvidia_instance_count_for_sizing() -> usize {
-    match query_nvidia_devices() {
-        Ok(devices) => devices.len().max(1),
-        Err(_) => 1,
-    }
-}
-
-fn detect_available_memory_budget_bytes() -> Option<u64> {
-    let mut sys = System::new();
-    sys.refresh_memory();
-
-    let total = sys.total_memory();
-    if total == 0 {
-        return None;
-    }
-
-    let mut available = sys.available_memory().min(total);
-    if available == 0 {
-        available = total;
-    }
-
-    if let Some(cgroup) = sys.cgroup_limits() {
-        if cgroup.total_memory > 0 {
-            available = available.min(cgroup.total_memory);
+            let done = engine.run_fill_batch(&header, &nonces[..lanes])?;
+            total = total.saturating_add(done as u64);
         }
-        if cgroup.free_memory > 0 {
-            available = available.min(cgroup.free_memory);
+
+        Ok(total)
+    }
+}
+
+fn worker_loop(
+    engine: &mut CudaArgon2Engine,
+    rx: Receiver<WorkerCommand>,
+    shared: Arc<NvidiaShared>,
+    instance_id: Arc<AtomicU64>,
+) {
+    let mut active: Option<ActiveAssignment> = None;
+    let mut fence_waiters: Vec<Sender<Result<()>>> = Vec::new();
+    let mut running = true;
+    let mut nonce_buf = vec![0u64; engine.max_lanes().max(1)];
+
+    while running {
+        if active.is_none() {
+            match rx.recv() {
+                Ok(cmd) => {
+                    running = handle_worker_command(cmd, &mut active, &mut fence_waiters, &shared);
+                }
+                Err(_) => break,
+            }
+        }
+
+        while let Ok(cmd) = rx.try_recv() {
+            running = handle_worker_command(cmd, &mut active, &mut fence_waiters, &shared);
+            if !running {
+                break;
+            }
+        }
+
+        if !running {
+            break;
+        }
+
+        let Some(current) = active.as_mut() else {
+            continue;
+        };
+
+        if current.remaining == 0 || Instant::now() >= current.work.template.stop_at {
+            finalize_active_assignment(&shared, current);
+            active = None;
+            drain_fence_waiters(&mut fence_waiters, Ok(()));
+            continue;
+        }
+
+        let lanes = engine.max_lanes().min(current.remaining as usize).max(1);
+        if nonce_buf.len() < lanes {
+            nonce_buf.resize(lanes, 0);
+        }
+        for (idx, nonce) in nonce_buf.iter_mut().take(lanes).enumerate() {
+            *nonce = current.next_nonce.wrapping_add(idx as u64);
+        }
+
+        shared.active_lanes.store(lanes as u64, Ordering::Release);
+
+        let done = match engine.run_fill_batch(
+            current.work.template.header_base.as_ref(),
+            &nonce_buf[..lanes],
+        ) {
+            Ok(done) => done,
+            Err(err) => {
+                emit_worker_error(
+                    &shared,
+                    &instance_id,
+                    format!("CUDA batch execution failed: {err:#}"),
+                );
+                break;
+            }
+        };
+
+        if done == 0 {
+            finalize_active_assignment(&shared, current);
+            active = None;
+            drain_fence_waiters(&mut fence_waiters, Ok(()));
+            continue;
+        }
+
+        current.hashes_done = current.hashes_done.saturating_add(done as u64);
+        current.next_nonce = current.next_nonce.wrapping_add(done as u64);
+        current.remaining = current.remaining.saturating_sub(done as u64);
+
+        shared.hashes.fetch_add(done as u64, Ordering::Relaxed);
+        shared
+            .inflight_assignment_hashes
+            .store(current.hashes_done, Ordering::Release);
+
+        let mut solved_nonce = None;
+        for idx in 0..done {
+            if hash_meets_target(engine.hash_at(idx), &current.work.template.target) {
+                solved_nonce = Some(nonce_buf[idx]);
+                break;
+            }
+        }
+
+        if let Some(nonce) = solved_nonce {
+            send_backend_event(
+                &shared,
+                BackendEvent::Solution(MiningSolution {
+                    epoch: current.work.template.epoch,
+                    nonce,
+                    backend_id: instance_id.load(Ordering::Acquire),
+                    backend: BACKEND_NAME,
+                }),
+            );
+            finalize_active_assignment(&shared, current);
+            active = None;
+            drain_fence_waiters(&mut fence_waiters, Ok(()));
+            continue;
         }
     }
 
-    Some(available.max(CPU_LANE_MEMORY_BYTES))
+    if let Some(active_assignment) = active.as_ref() {
+        finalize_active_assignment(&shared, active_assignment);
+    } else {
+        shared.active_lanes.store(0, Ordering::Release);
+        shared.pending_work.store(0, Ordering::Release);
+        shared
+            .inflight_assignment_hashes
+            .store(0, Ordering::Release);
+        if let Ok(mut slot) = shared.inflight_assignment_started_at.lock() {
+            *slot = None;
+        }
+    }
+
+    drain_fence_waiters(
+        &mut fence_waiters,
+        Err(anyhow!("nvidia worker stopped before fence completion")),
+    );
+}
+
+fn handle_worker_command(
+    cmd: WorkerCommand,
+    active: &mut Option<ActiveAssignment>,
+    fence_waiters: &mut Vec<Sender<Result<()>>>,
+    shared: &NvidiaShared,
+) -> bool {
+    match cmd {
+        WorkerCommand::Assign(work) => {
+            if let Some(current) = active.as_ref() {
+                finalize_active_assignment(shared, current);
+            }
+            shared.error_emitted.store(false, Ordering::Release);
+            shared.pending_work.store(1, Ordering::Release);
+            shared.active_lanes.store(0, Ordering::Release);
+            shared
+                .inflight_assignment_hashes
+                .store(0, Ordering::Release);
+            if let Ok(mut slot) = shared.inflight_assignment_started_at.lock() {
+                *slot = Some(Instant::now());
+            }
+            *active = Some(ActiveAssignment::new(work));
+            true
+        }
+        WorkerCommand::Cancel(ack) => {
+            if let Some(current) = active.as_ref() {
+                finalize_active_assignment(shared, current);
+                *active = None;
+            }
+            let _ = ack.send(Ok(()));
+            if active.is_none() {
+                drain_fence_waiters(fence_waiters, Ok(()));
+            }
+            true
+        }
+        WorkerCommand::Fence(ack) => {
+            if active.is_none() {
+                let _ = ack.send(Ok(()));
+            } else {
+                fence_waiters.push(ack);
+            }
+            true
+        }
+        WorkerCommand::Stop => false,
+    }
+}
+
+fn finalize_active_assignment(shared: &NvidiaShared, active: &ActiveAssignment) {
+    shared.active_lanes.store(0, Ordering::Release);
+    shared.pending_work.store(0, Ordering::Release);
+    shared
+        .inflight_assignment_hashes
+        .store(0, Ordering::Release);
+    if let Ok(mut slot) = shared.inflight_assignment_started_at.lock() {
+        *slot = None;
+    }
+
+    shared.completed_assignments.fetch_add(1, Ordering::Relaxed);
+    shared
+        .completed_assignment_hashes
+        .fetch_add(active.hashes_done, Ordering::Relaxed);
+    shared.completed_assignment_micros.fetch_add(
+        active
+            .started_at
+            .elapsed()
+            .as_micros()
+            .min(u64::MAX as u128) as u64,
+        Ordering::Relaxed,
+    );
+}
+
+fn drain_fence_waiters(waiters: &mut Vec<Sender<Result<()>>>, result: Result<()>) {
+    for waiter in waiters.drain(..) {
+        let payload = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|err| anyhow!("{err:#}"));
+        let _ = waiter.send(payload);
+    }
+}
+
+fn send_backend_event(shared: &NvidiaShared, event: BackendEvent) {
+    let outbound = match shared.event_sink.read() {
+        Ok(slot) => slot.clone(),
+        Err(_) => None,
+    };
+
+    let Some(outbound) = outbound else {
+        shared.dropped_events.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+
+    match outbound.send_timeout(event, EVENT_SEND_WAIT) {
+        Ok(()) => {}
+        Err(SendTimeoutError::Timeout(returned)) => {
+            if outbound.send(returned).is_err() {
+                shared.dropped_events.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Err(SendTimeoutError::Disconnected(_)) => {
+            shared.dropped_events.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn emit_worker_error(shared: &NvidiaShared, instance_id: &AtomicU64, message: String) {
+    if shared.error_emitted.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    send_backend_event(
+        shared,
+        BackendEvent::Error {
+            backend_id: instance_id.load(Ordering::Acquire),
+            backend: BACKEND_NAME,
+            message,
+        },
+    );
+}
+
+fn cuda_driver_err(err: DriverError) -> anyhow::Error {
+    anyhow!("CUDA driver error: {err:?}")
+}
+
+fn build_seed_blocks_for_nonce(
+    header_base: &[u8],
+    nonce: u64,
+    m_cost_kib: u32,
+    t_cost: u32,
+    out_words: &mut [u64],
+) -> Result<()> {
+    if out_words.len() < 256 {
+        bail!("seed output buffer too small: expected at least 256 words");
+    }
+
+    let mut initial = Blake2b512::new();
+    initial.update(1u32.to_le_bytes());
+    initial.update((POW_OUTPUT_LEN as u32).to_le_bytes());
+    initial.update(m_cost_kib.to_le_bytes());
+    initial.update(t_cost.to_le_bytes());
+    initial.update(ARGON2_VERSION_V13.to_le_bytes());
+    initial.update(ARGON2_ALGORITHM_ID.to_le_bytes());
+    initial.update((std::mem::size_of::<u64>() as u32).to_le_bytes());
+    initial.update(nonce.to_le_bytes());
+    initial.update((header_base.len() as u32).to_le_bytes());
+    initial.update(header_base);
+    initial.update(0u32.to_le_bytes());
+    initial.update(0u32.to_le_bytes());
+
+    let h0 = initial.finalize();
+
+    let lane_index = 0u32.to_le_bytes();
+    for (seed_idx, words_chunk) in out_words.chunks_exact_mut(128).take(2).enumerate() {
+        let block_index = (seed_idx as u32).to_le_bytes();
+        let mut block_bytes = [0u8; 1024];
+        blake2b_long(&[h0.as_ref(), &block_index, &lane_index], &mut block_bytes)?;
+
+        for (chunk, dst) in block_bytes.chunks_exact(8).zip(words_chunk.iter_mut()) {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(chunk);
+            *dst = u64::from_le_bytes(bytes);
+        }
+    }
+
+    Ok(())
+}
+
+fn finalize_lane_hash(last_block_words: &[u64], out: &mut [u8; POW_OUTPUT_LEN]) -> Result<()> {
+    if last_block_words.len() < 128 {
+        bail!(
+            "last block word buffer too small: expected at least 128 words, got {}",
+            last_block_words.len()
+        );
+    }
+
+    let mut block_bytes = [0u8; 1024];
+    for (dst, word) in block_bytes
+        .chunks_exact_mut(8)
+        .zip(last_block_words.iter().take(128))
+    {
+        dst.copy_from_slice(&word.to_le_bytes());
+    }
+
+    blake2b_long(&[&block_bytes], out)
+}
+
+fn blake2b_long(inputs: &[&[u8]], out: &mut [u8]) -> Result<()> {
+    if out.is_empty() {
+        bail!("blake2b_long output buffer is empty");
+    }
+
+    let len_bytes = u32::try_from(out.len())
+        .map(|v| v.to_le_bytes())
+        .map_err(|_| anyhow!("blake2b_long output length overflow"))?;
+
+    if out.len() <= Blake2b512::output_size() {
+        let mut digest = Blake2bVar::new(out.len())
+            .map_err(|_| anyhow!("invalid variable Blake2b output length"))?;
+
+        digest::Update::update(&mut digest, &len_bytes);
+        for input in inputs {
+            digest::Update::update(&mut digest, input);
+        }
+
+        digest
+            .finalize_variable(out)
+            .map_err(|_| anyhow!("failed to finalize Blake2b variable output"))?;
+        return Ok(());
+    }
+
+    let half_hash_len = Blake2b512::output_size() / 2;
+    let mut digest = Blake2b512::new();
+    digest.update(len_bytes);
+    for input in inputs {
+        digest.update(input);
+    }
+
+    let mut last_output = digest.finalize();
+    out[..half_hash_len].copy_from_slice(&last_output[..half_hash_len]);
+
+    let mut counter = half_hash_len;
+    while out.len().saturating_sub(counter) > Blake2b512::output_size() {
+        last_output = Blake2b512::digest(last_output);
+        let end = counter + half_hash_len;
+        out[counter..end].copy_from_slice(&last_output[..half_hash_len]);
+        counter = end;
+    }
+
+    let last_block_size = out.len().saturating_sub(counter);
+    let mut final_digest = Blake2bVar::new(last_block_size)
+        .map_err(|_| anyhow!("invalid final Blake2b output length"))?;
+    digest::Update::update(&mut final_digest, &last_output);
+    final_digest
+        .finalize_variable(&mut out[counter..])
+        .map_err(|_| anyhow!("failed to finalize tail Blake2b output"))?;
+
+    Ok(())
 }
 
 fn collapse_assignment_batch(work: &[WorkAssignment]) -> Result<Option<WorkAssignment>> {
     let Some(first) = work.first() else {
         return Ok(None);
     };
+
     if work.len() == 1 {
         return Ok(Some(first.clone()));
     }
@@ -342,6 +1049,7 @@ fn collapse_assignment_batch(work: &[WorkAssignment]) -> Result<Option<WorkAssig
                 idx + 1
             )
         })?;
+
         if assignment.nonce_chunk.start_nonce != expected_start {
             bail!(
                 "assignment batch is not contiguous at item {} (expected nonce {}, got {})",
@@ -389,51 +1097,15 @@ fn ensure_compatible_template(first: &Arc<WorkTemplate>, second: &Arc<WorkTempla
     Ok(())
 }
 
-fn spawn_event_forwarder(
-    sink: Arc<RwLock<Option<Sender<BackendEvent>>>>,
-    rx: Receiver<BackendEvent>,
-    backend_name: &'static str,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
-        while let Ok(event) = rx.recv() {
-            let translated = match event {
-                BackendEvent::Solution(solution) => BackendEvent::Solution(MiningSolution {
-                    backend: backend_name,
-                    ..solution
-                }),
-                BackendEvent::Error {
-                    backend_id,
-                    message,
-                    ..
-                } => BackendEvent::Error {
-                    backend_id,
-                    backend: backend_name,
-                    message,
-                },
-            };
-
-            let outbound = match sink.read() {
-                Ok(slot) => slot.clone(),
-                Err(_) => None,
-            };
-            let Some(outbound) = outbound else {
-                continue;
-            };
-            if outbound.send(translated).is_err() {
-                break;
-            }
-        }
-    })
-}
-
 fn query_nvidia_devices() -> Result<Vec<NvidiaDeviceInfo>> {
-    let output = Command::new("nvidia-smi")
+    let output = std::process::Command::new("nvidia-smi")
         .args([
             "--query-gpu=index,name,memory.total",
             "--format=csv,noheader,nounits",
         ])
         .output()
         .context("failed to execute nvidia-smi; ensure NVIDIA drivers are installed")?;
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if stderr.is_empty() {
@@ -450,6 +1122,7 @@ fn query_nvidia_devices() -> Result<Vec<NvidiaDeviceInfo>> {
     if devices.is_empty() {
         bail!("nvidia-smi reported no NVIDIA devices");
     }
+
     Ok(devices)
 }
 
@@ -495,6 +1168,7 @@ fn parse_nvidia_smi_query_output(raw: &str) -> Result<Vec<NvidiaDeviceInfo>> {
             memory_total_mib,
         });
     }
+
     Ok(devices)
 }
 
@@ -532,22 +1206,6 @@ mod tests {
         let err =
             parse_nvidia_smi_query_output("abc, RTX, 8192").expect_err("invalid index should fail");
         assert!(format!("{err:#}").contains("invalid GPU index"));
-    }
-
-    #[test]
-    fn recommend_worker_lanes_respects_memory_and_instances() {
-        assert_eq!(
-            recommend_worker_lanes(16, Some(4 * 1024 * 1024 * 1024), 1),
-            1
-        );
-        assert_eq!(
-            recommend_worker_lanes(16, Some(64 * 1024 * 1024 * 1024), 2),
-            8
-        );
-        assert_eq!(
-            recommend_worker_lanes(3, Some(64 * 1024 * 1024 * 1024), 1),
-            3
-        );
     }
 
     #[test]
@@ -600,5 +1258,18 @@ mod tests {
         let err =
             collapse_assignment_batch(&assignments).expect_err("non-contiguous chunks should fail");
         assert!(format!("{err:#}").contains("not contiguous"));
+    }
+
+    #[test]
+    fn blake2b_long_matches_expected_len_behavior() {
+        let mut short = [0u8; 32];
+        blake2b_long(&[b"seine"], &mut short).expect("short output should hash");
+
+        let mut long = [0u8; 96];
+        blake2b_long(&[b"seine"], &mut long).expect("long output should hash");
+
+        assert_ne!(short, [0u8; 32]);
+        assert_ne!(long, [0u8; 96]);
+        assert_ne!(&long[..32], &short);
     }
 }

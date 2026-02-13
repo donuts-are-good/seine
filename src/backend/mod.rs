@@ -456,6 +456,11 @@ pub trait PowBackend: Send + Sync {
 
     fn lanes(&self) -> usize;
 
+    /// Total device memory in bytes (e.g. GPU VRAM), if known.
+    fn device_memory_bytes(&self) -> Option<u64> {
+        None
+    }
+
     fn set_instance_id(&self, id: BackendInstanceId);
 
     fn set_event_sink(&self, sink: Sender<BackendEvent>);

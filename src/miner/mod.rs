@@ -188,7 +188,7 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
         (cpu_lanes as f64 * CPU_LANE_MEMORY_BYTES as f64) / (1024.0 * 1024.0 * 1024.0);
 
     let tui_state = if should_enable_tui(cfg) {
-        Some(build_tui_state(cfg, &backends, total_lanes, cpu_ram_gib))
+        Some(build_tui_state(cfg, &backends))
     } else {
         None
     };
@@ -409,24 +409,14 @@ fn should_enable_tui(cfg: &Config) -> bool {
     }
 }
 
-fn build_tui_state(
-    cfg: &Config,
-    backends: &[BackendSlot],
-    total_lanes: u64,
-    cpu_ram_gib: f64,
-) -> TuiState {
+fn build_tui_state(cfg: &Config, backends: &[BackendSlot]) -> TuiState {
     let tui_state = new_tui_state();
     if let Ok(mut s) = tui_state.lock() {
         s.api_url = cfg.api_url.clone();
         s.threads = cfg.threads;
         s.refresh_secs = cfg.refresh_interval.as_secs();
         s.sse_enabled = cfg.sse_enabled;
-        s.backends_desc = format!(
-            "{} ({} lanes, ~{:.1} GiB RAM)",
-            backend_names(backends),
-            total_lanes,
-            cpu_ram_gib
-        );
+        s.backends_desc = backend_descriptions(backends);
         s.accounting = if cfg.strict_round_accounting {
             "strict".to_string()
         } else {
@@ -1610,6 +1600,26 @@ fn backend_name_list(backends: &[BackendSlot]) -> Vec<String> {
 
 fn backend_names(backends: &[BackendSlot]) -> String {
     backend_name_list(backends).join(",")
+}
+
+fn backend_descriptions(backends: &[BackendSlot]) -> String {
+    backends
+        .iter()
+        .map(|slot| {
+            let name = format!("{}#{}", slot.backend.name(), slot.id);
+            if slot.backend.name() == "cpu" {
+                let ram_gib =
+                    (slot.lanes as f64 * CPU_LANE_MEMORY_BYTES as f64) / (1024.0 * 1024.0 * 1024.0);
+                format!("{} ({} lanes, ~{:.1} GiB RAM)", name, slot.lanes, ram_gib)
+            } else if let Some(mem_bytes) = slot.backend.device_memory_bytes() {
+                let mem_gib = mem_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                format!("{} ({} lanes, {:.1} GiB VRAM)", name, slot.lanes, mem_gib)
+            } else {
+                format!("{} ({} lanes)", name, slot.lanes)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn backend_preemption_profiles(backends: &[BackendSlot]) -> String {
