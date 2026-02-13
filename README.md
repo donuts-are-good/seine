@@ -4,7 +4,7 @@
 
 Current status:
 - CPU backend: implemented (Argon2id, consensus-compatible params).
-- NVIDIA backend: scaffolded interface only (not implemented yet).
+- NVIDIA backend: implemented runtime path with device probing (`nvidia-smi`) and backend integration (current hashing path is compatibility-focused and does not yet provide CUDA acceleration).
 - Runtime architecture: supports multiple backends in one process with persistent workers, configurable bounded backend event queues with lossless `Solution` delivery and deduplicated backend `Error` events (prevents multi-thread error storms from stalling worker teardown), coalesced tip notifications (deduped across SSE reconnects), template prefetch overlap to reduce round-boundary idle, and optional strict quiesce barriers for round-accurate hash accounting.
   - Backend assignment/control dispatch now runs through one shared per-backend task executor with panic capture and timeout quarantine to avoid duplicated control paths and extra thread churn.
   - Per-backend executors prioritize control commands (cancel/fence/stop) on a dedicated control lane, so queued assignment bursts do not delay control enqueue.
