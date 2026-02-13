@@ -128,6 +128,24 @@ struct SubmitRequest {
     solution: MiningSolution,
 }
 
+enum SubmitAttemptPayload {
+    Compact { template_id: String },
+    FullBlock { block: TemplateBlock },
+}
+
+impl SubmitAttemptPayload {
+    fn from_request(request: &SubmitRequest) -> Self {
+        match &request.template {
+            SubmitTemplate::Compact { template_id } => Self::Compact {
+                template_id: template_id.clone(),
+            },
+            SubmitTemplate::FullBlock { block } => Self::FullBlock {
+                block: (**block).clone(),
+            },
+        }
+    }
+}
+
 enum SubmitOutcome {
     Response(SubmitBlockResponse),
     Error(String),
@@ -263,12 +281,14 @@ fn process_submit_request(
     token_cookie_path: Option<&PathBuf>,
 ) -> SubmitResult {
     let max_attempts = SUBMIT_RETRY_MAX_ATTEMPTS.max(1);
+    let nonce = request.solution.nonce;
     let solution = request.solution.clone();
+    let mut payload = SubmitAttemptPayload::from_request(&request);
     let mut attempts = 0u32;
 
     loop {
         attempts = attempts.saturating_add(1);
-        match submit_request_once(client, &request) {
+        match submit_request_once(client, &mut payload, nonce) {
             Ok(resp) => {
                 return SubmitResult {
                     solution,
@@ -287,12 +307,14 @@ fn process_submit_request(
 
                 let unauthorized = is_unauthorized_error(&err);
                 let mut error_context = format!("{err:#}");
+                let mut retryable = is_retryable_api_error(&err);
                 if unauthorized {
                     match refresh_api_token_from_cookie(
                         client,
                         token_cookie_path.map(PathBuf::as_path),
                     ) {
                         TokenRefreshOutcome::Refreshed => {
+                            retryable = true;
                             if attempts < max_attempts {
                                 continue;
                             }
@@ -300,21 +322,23 @@ fn process_submit_request(
                                 "auth refreshed, but submit retry budget was exhausted".to_string();
                         }
                         TokenRefreshOutcome::Unchanged => {
+                            retryable = false;
                             error_context =
                                 format!("auth expired and cookie token was unchanged: {err:#}");
                         }
                         TokenRefreshOutcome::Unavailable => {
+                            retryable = false;
                             error_context = format!(
                                 "auth expired and no cookie refresh source is available: {err:#}"
                             );
                         }
                         TokenRefreshOutcome::Failed(msg) => {
+                            retryable = true;
                             error_context = format!("{msg}: {err:#}");
                         }
                     }
                 }
 
-                let retryable = is_retryable_api_error(&err) || unauthorized;
                 if retryable && attempts < max_attempts {
                     if !sleep_with_shutdown(shutdown, submit_retry_delay(attempts)) {
                         return SubmitResult {
@@ -338,16 +362,18 @@ fn process_submit_request(
     }
 }
 
-fn submit_request_once(client: &ApiClient, request: &SubmitRequest) -> Result<SubmitBlockResponse> {
-    let nonce = request.solution.nonce;
-    match &request.template {
-        SubmitTemplate::Compact { template_id } => {
-            client.submit_block(&(), Some(template_id), nonce)
+fn submit_request_once(
+    client: &ApiClient,
+    payload: &mut SubmitAttemptPayload,
+    nonce: u64,
+) -> Result<SubmitBlockResponse> {
+    match payload {
+        SubmitAttemptPayload::Compact { template_id } => {
+            client.submit_block(&(), Some(template_id.as_str()), nonce)
         }
-        SubmitTemplate::FullBlock { block } => {
-            let mut block = (**block).clone();
-            set_block_nonce(&mut block, nonce);
-            client.submit_block(&block, None, nonce)
+        SubmitAttemptPayload::FullBlock { block } => {
+            set_block_nonce(block, nonce);
+            client.submit_block(block, None, nonce)
         }
     }
 }
@@ -1830,6 +1856,7 @@ fn sleep_with_shutdown(shutdown: &AtomicBool, duration: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use crossbeam_channel::Sender;
+    use httpmock::prelude::*;
     use serde_json::json;
 
     use super::*;
@@ -1869,6 +1896,53 @@ mod tests {
         fn assign_work(&self, _work: WorkAssignment) -> Result<()> {
             Ok(())
         }
+    }
+
+    fn submit_test_client(server: &MockServer) -> ApiClient {
+        ApiClient::new(
+            server.url("").trim_end_matches('/').to_string(),
+            "test-token".to_string(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .expect("submit test client should be created")
+    }
+
+    #[test]
+    fn submit_unauthorized_without_refresh_source_fails_without_retry() {
+        let server = MockServer::start();
+        let submit_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/mining/submitblock");
+            then.status(401)
+                .header("content-type", "application/json")
+                .json_body(json!({"error": "unauthorized"}));
+        });
+
+        let client = submit_test_client(&server);
+        let request = SubmitRequest {
+            template: SubmitTemplate::Compact {
+                template_id: "tmpl-unauth".to_string(),
+            },
+            solution: MiningSolution {
+                epoch: 1,
+                nonce: 99,
+                backend_id: 1,
+                backend: "cpu",
+            },
+        };
+        let shutdown = AtomicBool::new(false);
+
+        let result = process_submit_request(&client, request, &shutdown, None);
+
+        assert_eq!(result.attempts, 1);
+        match result.outcome {
+            SubmitOutcome::Error(message) => {
+                assert!(message.contains("no cookie refresh source is available"));
+            }
+            SubmitOutcome::Response(_) => panic!("unauthorized submit should fail"),
+        }
+        submit_mock.assert_hits(1);
     }
 
     #[test]
