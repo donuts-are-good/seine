@@ -552,7 +552,7 @@ struct ExecuteRoundPhase<'a, 'cp> {
     difficulty: &'a str,
     header_base: &'a Arc<[u8]>,
     target: [u8; 32],
-    current_submit_template: &'a SubmitTemplate,
+    current_template: &'a BlockTemplateResponse,
     control_plane: &'a mut MiningControlPlane<'cp>,
     backends: &'a mut Vec<BackendSlot>,
     backend_events: &'a Receiver<BackendEvent>,
@@ -583,7 +583,7 @@ fn execute_round_phase(phase: ExecuteRoundPhase<'_, '_>) -> Result<()> {
         difficulty,
         header_base,
         target,
-        current_submit_template,
+        current_template,
         control_plane,
         backends,
         backend_events,
@@ -628,6 +628,7 @@ fn execute_round_phase(phase: ExecuteRoundPhase<'_, '_>) -> Result<()> {
     })?;
 
     let mut submitted_solution = None;
+    let mut current_submit_template: Option<SubmitTemplate> = None;
     let mut pending_solution = round_state.solved.take();
     let _ = drain_mining_backend_events(
         backend_events,
@@ -673,12 +674,10 @@ fn execute_round_phase(phase: ExecuteRoundPhase<'_, '_>) -> Result<()> {
                 ),
             );
         } else {
-            if control_plane.submit_template(
-                current_submit_template.clone(),
-                solution.clone(),
-                stats,
-                tui,
-            ) {
+            let submit_template = current_submit_template
+                .get_or_insert_with(|| SubmitTemplate::from_template(current_template))
+                .clone();
+            if control_plane.submit_template(submit_template, solution.clone(), stats, tui) {
                 inflight_solution_keys.insert(key);
                 enqueued_solution = Some(solution.clone());
             } else {
@@ -703,20 +702,24 @@ fn execute_round_phase(phase: ExecuteRoundPhase<'_, '_>) -> Result<()> {
         deferred_solution_keys,
         enqueued_solution.as_ref(),
     );
-    submit_deferred_solutions(
-        control_plane,
-        epoch,
-        current_submit_template,
-        DeferredSubmitState {
-            recent_templates,
-            deferred_solutions,
-            deferred_solution_keys,
-            submitted_solution_keys,
-            inflight_solution_keys,
-            stats,
-            tui,
-        },
-    );
+    if !deferred_solutions.is_empty() {
+        let submit_template = current_submit_template
+            .get_or_insert_with(|| SubmitTemplate::from_template(current_template));
+        submit_deferred_solutions(
+            control_plane,
+            epoch,
+            submit_template,
+            DeferredSubmitState {
+                recent_templates,
+                deferred_solutions,
+                deferred_solution_keys,
+                submitted_solution_keys,
+                inflight_solution_keys,
+                stats,
+                tui,
+            },
+        );
+    }
     process_submit_results(
         control_plane.drain_submit_results(stats, tui),
         deferred_solutions,
@@ -903,12 +906,12 @@ pub(super) fn run_mining_loop(
             height,
             difficulty,
         } = prepared_template;
-        let current_submit_template = SubmitTemplate::from_template(&template);
 
         epoch = epoch.wrapping_add(1).max(1);
         let work_id = next_work_id(&mut work_id_cursor);
         let reservation = nonce_scheduler.reserve(total_lanes(backends));
-        let stop_at = Instant::now() + cfg.refresh_interval;
+        let round_start = Instant::now();
+        let stop_at = round_start + cfg.refresh_interval;
 
         stats.bump_templates();
 
@@ -929,7 +932,6 @@ pub(super) fn run_mining_loop(
         )?;
         control_plane.spawn_prefetch_if_needed();
 
-        let round_start = Instant::now();
         execute_round_phase(ExecuteRoundPhase {
             cfg,
             shutdown: &shutdown,
@@ -942,7 +944,7 @@ pub(super) fn run_mining_loop(
             difficulty: &difficulty,
             header_base: &header_base,
             target,
-            current_submit_template: &current_submit_template,
+            current_template: &template,
             control_plane: &mut control_plane,
             backends,
             backend_events,
@@ -971,7 +973,7 @@ pub(super) fn run_mining_loop(
             &mut recent_templates,
             &mut recent_templates_bytes,
             epoch,
-            current_submit_template,
+            SubmitTemplate::from_template(&template),
             recent_template_retention,
             recent_template_cache_size,
             recent_template_cache_max_bytes,

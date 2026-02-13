@@ -2,6 +2,7 @@ use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::backend::MiningSolution;
+use serde_json::Value;
 
 use super::submit::SubmitTemplate;
 use super::ui::warn;
@@ -191,9 +192,52 @@ pub(super) fn remember_recent_template(
 fn submit_template_estimated_bytes(template: &SubmitTemplate) -> usize {
     match template {
         SubmitTemplate::Compact { template_id } => template_id.len().saturating_add(32),
-        SubmitTemplate::FullBlock { block } => serde_json::to_vec(block.as_ref())
-            .map(|encoded| encoded.len())
-            .unwrap_or(8 * 1024 * 1024),
+        SubmitTemplate::FullBlock { block } => estimate_template_block_bytes(block.as_ref()),
+    }
+}
+
+fn estimate_template_block_bytes(block: &crate::types::TemplateBlock) -> usize {
+    let mut bytes = 128usize;
+    bytes = bytes.saturating_add(
+        estimate_optional_u64(block.header.nonce)
+            .saturating_add(estimate_optional_u64(block.header.nonce_upper))
+            .saturating_add(estimate_optional_u64(block.header.height))
+            .saturating_add(estimate_optional_u64(block.header.height_upper))
+            .saturating_add(estimate_optional_u64(block.header.difficulty))
+            .saturating_add(estimate_optional_u64(block.header.difficulty_upper)),
+    );
+    bytes = bytes.saturating_add(estimate_json_map_bytes(&block.header.extra));
+    bytes.saturating_add(estimate_json_map_bytes(&block.extra))
+}
+
+fn estimate_optional_u64(value: Option<u64>) -> usize {
+    value.map_or(0, |v| v.to_string().len().saturating_add(8))
+}
+
+fn estimate_json_map_bytes(map: &serde_json::Map<String, Value>) -> usize {
+    let mut bytes = 2usize;
+    for (key, value) in map {
+        bytes = bytes
+            .saturating_add(key.len())
+            .saturating_add(3)
+            .saturating_add(estimate_json_value_bytes(value));
+    }
+    bytes
+}
+
+fn estimate_json_value_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Number(number) => number.to_string().len(),
+        Value::String(text) => text.len().saturating_add(2),
+        Value::Array(values) => values
+            .iter()
+            .fold(2usize, |acc, item| {
+                acc.saturating_add(estimate_json_value_bytes(item).saturating_add(1))
+            })
+            .saturating_sub(usize::from(!values.is_empty())),
+        Value::Object(map) => estimate_json_map_bytes(map),
     }
 }
 

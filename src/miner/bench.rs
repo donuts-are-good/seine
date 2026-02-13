@@ -132,6 +132,16 @@ struct BenchReport {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(default)]
+struct BenchBackendRuntimeFingerprint {
+    backend_id: BackendInstanceId,
+    backend: String,
+    assign_timeout_ms: u64,
+    assign_timeout_strikes: u32,
+    control_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
 struct BenchConfigFingerprint {
     backend_event_capacity: usize,
     hash_poll_ms: u64,
@@ -149,6 +159,7 @@ struct BenchConfigFingerprint {
     work_allocation: String,
     cpu_affinity: String,
     events_idle_timeout_secs: u64,
+    backend_runtime: Vec<BenchBackendRuntimeFingerprint>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -192,7 +203,7 @@ struct WorkerBenchmarkIdentity {
 }
 
 type BackendEventAction = RuntimeBackendEventAction;
-const BENCH_REPORT_SCHEMA_VERSION: u32 = 4;
+const BENCH_REPORT_SCHEMA_VERSION: u32 = 5;
 const BENCH_REPORT_COMPAT_MIN_SCHEMA_VERSION: u32 = 2;
 
 pub(super) fn run_benchmark(cfg: &Config, shutdown: &AtomicBool) -> Result<()> {
@@ -324,7 +335,7 @@ fn run_kernel_benchmark(
         BenchReport {
             schema_version: BENCH_REPORT_SCHEMA_VERSION,
             environment,
-            config_fingerprint: benchmark_config_fingerprint(cfg),
+            config_fingerprint: benchmark_config_fingerprint(cfg, None),
             pow_fingerprint: benchmark_pow_fingerprint(),
             bench_kind: "kernel".to_string(),
             backends: vec![backend.name().to_string()],
@@ -767,7 +778,7 @@ fn run_worker_benchmark_inner(
         BenchReport {
             schema_version: BENCH_REPORT_SCHEMA_VERSION,
             environment,
-            config_fingerprint: benchmark_config_fingerprint(cfg),
+            config_fingerprint: benchmark_config_fingerprint(cfg, Some(backends)),
             pow_fingerprint: benchmark_pow_fingerprint(),
             bench_kind: if restart_each_round {
                 "end_to_end".to_string()
@@ -1043,6 +1054,17 @@ fn baseline_compatibility_issues(
                 baseline.config_fingerprint.cpu_affinity, current.config_fingerprint.cpu_affinity
             ));
         }
+        if baseline.schema_version >= 5
+            && current.schema_version >= 5
+            && baseline.config_fingerprint.backend_runtime
+                != current.config_fingerprint.backend_runtime
+        {
+            issues.push(format!(
+                "backend_runtime mismatch baseline={} current={}",
+                format_backend_runtime_fingerprint(&baseline.config_fingerprint.backend_runtime),
+                format_backend_runtime_fingerprint(&current.config_fingerprint.backend_runtime)
+            ));
+        }
         if baseline.pow_fingerprint != current.pow_fingerprint {
             issues.push("pow parameter fingerprint mismatch".to_string());
         }
@@ -1141,6 +1163,23 @@ fn baseline_compatibility_issues(
     issues
 }
 
+fn format_backend_runtime_fingerprint(runtime: &[BenchBackendRuntimeFingerprint]) -> String {
+    runtime
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}#{}(assign={}ms,strikes={},control={}ms)",
+                entry.backend,
+                entry.backend_id,
+                entry.assign_timeout_ms,
+                entry.assign_timeout_strikes,
+                entry.control_timeout_ms
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn benchmark_header_base(round: u32) -> std::sync::Arc<[u8]> {
     let mut data = [0u8; POW_HEADER_BASE_LEN];
     for (i, byte) in data.iter_mut().enumerate() {
@@ -1192,7 +1231,25 @@ fn benchmark_environment() -> BenchEnvironment {
     }
 }
 
-fn benchmark_config_fingerprint(cfg: &Config) -> BenchConfigFingerprint {
+fn benchmark_config_fingerprint(
+    cfg: &Config,
+    backends: Option<&[BackendSlot]>,
+) -> BenchConfigFingerprint {
+    let backend_runtime = backends
+        .map(|slots| {
+            slots
+                .iter()
+                .map(|slot| BenchBackendRuntimeFingerprint {
+                    backend_id: slot.id,
+                    backend: slot.backend.name().to_string(),
+                    assign_timeout_ms: slot.runtime_policy.assignment_timeout.as_millis() as u64,
+                    assign_timeout_strikes: slot.runtime_policy.assignment_timeout_strikes,
+                    control_timeout_ms: slot.runtime_policy.control_timeout.as_millis() as u64,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
     BenchConfigFingerprint {
         backend_event_capacity: cfg.backend_event_capacity,
         hash_poll_ms: cfg.hash_poll_interval.as_millis() as u64,
@@ -1210,6 +1267,7 @@ fn benchmark_config_fingerprint(cfg: &Config) -> BenchConfigFingerprint {
         work_allocation: work_allocation_label(cfg.work_allocation).to_string(),
         cpu_affinity: cpu_affinity_label(cfg.cpu_affinity).to_string(),
         events_idle_timeout_secs: cfg.events_idle_timeout.as_secs(),
+        backend_runtime,
     }
 }
 
@@ -1548,6 +1606,13 @@ mod tests {
                 work_allocation: "adaptive".to_string(),
                 cpu_affinity: "auto".to_string(),
                 events_idle_timeout_secs: 90,
+                backend_runtime: vec![BenchBackendRuntimeFingerprint {
+                    backend_id: 1,
+                    backend: "cpu".to_string(),
+                    assign_timeout_ms: 1000,
+                    assign_timeout_strikes: 1,
+                    control_timeout_ms: 60_000,
+                }],
             },
             pow_fingerprint: BenchPowFingerprint {
                 memory_kb: POW_MEMORY_KB,
@@ -1696,6 +1761,19 @@ mod tests {
         assert!(issues
             .iter()
             .any(|issue| issue.contains("bench_warmup_rounds mismatch")));
+    }
+
+    #[test]
+    fn baseline_compatibility_detects_backend_runtime_profile_mismatch() {
+        let current = sample_report();
+        let mut baseline = sample_report();
+        baseline.config_fingerprint.backend_runtime[0].assign_timeout_ms = 500;
+
+        let issues =
+            baseline_compatibility_issues(&current, &baseline, BenchBaselinePolicy::Strict);
+        assert!(issues
+            .iter()
+            .any(|issue| issue.contains("backend_runtime mismatch")));
     }
 
     #[test]

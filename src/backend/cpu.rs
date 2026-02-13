@@ -483,7 +483,7 @@ impl PowBackend for CpuBackend {
     }
 
     fn preemption_granularity(&self) -> PreemptionGranularity {
-        PreemptionGranularity::Hashes(1)
+        PreemptionGranularity::Hashes(CONTROL_CHECK_INTERVAL_HASHES.max(1))
     }
 
     fn capabilities(&self) -> BackendCapabilities {
