@@ -145,6 +145,10 @@ struct BenchBackendRuntimeFingerprint {
 struct BenchConfigFingerprint {
     backend_event_capacity: usize,
     hash_poll_ms: u64,
+    cpu_hash_batch_size: u64,
+    cpu_control_check_interval_hashes: u64,
+    cpu_hash_flush_ms: u64,
+    cpu_event_dispatch_capacity: usize,
     backend_assign_timeout_ms: u64,
     backend_assign_timeout_strikes: u32,
     backend_control_timeout_ms: u64,
@@ -203,7 +207,7 @@ struct WorkerBenchmarkIdentity {
 }
 
 type BackendEventAction = RuntimeBackendEventAction;
-const BENCH_REPORT_SCHEMA_VERSION: u32 = 5;
+const BENCH_REPORT_SCHEMA_VERSION: u32 = 6;
 const BENCH_REPORT_COMPAT_MIN_SCHEMA_VERSION: u32 = 2;
 
 pub(super) fn run_benchmark(cfg: &Config, shutdown: &AtomicBool) -> Result<()> {
@@ -965,6 +969,48 @@ fn baseline_compatibility_issues(
                 baseline.config_fingerprint.hash_poll_ms, current.config_fingerprint.hash_poll_ms
             ));
         }
+        if baseline.schema_version >= 6 && current.schema_version >= 6 {
+            if baseline.config_fingerprint.cpu_hash_batch_size
+                != current.config_fingerprint.cpu_hash_batch_size
+            {
+                issues.push(format!(
+                    "cpu_hash_batch_size mismatch baseline={} current={}",
+                    baseline.config_fingerprint.cpu_hash_batch_size,
+                    current.config_fingerprint.cpu_hash_batch_size
+                ));
+            }
+            if baseline
+                .config_fingerprint
+                .cpu_control_check_interval_hashes
+                != current.config_fingerprint.cpu_control_check_interval_hashes
+            {
+                issues.push(format!(
+                    "cpu_control_check_interval_hashes mismatch baseline={} current={}",
+                    baseline
+                        .config_fingerprint
+                        .cpu_control_check_interval_hashes,
+                    current.config_fingerprint.cpu_control_check_interval_hashes
+                ));
+            }
+            if baseline.config_fingerprint.cpu_hash_flush_ms
+                != current.config_fingerprint.cpu_hash_flush_ms
+            {
+                issues.push(format!(
+                    "cpu_hash_flush_ms mismatch baseline={} current={}",
+                    baseline.config_fingerprint.cpu_hash_flush_ms,
+                    current.config_fingerprint.cpu_hash_flush_ms
+                ));
+            }
+            if baseline.config_fingerprint.cpu_event_dispatch_capacity
+                != current.config_fingerprint.cpu_event_dispatch_capacity
+            {
+                issues.push(format!(
+                    "cpu_event_dispatch_capacity mismatch baseline={} current={}",
+                    baseline.config_fingerprint.cpu_event_dispatch_capacity,
+                    current.config_fingerprint.cpu_event_dispatch_capacity
+                ));
+            }
+        }
         if baseline.config_fingerprint.backend_assign_timeout_ms
             != current.config_fingerprint.backend_assign_timeout_ms
         {
@@ -1253,6 +1299,10 @@ fn benchmark_config_fingerprint(
     BenchConfigFingerprint {
         backend_event_capacity: cfg.backend_event_capacity,
         hash_poll_ms: cfg.hash_poll_interval.as_millis() as u64,
+        cpu_hash_batch_size: cfg.cpu_hash_batch_size,
+        cpu_control_check_interval_hashes: cfg.cpu_control_check_interval_hashes,
+        cpu_hash_flush_ms: cfg.cpu_hash_flush_interval.as_millis() as u64,
+        cpu_event_dispatch_capacity: cfg.cpu_event_dispatch_capacity,
         backend_assign_timeout_ms: cfg.backend_assign_timeout.as_millis() as u64,
         backend_assign_timeout_strikes: cfg.backend_assign_timeout_strikes,
         backend_control_timeout_ms: cfg.backend_control_timeout.as_millis() as u64,
@@ -1592,6 +1642,10 @@ mod tests {
             config_fingerprint: BenchConfigFingerprint {
                 backend_event_capacity: 1024,
                 hash_poll_ms: 200,
+                cpu_hash_batch_size: 64,
+                cpu_control_check_interval_hashes: 256,
+                cpu_hash_flush_ms: 50,
+                cpu_event_dispatch_capacity: 256,
                 backend_assign_timeout_ms: 1000,
                 backend_assign_timeout_strikes: 1,
                 backend_control_timeout_ms: 60_000,
@@ -1774,6 +1828,19 @@ mod tests {
         assert!(issues
             .iter()
             .any(|issue| issue.contains("backend_runtime mismatch")));
+    }
+
+    #[test]
+    fn baseline_compatibility_detects_cpu_tuning_mismatch_for_schema_v6() {
+        let current = sample_report();
+        let mut baseline = sample_report();
+        baseline.config_fingerprint.cpu_hash_batch_size = 32;
+
+        let issues =
+            baseline_compatibility_issues(&current, &baseline, BenchBaselinePolicy::Strict);
+        assert!(issues
+            .iter()
+            .any(|issue| issue.contains("cpu_hash_batch_size mismatch")));
     }
 
     #[test]

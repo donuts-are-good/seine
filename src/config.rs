@@ -153,6 +153,22 @@ struct Cli {
     #[arg(long, default_value_t = 200)]
     hash_poll_ms: u64,
 
+    /// CPU worker hash flush batch size.
+    #[arg(long, default_value_t = 64)]
+    cpu_hash_batch_size: u64,
+
+    /// CPU worker control check cadence in hashes.
+    #[arg(long, default_value_t = 256)]
+    cpu_control_check_interval_hashes: u64,
+
+    /// CPU worker hash flush interval in milliseconds.
+    #[arg(long, default_value_t = 50)]
+    cpu_hash_flush_ms: u64,
+
+    /// CPU backend internal event dispatch queue capacity.
+    #[arg(long, default_value_t = 256)]
+    cpu_event_dispatch_capacity: usize,
+
     /// Maximum time to wait for one backend assignment dispatch call, in milliseconds.
     #[arg(long, default_value_t = 1000)]
     backend_assign_timeout_ms: u64,
@@ -299,6 +315,10 @@ pub struct Config {
     pub stats_interval: Duration,
     pub backend_event_capacity: usize,
     pub hash_poll_interval: Duration,
+    pub cpu_hash_batch_size: u64,
+    pub cpu_control_check_interval_hashes: u64,
+    pub cpu_hash_flush_interval: Duration,
+    pub cpu_event_dispatch_capacity: usize,
     pub backend_assign_timeout: Duration,
     pub backend_assign_timeout_strikes: u32,
     pub backend_control_timeout: Duration,
@@ -339,6 +359,18 @@ impl Config {
         }
         if cli.hash_poll_ms == 0 {
             bail!("hash-poll-ms must be >= 1");
+        }
+        if cli.cpu_hash_batch_size == 0 {
+            bail!("cpu-hash-batch-size must be >= 1");
+        }
+        if cli.cpu_control_check_interval_hashes == 0 {
+            bail!("cpu-control-check-interval-hashes must be >= 1");
+        }
+        if cli.cpu_hash_flush_ms == 0 {
+            bail!("cpu-hash-flush-ms must be >= 1");
+        }
+        if cli.cpu_event_dispatch_capacity == 0 {
+            bail!("cpu-event-dispatch-capacity must be >= 1");
         }
         if cli.backend_assign_timeout_ms == 0 {
             bail!("backend-assign-timeout-ms must be >= 1");
@@ -428,6 +460,10 @@ impl Config {
             stats_interval: Duration::from_secs(cli.stats_secs.max(1)),
             backend_event_capacity: cli.backend_event_capacity,
             hash_poll_interval: Duration::from_millis(cli.hash_poll_ms),
+            cpu_hash_batch_size: cli.cpu_hash_batch_size,
+            cpu_control_check_interval_hashes: cli.cpu_control_check_interval_hashes,
+            cpu_hash_flush_interval: Duration::from_millis(cli.cpu_hash_flush_ms),
+            cpu_event_dispatch_capacity: cli.cpu_event_dispatch_capacity,
             backend_assign_timeout: Duration::from_millis(cli.backend_assign_timeout_ms),
             backend_assign_timeout_strikes: cli.backend_assign_timeout_strikes.max(1),
             backend_control_timeout: Duration::from_millis(cli.backend_control_timeout_ms),
@@ -810,6 +846,10 @@ mod tests {
             stats_secs: 10,
             backend_event_capacity: 1024,
             hash_poll_ms: 200,
+            cpu_hash_batch_size: 64,
+            cpu_control_check_interval_hashes: 256,
+            cpu_hash_flush_ms: 50,
+            cpu_event_dispatch_capacity: 256,
             backend_assign_timeout_ms: 1000,
             backend_assign_timeout_ms_per_instance: Vec::new(),
             backend_assign_timeout_strikes: 3,

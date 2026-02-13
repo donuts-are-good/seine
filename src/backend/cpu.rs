@@ -20,20 +20,49 @@ mod events;
 #[path = "cpu/kernel.rs"]
 mod kernel;
 
-const HASH_BATCH_SIZE: u64 = 64;
-const CONTROL_CHECK_INTERVAL_HASHES: u64 = 256;
-const HASH_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+const DEFAULT_HASH_BATCH_SIZE: u64 = 64;
+const DEFAULT_CONTROL_CHECK_INTERVAL_HASHES: u64 = 256;
+const DEFAULT_HASH_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 const NONBLOCKING_POLL_MIN: Duration = Duration::from_micros(50);
 const NONBLOCKING_POLL_MAX: Duration = Duration::from_millis(1);
 const CRITICAL_EVENT_RETRY_WAIT: Duration = Duration::from_millis(5);
 const CRITICAL_EVENT_RETRY_MAX_WAIT: Duration = Duration::from_millis(100);
-const ERROR_EVENT_MAX_BLOCK: Duration = Duration::from_millis(500);
 const SOLVED_MASK: u64 = 1u64 << 63;
 const STARTUP_READY_WAIT_SLICE: Duration = Duration::from_millis(50);
 const STARTUP_READY_TIMEOUT_BASE: Duration = Duration::from_secs(15);
 const STARTUP_READY_TIMEOUT_PER_WORKER: Duration = Duration::from_secs(1);
 const STARTUP_READY_TIMEOUT_MAX: Duration = Duration::from_secs(180);
-const EVENT_DISPATCH_CAPACITY: usize = 256;
+const DEFAULT_EVENT_DISPATCH_CAPACITY: usize = 256;
+
+#[derive(Debug, Clone, Copy)]
+pub struct CpuBackendTuning {
+    pub hash_batch_size: u64,
+    pub control_check_interval_hashes: u64,
+    pub hash_flush_interval: Duration,
+    pub event_dispatch_capacity: usize,
+}
+
+impl Default for CpuBackendTuning {
+    fn default() -> Self {
+        Self {
+            hash_batch_size: DEFAULT_HASH_BATCH_SIZE,
+            control_check_interval_hashes: DEFAULT_CONTROL_CHECK_INTERVAL_HASHES,
+            hash_flush_interval: DEFAULT_HASH_FLUSH_INTERVAL,
+            event_dispatch_capacity: DEFAULT_EVENT_DISPATCH_CAPACITY,
+        }
+    }
+}
+
+impl CpuBackendTuning {
+    fn normalized(self) -> Self {
+        Self {
+            hash_batch_size: self.hash_batch_size.max(1),
+            control_check_interval_hashes: self.control_check_interval_hashes.max(1),
+            hash_flush_interval: self.hash_flush_interval.max(Duration::from_millis(1)),
+            event_dispatch_capacity: self.event_dispatch_capacity.max(1),
+        }
+    }
+}
 
 #[repr(align(64))]
 struct PaddedAtomicU64(AtomicU64);
@@ -88,6 +117,10 @@ struct Shared {
     dropped_events: AtomicU64,
     event_dispatch_tx: RwLock<Option<Sender<BackendEvent>>>,
     event_sink: RwLock<Option<Sender<BackendEvent>>>,
+    hash_batch_size: u64,
+    control_check_interval_hashes: u64,
+    hash_flush_interval: Duration,
+    event_dispatch_capacity: usize,
 }
 
 pub struct CpuBackend {
@@ -100,6 +133,15 @@ pub struct CpuBackend {
 
 impl CpuBackend {
     pub fn new(threads: usize, affinity_mode: CpuAffinityMode) -> Self {
+        Self::with_tuning(threads, affinity_mode, CpuBackendTuning::default())
+    }
+
+    pub fn with_tuning(
+        threads: usize,
+        affinity_mode: CpuAffinityMode,
+        tuning: CpuBackendTuning,
+    ) -> Self {
+        let tuning = tuning.normalized();
         let lanes = threads.max(1);
         Self {
             threads,
@@ -134,6 +176,10 @@ impl CpuBackend {
                 dropped_events: AtomicU64::new(0),
                 event_dispatch_tx: RwLock::new(None),
                 event_sink: RwLock::new(None),
+                hash_batch_size: tuning.hash_batch_size,
+                control_check_interval_hashes: tuning.control_check_interval_hashes,
+                hash_flush_interval: tuning.hash_flush_interval,
+                event_dispatch_capacity: tuning.event_dispatch_capacity,
             }),
             worker_handles: Mutex::new(Vec::new()),
             event_forward_handle: Mutex::new(None),
@@ -174,7 +220,8 @@ impl CpuBackend {
     fn start_event_forwarder(&self) -> Result<()> {
         let instance_id = self.shared.instance_id.load(Ordering::Acquire);
         // Bound internal event buffering so sink stalls cannot grow memory without limit.
-        let (dispatch_tx, dispatch_rx) = bounded::<BackendEvent>(EVENT_DISPATCH_CAPACITY);
+        let (dispatch_tx, dispatch_rx) =
+            bounded::<BackendEvent>(self.shared.event_dispatch_capacity.max(1));
         if let Ok(mut slot) = self.shared.event_dispatch_tx.write() {
             *slot = Some(dispatch_tx);
         } else {
@@ -483,14 +530,14 @@ impl PowBackend for CpuBackend {
     }
 
     fn preemption_granularity(&self) -> PreemptionGranularity {
-        PreemptionGranularity::Hashes(CONTROL_CHECK_INTERVAL_HASHES.max(1))
+        PreemptionGranularity::Hashes(self.shared.control_check_interval_hashes.max(1))
     }
 
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             preferred_iters_per_lane: None,
             preferred_allocation_iters_per_lane: None,
-            preferred_hash_poll_interval: Some(HASH_FLUSH_INTERVAL),
+            preferred_hash_poll_interval: Some(self.shared.hash_flush_interval),
             preferred_assignment_timeout: None,
             preferred_control_timeout: None,
             preferred_assignment_timeout_strikes: None,
@@ -865,8 +912,13 @@ fn flush_hashes(shared: &Shared, thread_idx: usize, pending_hashes: &mut u64) {
     *pending_hashes = 0;
 }
 
-fn should_flush_hashes(pending_hashes: u64, now: Instant, next_flush_at: Instant) -> bool {
-    pending_hashes >= HASH_BATCH_SIZE || now >= next_flush_at
+fn should_flush_hashes(
+    pending_hashes: u64,
+    now: Instant,
+    next_flush_at: Instant,
+    hash_batch_size: u64,
+) -> bool {
+    pending_hashes >= hash_batch_size.max(1) || now >= next_flush_at
 }
 
 fn emit_error(shared: &Shared, message: String) {
@@ -885,7 +937,7 @@ fn forward_event(shared: &Shared, event: BackendEvent) {
 mod tests {
     use super::{
         emit_error, forward_event, lane_quota_for_chunk, should_flush_hashes, start_assignment,
-        BackendEvent, CpuBackend, ERROR_EVENT_MAX_BLOCK, HASH_BATCH_SIZE,
+        BackendEvent, CpuBackend, DEFAULT_HASH_BATCH_SIZE,
     };
     use crate::backend::{MiningSolution, PowBackend};
     use crate::config::CpuAffinityMode;
@@ -913,12 +965,18 @@ mod tests {
     fn hash_flush_triggers_on_time_or_batch_threshold() {
         let now = Instant::now();
         assert!(should_flush_hashes(
-            HASH_BATCH_SIZE,
+            DEFAULT_HASH_BATCH_SIZE,
             now,
-            now + Duration::from_secs(1)
+            now + Duration::from_secs(1),
+            DEFAULT_HASH_BATCH_SIZE,
         ));
-        assert!(should_flush_hashes(1, now, now));
-        assert!(!should_flush_hashes(1, now, now + Duration::from_secs(1)));
+        assert!(should_flush_hashes(1, now, now, DEFAULT_HASH_BATCH_SIZE,));
+        assert!(!should_flush_hashes(
+            1,
+            now,
+            now + Duration::from_secs(1),
+            DEFAULT_HASH_BATCH_SIZE,
+        ));
     }
 
     #[test]
@@ -1022,8 +1080,16 @@ mod tests {
 
         emit_thread
             .join()
-            .expect("error emitter thread should complete under backpressure");
-        let deadline = Instant::now() + ERROR_EVENT_MAX_BLOCK + Duration::from_millis(250);
+            .expect("error emitter thread should complete after enqueueing");
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            backend.shared.dropped_events.load(Ordering::Acquire),
+            0,
+            "error event should remain lossless while backend stays started"
+        );
+
+        backend.shared.started.store(false, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_millis(250);
         while backend.shared.dropped_events.load(Ordering::Acquire) == 0
             && Instant::now() < deadline
         {
@@ -1031,7 +1097,7 @@ mod tests {
         }
         assert!(
             backend.shared.dropped_events.load(Ordering::Acquire) >= 1,
-            "error event should eventually drop under sustained queue backpressure"
+            "error event should be dropped only after backend shutdown interrupts delivery"
         );
 
         if let Ok(mut slot) = backend.shared.event_dispatch_tx.write() {

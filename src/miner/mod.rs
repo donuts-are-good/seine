@@ -27,10 +27,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use blocknet_pow_spec::CPU_LANE_MEMORY_BYTES;
-use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
+use crossbeam_channel::{bounded, Receiver, Sender};
 
 use crate::api::ApiClient;
-use crate::backend::cpu::CpuBackend;
+use crate::backend::cpu::{CpuBackend, CpuBackendTuning};
 use crate::backend::nvidia::NvidiaBackend;
 use crate::backend::{
     normalize_backend_capabilities, BackendCapabilities, BackendEvent, BackendExecutionModel,
@@ -45,7 +45,6 @@ use ui::{info, warn};
 
 const TEMPLATE_RETRY_DELAY: Duration = Duration::from_secs(2);
 const MIN_EVENT_WAIT: Duration = Duration::from_millis(1);
-const BACKEND_EVENT_FAN_IN_IDLE_WAIT: Duration = Duration::from_millis(1);
 const BACKEND_EVENT_SOURCE_CAPACITY_MAX: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
@@ -215,6 +214,16 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
             effective_hash_poll_interval(&backends, cfg.hash_poll_interval).as_millis(),
         ),
     );
+    info(
+        "MINER",
+        format!(
+            "cpu-tuning | hash_batch={} control_check={} hash_flush={}ms event_q={}",
+            cfg.cpu_hash_batch_size,
+            cfg.cpu_control_check_interval_hashes,
+            cfg.cpu_hash_flush_interval.as_millis(),
+            cfg.cpu_event_dispatch_capacity,
+        ),
+    );
     let sub_round_rebalance = cfg
         .sub_round_rebalance_interval
         .map(|interval| format!("{}ms", interval.as_millis()))
@@ -374,9 +383,15 @@ fn build_backend_instances(cfg: &Config) -> Vec<(BackendSpec, Arc<dyn PowBackend
         .copied()
         .map(|backend_spec| {
             let backend = match backend_spec.kind {
-                BackendKind::Cpu => Arc::new(CpuBackend::new(
+                BackendKind::Cpu => Arc::new(CpuBackend::with_tuning(
                     backend_spec.cpu_threads.unwrap_or(cfg.threads),
                     backend_spec.cpu_affinity.unwrap_or(cfg.cpu_affinity),
+                    CpuBackendTuning {
+                        hash_batch_size: cfg.cpu_hash_batch_size,
+                        control_check_interval_hashes: cfg.cpu_control_check_interval_hashes,
+                        hash_flush_interval: cfg.cpu_hash_flush_interval,
+                        event_dispatch_capacity: cfg.cpu_event_dispatch_capacity,
+                    },
                 )) as Arc<dyn PowBackend>,
                 BackendKind::Nvidia => {
                     Arc::new(NvidiaBackend::new(backend_spec.device_index)) as Arc<dyn PowBackend>
@@ -490,38 +505,23 @@ fn spawn_backend_event_fan_in(
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
-            let mut receivers = sources.into_iter().map(Some).collect::<Vec<_>>();
-            let mut cursor = 0usize;
-            loop {
-                if receivers.iter().all(Option::is_none) {
-                    break;
+            let mut receivers = sources;
+            while !receivers.is_empty() {
+                let mut select = crossbeam_channel::Select::new();
+                for receiver in &receivers {
+                    select.recv(receiver);
                 }
-
-                let mut forwarded = false;
-                let total = receivers.len();
-                for _ in 0..total {
-                    let idx = cursor % total;
-                    cursor = cursor.wrapping_add(1);
-                    let Some(receiver) = receivers[idx].as_ref() else {
-                        continue;
-                    };
-                    match receiver.try_recv() {
-                        Ok(event) => {
-                            if sink.send(event).is_err() {
-                                return;
-                            }
-                            forwarded = true;
-                            break;
-                        }
-                        Err(TryRecvError::Empty) => {}
-                        Err(TryRecvError::Disconnected) => {
-                            receivers[idx] = None;
+                let operation = select.select();
+                let idx = operation.index();
+                match operation.recv(&receivers[idx]) {
+                    Ok(event) => {
+                        if sink.send(event).is_err() {
+                            return;
                         }
                     }
-                }
-
-                if !forwarded {
-                    std::thread::sleep(BACKEND_EVENT_FAN_IN_IDLE_WAIT);
+                    Err(_) => {
+                        receivers.swap_remove(idx);
+                    }
                 }
             }
         })
@@ -1550,6 +1550,10 @@ mod tests {
             stats_interval: Duration::from_secs(10),
             backend_event_capacity: 1024,
             hash_poll_interval: Duration::from_millis(200),
+            cpu_hash_batch_size: 64,
+            cpu_control_check_interval_hashes: 256,
+            cpu_hash_flush_interval: Duration::from_millis(50),
+            cpu_event_dispatch_capacity: 256,
             backend_assign_timeout: Duration::from_millis(1_000),
             backend_assign_timeout_strikes: 3,
             backend_control_timeout: Duration::from_millis(60_000),

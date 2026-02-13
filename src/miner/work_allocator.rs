@@ -16,6 +16,7 @@ use super::{backend_capabilities, backend_names, total_lanes, BackendSlot, Distr
 
 const ADAPTIVE_WEIGHT_FLOOR_PER_LANE_FRAC: f64 = 0.01;
 const ADAPTIVE_NEW_BACKEND_BOOST_PER_LANE_FRAC: f64 = 0.10;
+const NON_QUARANTINED_ASSIGNMENT_RETRY_LIMIT: u32 = 3;
 
 enum DispatchAssignments {
     Single(WorkAssignment),
@@ -38,6 +39,7 @@ struct DispatchFailure {
     backend: &'static str,
     reason: String,
     quarantined: bool,
+    remaining_strikes_before_quarantine: Option<u32>,
 }
 
 pub(super) fn distribute_work(
@@ -48,7 +50,7 @@ pub(super) fn distribute_work(
     let mut attempt_start_nonce = options.reservation.start_nonce;
     let mut additional_span_consumed = 0u64;
     let mut remaining_reserved_span = options.reservation.reserved_span;
-    let mut non_quarantined_retry_used = false;
+    let mut non_quarantined_retry_attempts = 0u32;
     loop {
         if backends.is_empty() {
             bail!("all mining backends are unavailable");
@@ -124,6 +126,14 @@ pub(super) fn distribute_work(
         }
 
         let has_non_quarantined_failures = failures.iter().any(|failure| !failure.quarantined);
+        let non_quarantine_retry_budget = failures
+            .iter()
+            .filter(|failure| !failure.quarantined)
+            .filter_map(|failure| failure.remaining_strikes_before_quarantine)
+            .min()
+            .map(|remaining| remaining.saturating_sub(1))
+            .unwrap_or(0)
+            .min(NON_QUARANTINED_ASSIGNMENT_RETRY_LIMIT);
         for failure in failures {
             warn(
                 "BACKEND",
@@ -156,20 +166,29 @@ pub(super) fn distribute_work(
         }
 
         if has_non_quarantined_failures {
-            if non_quarantined_retry_used || std::time::Instant::now() >= options.stop_at {
+            if non_quarantined_retry_attempts >= NON_QUARANTINED_ASSIGNMENT_RETRY_LIMIT
+                || non_quarantined_retry_attempts >= non_quarantine_retry_budget
+                || std::time::Instant::now() >= options.stop_at
+            {
                 warn(
                     "BACKEND",
-                    "assignment timeout without quarantine; deferring redistribution to next round",
+                    format!(
+                        "assignment timeout without quarantine; exhausted in-round retry budget ({}/{}); deferring redistribution to next round",
+                        non_quarantine_retry_budget,
+                        NON_QUARANTINED_ASSIGNMENT_RETRY_LIMIT
+                    ),
                 );
                 return Ok(additional_span_consumed);
             }
 
-            non_quarantined_retry_used = true;
+            non_quarantined_retry_attempts = non_quarantined_retry_attempts.saturating_add(1);
             attempt_start_nonce = attempt_start_nonce.wrapping_add(attempt_consumed_span);
             warn(
                 "BACKEND",
                 format!(
-                    "assignment timeout without quarantine; redistributing immediately with remaining={} start_nonce={} consumed_span={} attempted_span={}",
+                    "assignment timeout without quarantine; redistributing immediately (retry {}/{}) with remaining={} start_nonce={} consumed_span={} attempted_span={}",
+                    non_quarantined_retry_attempts,
+                    NON_QUARANTINED_ASSIGNMENT_RETRY_LIMIT,
                     backend_names(backends),
                     attempt_start_nonce,
                     attempt_consumed_span,
@@ -280,6 +299,7 @@ fn dispatch_assignment_tasks(
                     backend,
                     reason: format!("{err:#}"),
                     quarantined: true,
+                    remaining_strikes_before_quarantine: None,
                 });
             }
             Some(BackendTaskDispatchResult::TimedOut(BackendTaskTimeoutKind::Execution)) | None => {
@@ -314,6 +334,7 @@ fn dispatch_assignment_tasks(
                         backend,
                         reason,
                         quarantined: true,
+                        remaining_strikes_before_quarantine: None,
                     });
                 } else {
                     failures.push(DispatchFailure {
@@ -326,6 +347,11 @@ fn dispatch_assignment_tasks(
                             timeout_decision.threshold,
                         ),
                         quarantined: false,
+                        remaining_strikes_before_quarantine: Some(
+                            timeout_decision
+                                .threshold
+                                .saturating_sub(timeout_decision.strikes),
+                        ),
                     });
                     survivors.push((idx, slot));
                 }
@@ -361,6 +387,7 @@ fn dispatch_assignment_tasks(
                         backend,
                         reason,
                         quarantined: true,
+                        remaining_strikes_before_quarantine: None,
                     });
                 } else {
                     failures.push(DispatchFailure {
@@ -373,6 +400,11 @@ fn dispatch_assignment_tasks(
                             timeout_decision.threshold,
                         ),
                         quarantined: false,
+                        remaining_strikes_before_quarantine: Some(
+                            timeout_decision
+                                .threshold
+                                .saturating_sub(timeout_decision.strikes),
+                        ),
                     });
                     survivors.push((idx, slot));
                 }

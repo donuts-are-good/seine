@@ -11,8 +11,7 @@ use crate::types::hash_meets_target;
 use super::{
     emit_error, emit_event, flush_hashes, lane_quota_for_chunk, mark_startup_failed,
     mark_worker_active, mark_worker_inactive, mark_worker_ready, pow_params, request_shutdown,
-    should_flush_hashes, wait_for_work_update, Shared, CONTROL_CHECK_INTERVAL_HASHES,
-    HASH_FLUSH_INTERVAL, SOLVED_MASK,
+    should_flush_hashes, wait_for_work_update, Shared, SOLVED_MASK,
 };
 
 pub(super) fn cpu_worker_loop(
@@ -49,7 +48,7 @@ pub(super) fn cpu_worker_loop(
     let lane_stride = shared.hash_slots.len().max(1) as u64;
     let mut lane_quota = 0u64;
     let mut pending_hashes = 0u64;
-    let mut next_flush_at = Instant::now() + HASH_FLUSH_INTERVAL;
+    let mut next_flush_at = Instant::now() + shared.hash_flush_interval;
     let mut control_hashes_remaining = 0u64;
 
     loop {
@@ -68,7 +67,7 @@ pub(super) fn cpu_worker_loop(
                         thread_idx as u64,
                         lane_stride,
                     );
-                    next_flush_at = Instant::now() + HASH_FLUSH_INTERVAL;
+                    next_flush_at = Instant::now() + shared.hash_flush_interval;
                     control_hashes_remaining = 0;
                     local_generation = generation;
                     local_work = Some(work);
@@ -120,7 +119,7 @@ pub(super) fn cpu_worker_loop(
 
             control_hashes_remaining = lane_quota
                 .saturating_sub(lane_iters)
-                .clamp(1, CONTROL_CHECK_INTERVAL_HASHES);
+                .clamp(1, shared.control_check_interval_hashes.max(1));
         }
 
         let nonce_bytes = nonce.to_le_bytes();
@@ -146,10 +145,11 @@ pub(super) fn cpu_worker_loop(
         pending_hashes = pending_hashes.saturating_add(1);
 
         let now = Instant::now();
-        let should_flush = should_flush_hashes(pending_hashes, now, next_flush_at);
+        let should_flush =
+            should_flush_hashes(pending_hashes, now, next_flush_at, shared.hash_batch_size);
         if should_flush {
             flush_hashes(&shared, thread_idx, &mut pending_hashes);
-            next_flush_at = now + HASH_FLUSH_INTERVAL;
+            next_flush_at = now + shared.hash_flush_interval;
         }
 
         if hash_meets_target(&output, &template.target) {

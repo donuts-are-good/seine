@@ -1,13 +1,10 @@
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use crossbeam_channel::{SendTimeoutError, Sender};
 
 use crate::backend::BackendEvent;
 
-use super::{
-    Shared, CRITICAL_EVENT_RETRY_MAX_WAIT, CRITICAL_EVENT_RETRY_WAIT, ERROR_EVENT_MAX_BLOCK,
-};
+use super::{Shared, CRITICAL_EVENT_RETRY_MAX_WAIT, CRITICAL_EVENT_RETRY_WAIT};
 
 pub(super) fn emit_error(shared: &Shared, message: String) {
     if shared.error_emitted.swap(true, Ordering::AcqRel) {
@@ -36,7 +33,7 @@ pub(super) fn emit_event(shared: &Shared, event: BackendEvent) {
 }
 
 pub(super) fn send_dispatch_event(shared: &Shared, tx: &Sender<BackendEvent>, event: BackendEvent) {
-    send_event_with_backpressure(shared, tx, event, EventDelivery::Lossless);
+    send_event_with_backpressure(shared, tx, event);
 }
 
 pub(super) fn forward_event(shared: &Shared, event: BackendEvent) {
@@ -51,12 +48,7 @@ pub(super) fn forward_event(shared: &Shared, event: BackendEvent) {
 
     match event {
         BackendEvent::Solution(solution) => {
-            send_critical_event(
-                shared,
-                &tx,
-                BackendEvent::Solution(solution),
-                EventDelivery::Lossless,
-            );
+            send_critical_event(shared, &tx, BackendEvent::Solution(solution));
         }
         BackendEvent::Error {
             backend_id,
@@ -71,35 +63,17 @@ pub(super) fn forward_event(shared: &Shared, event: BackendEvent) {
                     backend,
                     message,
                 },
-                EventDelivery::BestEffort(ERROR_EVENT_MAX_BLOCK),
             );
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum EventDelivery {
-    Lossless,
-    BestEffort(std::time::Duration),
+fn send_critical_event(shared: &Shared, tx: &Sender<BackendEvent>, event: BackendEvent) {
+    send_event_with_backpressure(shared, tx, event);
 }
 
-fn send_critical_event(
-    shared: &Shared,
-    tx: &Sender<BackendEvent>,
-    event: BackendEvent,
-    delivery: EventDelivery,
-) {
-    send_event_with_backpressure(shared, tx, event, delivery);
-}
-
-fn send_event_with_backpressure(
-    shared: &Shared,
-    tx: &Sender<BackendEvent>,
-    event: BackendEvent,
-    delivery: EventDelivery,
-) {
+fn send_event_with_backpressure(shared: &Shared, tx: &Sender<BackendEvent>, event: BackendEvent) {
     let mut queued = event;
-    let started_at = Instant::now();
     let mut retry_wait = CRITICAL_EVENT_RETRY_WAIT;
     loop {
         if !shared.started.load(Ordering::Acquire) {
@@ -114,12 +88,6 @@ fn send_event_with_backpressure(
                 return;
             }
             Err(SendTimeoutError::Timeout(returned)) => {
-                if let EventDelivery::BestEffort(max_block) = delivery {
-                    if started_at.elapsed() >= max_block {
-                        shared.dropped_events.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                }
                 queued = returned;
                 retry_wait = (retry_wait.saturating_mul(2)).min(CRITICAL_EVENT_RETRY_MAX_WAIT);
             }

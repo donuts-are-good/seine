@@ -105,6 +105,11 @@ Run headless/plain logs (no fullscreen TUI):
   - Active backends run a startup deadline probe (`cancel`/`fence`) with a bounded watchdog timeout before mining/benchmark rounds begin; probe failures are quarantined.
   - `--hash-poll-ms` (default `200`) controls backend hash counter polling cadence.
     - Runtime may tighten this cadence based on backend capability hints (for example future GPU backends) while preserving the configured upper bound.
+  - CPU backend hot-path tuning knobs for faster perf iteration:
+    - `--cpu-hash-batch-size` (default `64`) controls per-worker hash counter flush batch size.
+    - `--cpu-control-check-interval-hashes` (default `256`) controls per-worker control/deadline check cadence.
+    - `--cpu-hash-flush-ms` (default `50`) controls time-based hash counter flush cadence.
+    - `--cpu-event-dispatch-capacity` (default `256`) controls internal CPU backend event dispatch buffering.
   - `--stats-secs` (default `10`) controls periodic stats log emission cadence.
   - `--work-allocation` (`adaptive` or `static`) controls backend nonce-chunk splitting policy in mining mode.
     - Adaptive mode now also incorporates solved/stale rounds with reduced gain so weights stay fresh under frequent tip churn.
