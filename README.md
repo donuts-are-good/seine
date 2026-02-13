@@ -77,10 +77,16 @@ Select explicit NVIDIA device instances:
 ./target/release/seine --backend nvidia --nvidia-devices 0,1
 ```
 
-Build with NVIDIA support enabled:
+NVIDIA support is enabled in default builds:
 
 ```bash
-cargo build --release --features nvidia
+cargo build --release
+```
+
+Build without NVIDIA support:
+
+```bash
+cargo build --release --no-default-features
 ```
 
 Run headless/plain logs (no fullscreen TUI):

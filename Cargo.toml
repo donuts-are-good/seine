@@ -22,7 +22,7 @@ blocknet-pow-spec = { path = "./pow-spec" }
 sysinfo = "0.31"
 
 [features]
-default = []
+default = ["nvidia"]
 nvidia = []
 
 [dev-dependencies]
