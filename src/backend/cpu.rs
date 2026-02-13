@@ -569,6 +569,10 @@ impl BenchBackend for CpuBackend {
         let setup_barrier = Arc::new(Barrier::new(lanes.saturating_add(1)));
         let start_barrier = Arc::new(Barrier::new(lanes.saturating_add(1)));
         let stop_at = Arc::new(OnceLock::<Instant>::new());
+        let core_ids = match self.affinity_mode {
+            CpuAffinityMode::Off => None,
+            CpuAffinityMode::Auto => core_affinity::get_core_ids().filter(|ids| !ids.is_empty()),
+        };
 
         thread::scope(|scope| {
             for lane in 0..lanes {
@@ -576,7 +580,14 @@ impl BenchBackend for CpuBackend {
                 let setup_barrier = Arc::clone(&setup_barrier);
                 let start_barrier = Arc::clone(&start_barrier);
                 let stop_at = Arc::clone(&stop_at);
+                let core_id = core_ids
+                    .as_ref()
+                    .and_then(|ids| ids.get(lane % ids.len()))
+                    .copied();
                 scope.spawn(move || {
+                    if let Some(core_id) = core_id {
+                        let _ = core_affinity::set_for_current(core_id);
+                    }
                     let mut worker_state = match pow_params() {
                         Ok(params) => {
                             let memory_blocks = vec![Block::default(); params.block_count()];

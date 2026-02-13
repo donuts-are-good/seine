@@ -50,11 +50,13 @@ use ui::{info, warn};
 const TEMPLATE_RETRY_DELAY: Duration = Duration::from_secs(2);
 const MIN_EVENT_WAIT: Duration = Duration::from_millis(1);
 const BACKEND_EVENT_SOURCE_CAPACITY_MAX: usize = 256;
-const CPU_AUTOTUNE_RECORD_SCHEMA_VERSION: u32 = 1;
+const CPU_AUTOTUNE_RECORD_SCHEMA_VERSION: u32 = 3;
 const CPU_AUTOTUNE_LINEAR_SCAN_MAX_CANDIDATES: usize = 8;
 const CPU_AUTOTUNE_FINAL_SWEEP_RADIUS: usize = 2;
 const CPU_AUTOTUNE_TARGET_HASHES_PER_CANDIDATE: u64 = 30;
 const CPU_AUTOTUNE_MAX_SAMPLE_SECS_PER_CANDIDATE: u64 = 60;
+const CPU_AUTOTUNE_BALANCED_PEAK_FLOOR_FRAC: f64 = 0.90;
+const CPU_AUTOTUNE_EFFICIENCY_PEAK_FLOOR_FRAC: f64 = 0.75;
 
 #[derive(Debug, Clone, Copy)]
 struct BackendRuntimePolicy {
@@ -137,9 +139,17 @@ struct CpuAutotuneRecord {
 #[derive(Debug, Clone, Copy)]
 struct CpuAutotuneMeasurement {
     hashes: u64,
-    sample_secs: f64,
     wall_secs: f64,
     hps: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CpuAutotuneSelection {
+    selected_threads: usize,
+    selected_hps: f64,
+    peak_threads: usize,
+    peak_hps: f64,
+    peak_floor_frac: f64,
 }
 
 pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
@@ -679,27 +689,52 @@ fn maybe_autotune_cpu_threads(
         warn(tag, "cpu-autotune | interrupted by shutdown request");
     }
 
-    let (best_threads, best_hps) = measurements
-        .iter()
-        .max_by(|(_, left), (_, right)| left.hps.total_cmp(&right.hps))
-        .map(|(threads, measurement)| (*threads, measurement.hps))
-        .unwrap_or((cfg.threads.max(1), 0.0));
-    apply_cpu_threads(cfg, best_threads);
-    info(
-        tag,
-        format!(
-            "cpu-autotune | done — best: {} threads at {} per CPU instance",
-            best_threads,
-            format_hashrate(best_hps)
-        ),
+    let selection = select_cpu_autotune_candidate(cfg.cpu_profile, &measurements).unwrap_or(
+        CpuAutotuneSelection {
+            selected_threads: cfg.threads.max(1),
+            selected_hps: 0.0,
+            peak_threads: cfg.threads.max(1),
+            peak_hps: 0.0,
+            peak_floor_frac: 1.0,
+        },
     );
+    apply_cpu_threads(cfg, selection.selected_threads);
+    if selection.selected_threads != selection.peak_threads {
+        let saved_threads = selection
+            .peak_threads
+            .saturating_sub(selection.selected_threads);
+        let saved_ram_gib =
+            (saved_threads as f64 * CPU_LANE_MEMORY_BYTES as f64) / (1024.0 * 1024.0 * 1024.0);
+        info(
+            tag,
+            format!(
+                "cpu-autotune | done — selected {} threads at {} (peak {} threads at {}; profile={} keeps >= {:.0}% peak, saves ~{:.1} GiB RAM per CPU instance)",
+                selection.selected_threads,
+                format_hashrate(selection.selected_hps),
+                selection.peak_threads,
+                format_hashrate(selection.peak_hps),
+                cpu_profile_label(cfg.cpu_profile),
+                selection.peak_floor_frac * 100.0,
+                saved_ram_gib,
+            ),
+        );
+    } else {
+        info(
+            tag,
+            format!(
+                "cpu-autotune | done — best: {} threads at {} per CPU instance",
+                selection.selected_threads,
+                format_hashrate(selection.selected_hps)
+            ),
+        );
+    }
     if let Err(err) = persist_cpu_autotune_record(
         cfg,
         cpu_instance_count,
         min_threads,
         max_threads,
-        best_threads,
-        best_hps,
+        selection.selected_threads,
+        selection.selected_hps,
         autotune_secs,
     ) {
         warn(
@@ -719,6 +754,55 @@ fn maybe_autotune_cpu_threads(
         );
     }
     Ok(())
+}
+
+fn cpu_autotune_peak_floor_frac(profile: CpuPerformanceProfile) -> f64 {
+    match profile {
+        CpuPerformanceProfile::Throughput => 1.0,
+        CpuPerformanceProfile::Balanced => CPU_AUTOTUNE_BALANCED_PEAK_FLOOR_FRAC,
+        CpuPerformanceProfile::Efficiency => CPU_AUTOTUNE_EFFICIENCY_PEAK_FLOOR_FRAC,
+    }
+}
+
+fn select_peak_autotune_candidate(
+    measurements: &BTreeMap<usize, CpuAutotuneMeasurement>,
+) -> Option<(usize, CpuAutotuneMeasurement)> {
+    measurements
+        .iter()
+        .max_by(|(left_threads, left), (right_threads, right)| {
+            // Prefer lower thread counts when measured H/s ties.
+            left.hps
+                .total_cmp(&right.hps)
+                .then_with(|| right_threads.cmp(left_threads))
+        })
+        .map(|(threads, measurement)| (*threads, *measurement))
+}
+
+fn select_cpu_autotune_candidate(
+    profile: CpuPerformanceProfile,
+    measurements: &BTreeMap<usize, CpuAutotuneMeasurement>,
+) -> Option<CpuAutotuneSelection> {
+    let (peak_threads, peak) = select_peak_autotune_candidate(measurements)?;
+    let peak_floor_frac = cpu_autotune_peak_floor_frac(profile).clamp(0.0, 1.0);
+    let min_acceptable_hps = peak.hps * peak_floor_frac;
+
+    let (selected_threads, selected) = if peak_floor_frac >= 1.0 || peak.hps <= 0.0 {
+        (peak_threads, peak)
+    } else {
+        measurements
+            .iter()
+            .find(|(_, measurement)| measurement.hps + f64::EPSILON >= min_acceptable_hps)
+            .map(|(threads, measurement)| (*threads, *measurement))
+            .unwrap_or((peak_threads, peak))
+    };
+
+    Some(CpuAutotuneSelection {
+        selected_threads,
+        selected_hps: selected.hps,
+        peak_threads,
+        peak_hps: peak.hps,
+        peak_floor_frac,
+    })
 }
 
 fn measure_cpu_autotune_candidate(
@@ -797,11 +881,11 @@ fn bench_cpu_autotune_candidate(
         return Ok(None);
     }
 
-    let sample_secs = (sampled_secs as f64).max(f64::EPSILON);
-    let hps = (sampled_hashes as f64) / sample_secs;
+    // Use elapsed wall time for throughput so short windows don't overcount hashes
+    // that finish after the target window boundary.
+    let hps = (sampled_hashes as f64) / wall_secs.max(f64::EPSILON);
     Ok(Some(CpuAutotuneMeasurement {
         hashes: sampled_hashes,
-        sample_secs,
         wall_secs,
         hps,
     }))
@@ -2136,6 +2220,62 @@ mod tests {
             bench_fail_below_pct: None,
             bench_baseline_policy: crate::config::BenchBaselinePolicy::Strict,
         }
+    }
+
+    fn autotune_measurements(values: &[(usize, f64)]) -> BTreeMap<usize, CpuAutotuneMeasurement> {
+        values
+            .iter()
+            .map(|(threads, hps)| {
+                (
+                    *threads,
+                    CpuAutotuneMeasurement {
+                        hashes: 0,
+                        wall_secs: 0.0,
+                        hps: *hps,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn autotune_selection_throughput_prefers_peak_and_lower_tie_threads() {
+        let selection = select_cpu_autotune_candidate(
+            CpuPerformanceProfile::Throughput,
+            &autotune_measurements(&[(3, 3.0), (4, 3.0), (5, 2.9)]),
+        )
+        .expect("selection should exist");
+
+        assert_eq!(selection.peak_threads, 3);
+        assert_eq!(selection.selected_threads, 3);
+        assert_eq!(selection.peak_floor_frac, 1.0);
+    }
+
+    #[test]
+    fn autotune_selection_balanced_biases_lower_when_near_peak() {
+        let selection = select_cpu_autotune_candidate(
+            CpuPerformanceProfile::Balanced,
+            &autotune_measurements(&[(3, 3.0), (4, 3.2), (22, 3.3)]),
+        )
+        .expect("selection should exist");
+
+        assert_eq!(selection.peak_threads, 22);
+        assert_eq!(selection.selected_threads, 3);
+        assert!((selection.peak_floor_frac - CPU_AUTOTUNE_BALANCED_PEAK_FLOOR_FRAC).abs() < 1e-9);
+    }
+
+    #[test]
+    fn autotune_selection_efficiency_uses_stronger_bias_floor() {
+        let selection = select_cpu_autotune_candidate(
+            CpuPerformanceProfile::Efficiency,
+            &autotune_measurements(&[(2, 2.1), (3, 2.3), (10, 3.0)]),
+        )
+        .expect("selection should exist");
+
+        // 75% of peak (3.0) is 2.25, so 3 threads is the first candidate that qualifies.
+        assert_eq!(selection.peak_threads, 10);
+        assert_eq!(selection.selected_threads, 3);
+        assert!((selection.peak_floor_frac - CPU_AUTOTUNE_EFFICIENCY_PEAK_FLOOR_FRAC).abs() < 1e-9);
     }
 
     #[test]
