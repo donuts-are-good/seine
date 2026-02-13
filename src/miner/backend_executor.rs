@@ -9,7 +9,8 @@ use anyhow::{anyhow, Result};
 use crossbeam_channel::{bounded, RecvTimeoutError, SendTimeoutError, Sender, TrySendError};
 
 use crate::backend::{
-    AssignmentSemantics, BackendCallStatus, BackendInstanceId, PowBackend, WorkAssignment,
+    AssignmentSemantics, BackendCallStatus, BackendCapabilities, BackendInstanceId, PowBackend,
+    WorkAssignment,
 };
 
 use super::ui::warn;
@@ -137,8 +138,33 @@ fn backend_worker_key(
     }
 }
 
+fn normalized_backend_capabilities(backend_handle: &Arc<dyn PowBackend>) -> BackendCapabilities {
+    let mut capabilities = backend_handle.capabilities();
+    capabilities.max_inflight_assignments = capabilities.max_inflight_assignments.max(1);
+    if capabilities.max_inflight_assignments > 1 && !backend_handle.supports_assignment_batching() {
+        capabilities.max_inflight_assignments = 1;
+    }
+
+    capabilities.nonblocking_poll_min = capabilities
+        .nonblocking_poll_min
+        .map(|min_poll| min_poll.max(Duration::from_micros(10)));
+    capabilities.nonblocking_poll_max = capabilities
+        .nonblocking_poll_max
+        .map(|max_poll| max_poll.max(Duration::from_micros(10)));
+    if let (Some(min_poll), Some(max_poll)) = (
+        capabilities.nonblocking_poll_min,
+        capabilities.nonblocking_poll_max,
+    ) {
+        if max_poll < min_poll {
+            capabilities.nonblocking_poll_max = Some(min_poll);
+        }
+    }
+
+    capabilities
+}
+
 fn backend_worker_queue_capacity(backend_handle: &Arc<dyn PowBackend>) -> usize {
-    let capabilities = backend_handle.capabilities();
+    let capabilities = normalized_backend_capabilities(backend_handle);
     let requested = capabilities.max_inflight_assignments.max(1) as usize;
     let queue_depth = if capabilities.assignment_semantics == AssignmentSemantics::Append {
         requested
@@ -760,7 +786,7 @@ const NONBLOCKING_BACKOFF_HARD_MAX: Duration = Duration::from_millis(50);
 fn backend_nonblocking_backoff_bounds(
     backend_handle: &Arc<dyn PowBackend>,
 ) -> (Duration, Duration) {
-    let capabilities = backend_handle.capabilities();
+    let capabilities = normalized_backend_capabilities(backend_handle);
     let min_backoff = capabilities
         .nonblocking_poll_min
         .unwrap_or(DEFAULT_NONBLOCKING_BACKOFF_MIN)
@@ -896,6 +922,132 @@ mod tests {
         fn assign_work(&self, _work: WorkAssignment) -> Result<()> {
             Ok(())
         }
+    }
+
+    struct CapabilityBackend {
+        max_inflight_assignments: u32,
+        assignment_semantics: AssignmentSemantics,
+        supports_batching: bool,
+        nonblocking_poll_min: Option<Duration>,
+        nonblocking_poll_max: Option<Duration>,
+    }
+
+    impl CapabilityBackend {
+        fn new(max_inflight_assignments: u32) -> Self {
+            Self {
+                max_inflight_assignments,
+                assignment_semantics: AssignmentSemantics::Replace,
+                supports_batching: false,
+                nonblocking_poll_min: None,
+                nonblocking_poll_max: None,
+            }
+        }
+
+        fn with_assignment_semantics(mut self, assignment_semantics: AssignmentSemantics) -> Self {
+            self.assignment_semantics = assignment_semantics;
+            self
+        }
+
+        fn with_batching(mut self, supports_batching: bool) -> Self {
+            self.supports_batching = supports_batching;
+            self
+        }
+
+        fn with_nonblocking_poll(
+            mut self,
+            min_poll: Option<Duration>,
+            max_poll: Option<Duration>,
+        ) -> Self {
+            self.nonblocking_poll_min = min_poll;
+            self.nonblocking_poll_max = max_poll;
+            self
+        }
+    }
+
+    impl PowBackend for CapabilityBackend {
+        fn name(&self) -> &'static str {
+            "capability"
+        }
+
+        fn lanes(&self) -> usize {
+            1
+        }
+
+        fn set_instance_id(&self, _id: BackendInstanceId) {}
+
+        fn set_event_sink(&self, _sink: Sender<BackendEvent>) {}
+
+        fn start(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&self) {}
+
+        fn assign_work(&self, _work: WorkAssignment) -> Result<()> {
+            Ok(())
+        }
+
+        fn supports_assignment_batching(&self) -> bool {
+            self.supports_batching
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                max_inflight_assignments: self.max_inflight_assignments,
+                assignment_semantics: self.assignment_semantics,
+                nonblocking_poll_min: self.nonblocking_poll_min,
+                nonblocking_poll_max: self.nonblocking_poll_max,
+                ..BackendCapabilities::default()
+            }
+        }
+    }
+
+    #[test]
+    fn worker_queue_capacity_is_normalized_for_non_batching_backends() {
+        let backend = Arc::new(
+            CapabilityBackend::new(16)
+                .with_assignment_semantics(AssignmentSemantics::Append)
+                .with_batching(false),
+        ) as Arc<dyn PowBackend>;
+
+        assert_eq!(backend_worker_queue_capacity(&backend), 1);
+    }
+
+    #[test]
+    fn worker_queue_capacity_uses_append_inflight_depth_with_batching() {
+        let backend = Arc::new(
+            CapabilityBackend::new(16)
+                .with_assignment_semantics(AssignmentSemantics::Append)
+                .with_batching(true),
+        ) as Arc<dyn PowBackend>;
+
+        assert_eq!(backend_worker_queue_capacity(&backend), 16);
+    }
+
+    #[test]
+    fn worker_queue_capacity_applies_global_cap() {
+        let backend = Arc::new(
+            CapabilityBackend::new(512)
+                .with_assignment_semantics(AssignmentSemantics::Append)
+                .with_batching(true),
+        ) as Arc<dyn PowBackend>;
+
+        assert_eq!(
+            backend_worker_queue_capacity(&backend),
+            BACKEND_WORKER_QUEUE_CAPACITY_MAX
+        );
+    }
+
+    #[test]
+    fn nonblocking_backoff_bounds_normalize_inverted_hints() {
+        let backend = Arc::new(CapabilityBackend::new(1).with_nonblocking_poll(
+            Some(Duration::from_millis(7)),
+            Some(Duration::from_micros(10)),
+        )) as Arc<dyn PowBackend>;
+
+        let (min_backoff, max_backoff) = backend_nonblocking_backoff_bounds(&backend);
+        assert_eq!(min_backoff, Duration::from_millis(7));
+        assert_eq!(max_backoff, Duration::from_millis(7));
     }
 
     struct StopCountingBackend {
