@@ -364,18 +364,19 @@ impl<'a> MiningControlPlane<'a> {
 
     fn enqueue_submit_request(&mut self, request: SubmitRequest) {
         if self.submit_backlog.len() >= SUBMIT_BACKLOG_CAPACITY {
-            warn(
-                "SUBMIT",
-                format!(
-                    "submit backlog full ({}); dropping epoch={} nonce={} backend={}#{}",
-                    SUBMIT_BACKLOG_CAPACITY,
-                    request.solution.epoch,
-                    request.solution.nonce,
-                    request.solution.backend,
-                    request.solution.backend_id
-                ),
-            );
-            return;
+            if let Some(dropped) = self.submit_backlog.pop_front() {
+                warn(
+                    "SUBMIT",
+                    format!(
+                        "submit backlog full ({}); dropping oldest epoch={} nonce={} backend={}#{} to keep newest request",
+                        SUBMIT_BACKLOG_CAPACITY,
+                        dropped.solution.epoch,
+                        dropped.solution.nonce,
+                        dropped.solution.backend,
+                        dropped.solution.backend_id
+                    ),
+                );
+            }
         }
         self.submit_backlog.push_back(request);
     }
@@ -1398,6 +1399,13 @@ fn drain_mining_backend_events(
 }
 
 fn push_deferred_solution(deferred_solutions: &mut Vec<MiningSolution>, solution: MiningSolution) {
+    if deferred_solutions
+        .iter()
+        .any(|queued| queued.epoch == solution.epoch && queued.nonce == solution.nonce)
+    {
+        return;
+    }
+
     if deferred_solutions.len() >= DEFERRED_SOLUTIONS_CAPACITY {
         let drop_count = deferred_solutions
             .len()
@@ -1942,6 +1950,31 @@ mod tests {
 
         assert_eq!(deferred.len(), DEFERRED_SOLUTIONS_CAPACITY);
         assert_eq!(deferred[0].epoch, 3);
+    }
+
+    #[test]
+    fn deferred_solution_queue_dedupes_epoch_and_nonce() {
+        let mut deferred = Vec::new();
+        push_deferred_solution(
+            &mut deferred,
+            MiningSolution {
+                epoch: 10,
+                nonce: 77,
+                backend_id: 1,
+                backend: "cpu",
+            },
+        );
+        push_deferred_solution(
+            &mut deferred,
+            MiningSolution {
+                epoch: 10,
+                nonce: 77,
+                backend_id: 9,
+                backend: "nvidia",
+            },
+        );
+
+        assert_eq!(deferred.len(), 1);
     }
 
     #[test]
