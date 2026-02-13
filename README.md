@@ -4,7 +4,7 @@
 
 Current status:
 - CPU backend: implemented (Argon2id, consensus-compatible params).
-- NVIDIA backend: implemented runtime path with device probing (`nvidia-smi`) and backend integration (current hashing path is compatibility-focused and does not yet provide CUDA acceleration).
+- NVIDIA backend: optimized runtime path with device probing (`nvidia-smi`), auto lane sizing, throughput-oriented worker tuning, and batched assignment collapsing (current hashing path remains compatibility-focused and does not yet provide CUDA acceleration).
 - Runtime architecture: supports multiple backends in one process with persistent workers, configurable bounded backend event queues with lossless `Solution` delivery and deduplicated backend `Error` events (prevents multi-thread error storms from stalling worker teardown), coalesced tip notifications (deduped across SSE reconnects), template prefetch overlap to reduce round-boundary idle, and optional strict quiesce barriers for round-accurate hash accounting.
   - Backend assignment/control dispatch now runs through one shared per-backend task executor with panic capture and timeout quarantine to avoid duplicated control paths and extra thread churn.
   - Per-backend executors prioritize control commands (cancel/fence/stop) on a dedicated control lane, so queued assignment bursts do not delay control enqueue.
@@ -61,6 +61,9 @@ Password sources (in order): `--wallet-password`, `--wallet-password-file`, `SEI
 ```bash
 ./target/release/seine --api-url http://127.0.0.1:8332 --wallet-password-file /path/to/wallet.pass
 ```
+
+If `--backend` is omitted, Seine auto-detects and uses available backends (CPU + NVIDIA when available).
+Pass `--backend cpu` or `--backend nvidia` to force a specific backend set.
 
 Select multiple backends (comma-separated or repeated flag). Unavailable backends are skipped:
 
@@ -119,7 +122,9 @@ Run headless/plain logs (no fullscreen TUI):
       - Results are persisted to `<data-dir>/seine.cpu-autotune.json` and reused on subsequent runs.
       - `--cpu-autotune-threads` forces autotuning even when `--threads` is set.
       - `--disable-cpu-autotune-threads` disables autotuning.
-      - `--cpu-autotune-min-threads`, `--cpu-autotune-max-threads`, and `--cpu-autotune-secs` bound autotuner search range and sample length.
+      - `--cpu-autotune-min-threads`, `--cpu-autotune-max-threads`, and `--cpu-autotune-secs` bound autotuner search range and base sample window (`--cpu-autotune-secs` default: `6`).
+      - Autotune uses a binary-style peak search for larger thread ranges, then locally sweeps neighboring candidates for final selection.
+      - Candidate sampling auto-extends up to an internal cap to collect a minimum hash count on very slow lanes (reduces variance vs fixed very short windows).
       - `--cpu-autotune-config` overrides the persisted autotune config path.
   - `--stats-secs` (default `10`) controls periodic stats log emission cadence.
   - `--work-allocation` (`adaptive` or `static`) controls backend nonce-chunk splitting policy in mining mode.

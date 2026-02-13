@@ -7,6 +7,9 @@ use anyhow::{bail, Context, Result};
 use blocknet_pow_spec::CPU_LANE_MEMORY_BYTES;
 use clap::{ArgAction, Parser, ValueEnum};
 
+#[cfg(feature = "nvidia")]
+use std::process::Command;
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, ValueEnum)]
 pub enum BackendKind {
     Cpu,
@@ -142,12 +145,12 @@ struct Cli {
     data_dir: PathBuf,
 
     /// One or more mining backends. Repeat the flag or pass comma-separated values.
+    /// When omitted, Seine auto-detects available backends (CPU + NVIDIA when available).
     #[arg(
         long = "backend",
         value_enum,
         value_delimiter = ',',
-        num_args = 1..,
-        default_value = "cpu"
+        num_args = 1..
     )]
     backends: Vec<BackendKind>,
 
@@ -541,10 +544,11 @@ impl Config {
             }
         }
 
-        let backends = cli.backends.clone();
-        if backends.is_empty() {
-            bail!("at least one backend is required");
-        }
+        let backends = resolve_backend_selection(
+            &cli.backends,
+            &cli.nvidia_devices,
+            detect_nvidia_backend_available(),
+        );
         let cpu_backend_instances = backends
             .iter()
             .filter(|kind| matches!(kind, BackendKind::Cpu))
@@ -663,6 +667,48 @@ impl Config {
             bench_baseline_policy: cli.bench_baseline_policy,
         })
     }
+}
+
+fn resolve_backend_selection(
+    requested_backends: &[BackendKind],
+    nvidia_devices: &[u32],
+    nvidia_available: bool,
+) -> Vec<BackendKind> {
+    if !requested_backends.is_empty() {
+        return requested_backends.to_vec();
+    }
+
+    let mut selected = vec![BackendKind::Cpu];
+    if nvidia_available || !nvidia_devices.is_empty() {
+        selected.push(BackendKind::Nvidia);
+    }
+    selected
+}
+
+#[cfg(feature = "nvidia")]
+fn detect_nvidia_backend_available() -> bool {
+    let output = match Command::new("nvidia-smi")
+        .args(["--query-gpu=index", "--format=csv,noheader,nounits"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+
+    let stdout = match String::from_utf8(output.stdout) {
+        Ok(stdout) => stdout,
+        Err(_) => return false,
+    };
+
+    stdout.lines().any(|line| !line.trim().is_empty())
+}
+
+#[cfg(not(feature = "nvidia"))]
+fn detect_nvidia_backend_available() -> bool {
+    false
 }
 
 fn resolve_token_with_source(cli: &Cli) -> Result<(String, Option<PathBuf>)> {
@@ -1340,5 +1386,30 @@ mod tests {
             cli.cpu_autotune_threads || cpu_autotune_default_enabled
         };
         assert!(!cpu_autotune_threads);
+    }
+
+    #[test]
+    fn resolve_backend_selection_uses_requested_backends_verbatim() {
+        let selected =
+            resolve_backend_selection(&[BackendKind::Nvidia, BackendKind::Cpu], &[], false);
+        assert_eq!(selected, vec![BackendKind::Nvidia, BackendKind::Cpu]);
+    }
+
+    #[test]
+    fn resolve_backend_selection_defaults_to_cpu_only_when_nvidia_unavailable() {
+        let selected = resolve_backend_selection(&[], &[], false);
+        assert_eq!(selected, vec![BackendKind::Cpu]);
+    }
+
+    #[test]
+    fn resolve_backend_selection_defaults_to_cpu_and_nvidia_when_available() {
+        let selected = resolve_backend_selection(&[], &[], true);
+        assert_eq!(selected, vec![BackendKind::Cpu, BackendKind::Nvidia]);
+    }
+
+    #[test]
+    fn resolve_backend_selection_enables_nvidia_when_devices_are_explicit() {
+        let selected = resolve_backend_selection(&[], &[0, 1], false);
+        assert_eq!(selected, vec![BackendKind::Cpu, BackendKind::Nvidia]);
     }
 }
