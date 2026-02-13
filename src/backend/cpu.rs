@@ -678,11 +678,11 @@ fn cpu_worker_loop(shared: Arc<Shared>, thread_idx: usize, core_id: Option<core_
         control_hashes_remaining = control_hashes_remaining.saturating_sub(1);
         pending_hashes = pending_hashes.saturating_add(1);
 
-        let should_flush = pending_hashes >= HASH_BATCH_SIZE
-            || (control_hashes_remaining == 0 && Instant::now() >= next_flush_at);
+        let now = Instant::now();
+        let should_flush = should_flush_hashes(pending_hashes, now, next_flush_at);
         if should_flush {
             flush_hashes(&shared, thread_idx, &mut pending_hashes);
-            next_flush_at = Instant::now() + HASH_FLUSH_INTERVAL;
+            next_flush_at = now + HASH_FLUSH_INTERVAL;
         }
 
         if hash_meets_target(&output, &template.target) {
@@ -1015,6 +1015,10 @@ fn flush_hashes(shared: &Shared, thread_idx: usize, pending_hashes: &mut u64) {
     *pending_hashes = 0;
 }
 
+fn should_flush_hashes(pending_hashes: u64, now: Instant, next_flush_at: Instant) -> bool {
+    pending_hashes >= HASH_BATCH_SIZE || now >= next_flush_at
+}
+
 fn emit_error(shared: &Shared, message: String) {
     if shared.error_emitted.swap(true, Ordering::AcqRel) {
         return;
@@ -1136,8 +1140,8 @@ fn send_event_with_backpressure(
 #[cfg(test)]
 mod tests {
     use super::{
-        emit_error, forward_event, lane_quota_for_chunk, start_assignment, BackendEvent,
-        CpuBackend, MiningSolution, ERROR_EVENT_MAX_BLOCK,
+        emit_error, forward_event, lane_quota_for_chunk, should_flush_hashes, start_assignment,
+        BackendEvent, CpuBackend, MiningSolution, ERROR_EVENT_MAX_BLOCK, HASH_BATCH_SIZE,
     };
     use crate::backend::PowBackend;
     use crate::config::CpuAffinityMode;
@@ -1159,6 +1163,14 @@ mod tests {
         assert_eq!(lane_quota_for_chunk(5, 1, 4), 1);
         assert_eq!(lane_quota_for_chunk(5, 3, 4), 1);
         assert_eq!(lane_quota_for_chunk(5, 6, 4), 0);
+    }
+
+    #[test]
+    fn hash_flush_triggers_on_time_or_batch_threshold() {
+        let now = Instant::now();
+        assert!(should_flush_hashes(HASH_BATCH_SIZE, now, now + Duration::from_secs(1)));
+        assert!(should_flush_hashes(1, now, now));
+        assert!(!should_flush_hashes(1, now, now + Duration::from_secs(1)));
     }
 
     #[test]
