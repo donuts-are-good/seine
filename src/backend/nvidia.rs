@@ -13,7 +13,9 @@ use blake2::{
     Blake2b512, Blake2bVar,
 };
 use blocknet_pow_spec::{pow_params, CPU_LANE_MEMORY_BYTES, POW_HEADER_BASE_LEN, POW_OUTPUT_LEN};
-use crossbeam_channel::{bounded, Receiver, SendTimeoutError, Sender};
+use crossbeam_channel::{
+    bounded, Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError, TrySendError,
+};
 use cudarc::{
     driver::{
         CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
@@ -23,21 +25,23 @@ use cudarc::{
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{
-    AssignmentSemantics, BackendCapabilities, BackendEvent, BackendExecutionModel,
-    BackendInstanceId, BackendTelemetry, BenchBackend, DeadlineSupport, MiningSolution, NonceChunk,
-    PowBackend, PreemptionGranularity, WorkAssignment, WorkTemplate,
+    AssignmentSemantics, BackendCallStatus, BackendCapabilities, BackendEvent,
+    BackendExecutionModel, BackendInstanceId, BackendTelemetry, BenchBackend, DeadlineSupport,
+    MiningSolution, NonceChunk, PowBackend, PreemptionGranularity, WorkAssignment, WorkTemplate,
 };
 use crate::types::hash_meets_target;
 
 const BACKEND_NAME: &str = "nvidia";
 const CUDA_KERNEL_SRC: &str = include_str!("nvidia_kernel.cu");
 const MAX_RECOMMENDED_LANES: usize = 16;
-const CMD_CHANNEL_CAPACITY: usize = 256;
+const ASSIGN_CHANNEL_CAPACITY: usize = 256;
+const CONTROL_CHANNEL_CAPACITY: usize = 32;
 const EVENT_SEND_WAIT: Duration = Duration::from_millis(5);
 const KERNEL_THREADS: u32 = 32;
 const DEFAULT_NVIDIA_MAX_RREGCOUNT: u32 = 224;
 const NVIDIA_AUTOTUNE_SCHEMA_VERSION: u32 = 2;
 const NVIDIA_AUTOTUNE_REGCAP_CANDIDATES: &[u32] = &[240, 224, 208, 192, 160];
+const NVIDIA_AUTOTUNE_LOOP_UNROLL_CANDIDATES: &[bool] = &[false];
 const ARGON2_VERSION_V13: u32 = 0x13;
 const ARGON2_ALGORITHM_ID: u32 = 2; // Argon2id
 
@@ -52,12 +56,14 @@ struct NvidiaDeviceInfo {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 struct NvidiaKernelTuning {
     max_rregcount: u32,
+    block_loop_unroll: bool,
 }
 
 impl Default for NvidiaKernelTuning {
     fn default() -> Self {
         Self {
             max_rregcount: DEFAULT_NVIDIA_MAX_RREGCOUNT,
+            block_loop_unroll: false,
         }
     }
 }
@@ -75,6 +81,8 @@ struct NvidiaAutotuneKey {
 struct NvidiaAutotuneRecord {
     key: NvidiaAutotuneKey,
     max_rregcount: u32,
+    #[serde(default)]
+    block_loop_unroll: bool,
     measured_hps: f64,
     autotune_secs: u64,
     timestamp_unix_secs: u64,
@@ -119,7 +127,8 @@ impl NvidiaShared {
 }
 
 struct NvidiaWorker {
-    tx: Sender<WorkerCommand>,
+    assignment_tx: Sender<WorkerCommand>,
+    control_tx: Sender<WorkerCommand>,
     handle: JoinHandle<()>,
 }
 
@@ -148,6 +157,31 @@ impl ActiveAssignment {
             work,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PendingControlKind {
+    Cancel,
+    Fence,
+}
+
+impl PendingControlKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cancel => "cancel",
+            Self::Fence => "fence",
+        }
+    }
+}
+
+struct PendingControlAck {
+    kind: PendingControlKind,
+    ack_rx: Receiver<Result<()>>,
+}
+
+#[derive(Default)]
+struct NonblockingControlState {
+    pending: Option<PendingControlAck>,
 }
 
 struct CudaArgon2Engine {
@@ -231,8 +265,7 @@ impl CudaArgon2Engine {
                         lanes,
                     ) {
                         Ok(()) => {
-                            selected =
-                                Some((lanes, (lane_memory, seed_blocks, last_blocks)));
+                            selected = Some((lanes, (lane_memory, seed_blocks, last_blocks)));
                             break;
                         }
                         Err(err)
@@ -387,12 +420,17 @@ pub struct NvidiaBackend {
     resolved_device: RwLock<Option<NvidiaDeviceInfo>>,
     kernel_tuning: RwLock<Option<NvidiaKernelTuning>>,
     shared: Arc<NvidiaShared>,
+    nonblocking_control: Mutex<NonblockingControlState>,
     worker: Mutex<Option<NvidiaWorker>>,
     max_lanes: AtomicUsize,
 }
 
 impl NvidiaBackend {
-    pub fn new(device_index: Option<u32>, autotune_config_path: PathBuf, autotune_secs: u64) -> Self {
+    pub fn new(
+        device_index: Option<u32>,
+        autotune_config_path: PathBuf,
+        autotune_secs: u64,
+    ) -> Self {
         Self {
             instance_id: Arc::new(AtomicU64::new(0)),
             requested_device_index: device_index,
@@ -401,6 +439,7 @@ impl NvidiaBackend {
             resolved_device: RwLock::new(None),
             kernel_tuning: RwLock::new(None),
             shared: Arc::new(NvidiaShared::new()),
+            nonblocking_control: Mutex::new(NonblockingControlState::default()),
             worker: Mutex::new(None),
             max_lanes: AtomicUsize::new(1),
         }
@@ -447,7 +486,7 @@ impl NvidiaBackend {
         Ok(selected)
     }
 
-    fn worker_tx(&self) -> Result<Sender<WorkerCommand>> {
+    fn worker_assignment_tx(&self) -> Result<Sender<WorkerCommand>> {
         let guard = self
             .worker
             .lock()
@@ -455,7 +494,113 @@ impl NvidiaBackend {
         let Some(worker) = guard.as_ref() else {
             bail!("NVIDIA backend is not started");
         };
-        Ok(worker.tx.clone())
+        Ok(worker.assignment_tx.clone())
+    }
+
+    fn worker_control_tx(&self) -> Result<Sender<WorkerCommand>> {
+        let guard = self
+            .worker
+            .lock()
+            .map_err(|_| anyhow!("nvidia worker lock poisoned"))?;
+        let Some(worker) = guard.as_ref() else {
+            bail!("NVIDIA backend is not started");
+        };
+        Ok(worker.control_tx.clone())
+    }
+
+    fn clear_nonblocking_control_state(&self) {
+        if let Ok(mut state) = self.nonblocking_control.lock() {
+            state.pending = None;
+        }
+    }
+
+    fn send_control_blocking(&self, kind: PendingControlKind) -> Result<()> {
+        let tx = self.worker_control_tx()?;
+        let (ack_tx, ack_rx) = bounded::<Result<()>>(1);
+        let cmd = match kind {
+            PendingControlKind::Cancel => WorkerCommand::Cancel(ack_tx),
+            PendingControlKind::Fence => WorkerCommand::Fence(ack_tx),
+        };
+        tx.send(cmd).map_err(|_| {
+            anyhow!(
+                "nvidia worker channel closed while issuing {}",
+                kind.label()
+            )
+        })?;
+        ack_rx
+            .recv()
+            .map_err(|_| anyhow!("nvidia worker did not acknowledge {}", kind.label()))??;
+        Ok(())
+    }
+
+    fn control_nonblocking(&self, kind: PendingControlKind) -> Result<BackendCallStatus> {
+        let tx = self.worker_control_tx()?;
+        let mut state = self
+            .nonblocking_control
+            .lock()
+            .map_err(|_| anyhow!("nvidia nonblocking control lock poisoned"))?;
+
+        if let Some(pending) = state.pending.as_mut() {
+            match pending.ack_rx.try_recv() {
+                Ok(result) => {
+                    state.pending = None;
+                    result?;
+                }
+                Err(TryRecvError::Empty) => {
+                    if pending.kind == kind {
+                        return Ok(BackendCallStatus::Pending);
+                    }
+                    return Ok(BackendCallStatus::Pending);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    let pending_kind = pending.kind;
+                    state.pending = None;
+                    bail!(
+                        "nvidia worker disconnected while waiting for {} acknowledgement",
+                        pending_kind.label()
+                    );
+                }
+            }
+        }
+
+        let (ack_tx, ack_rx) = bounded::<Result<()>>(1);
+        let cmd = match kind {
+            PendingControlKind::Cancel => WorkerCommand::Cancel(ack_tx),
+            PendingControlKind::Fence => WorkerCommand::Fence(ack_tx),
+        };
+        match tx.try_send(cmd) {
+            Ok(()) => {
+                state.pending = Some(PendingControlAck { kind, ack_rx });
+                if let Some(pending) = state.pending.as_mut() {
+                    match pending.ack_rx.try_recv() {
+                        Ok(result) => {
+                            state.pending = None;
+                            result?;
+                            return Ok(BackendCallStatus::Complete);
+                        }
+                        Err(TryRecvError::Empty) => {
+                            return Ok(BackendCallStatus::Pending);
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            let pending_kind = pending.kind;
+                            state.pending = None;
+                            bail!(
+                                "nvidia worker disconnected while waiting for {} acknowledgement",
+                                pending_kind.label()
+                            );
+                        }
+                    }
+                }
+                Ok(BackendCallStatus::Pending)
+            }
+            Err(TrySendError::Full(_)) => Ok(BackendCallStatus::Pending),
+            Err(TrySendError::Disconnected(_)) => {
+                bail!(
+                    "nvidia worker channel closed while issuing {}",
+                    kind.label()
+                )
+            }
+        }
     }
 
     fn resolve_kernel_tuning(&self, selected: &NvidiaDeviceInfo) -> NvidiaKernelTuning {
@@ -473,8 +618,9 @@ impl NvidiaBackend {
             return cached;
         }
 
-        let tuned = autotune_nvidia_kernel_tuning(selected, &self.autotune_config_path, self.autotune_secs)
-            .unwrap_or_else(|_| NvidiaKernelTuning::default());
+        let tuned =
+            autotune_nvidia_kernel_tuning(selected, &self.autotune_config_path, self.autotune_secs)
+                .unwrap_or_else(|_| NvidiaKernelTuning::default());
         if let Ok(mut slot) = self.kernel_tuning.write() {
             *slot = Some(tuned);
         }
@@ -553,8 +699,10 @@ impl PowBackend for NvidiaBackend {
         if let Ok(mut slot) = self.shared.inflight_assignment_started_at.lock() {
             *slot = None;
         }
+        self.clear_nonblocking_control_state();
 
-        let (tx, rx) = bounded::<WorkerCommand>(CMD_CHANNEL_CAPACITY);
+        let (assignment_tx, assignment_rx) = bounded::<WorkerCommand>(ASSIGN_CHANNEL_CAPACITY);
+        let (control_tx, control_rx) = bounded::<WorkerCommand>(CONTROL_CHANNEL_CAPACITY);
         let shared = Arc::clone(&self.shared);
         let instance_id = Arc::clone(&self.instance_id);
         let handle = thread::Builder::new()
@@ -562,14 +710,18 @@ impl PowBackend for NvidiaBackend {
                 "seine-nvidia-worker-{}",
                 self.instance_id.load(Ordering::Acquire)
             ))
-            .spawn(move || worker_loop(&mut engine, rx, shared, instance_id))
+            .spawn(move || worker_loop(&mut engine, assignment_rx, control_rx, shared, instance_id))
             .map_err(|err| anyhow!("failed to spawn nvidia worker thread: {err}"))?;
 
         let mut guard = self
             .worker
             .lock()
             .map_err(|_| anyhow!("nvidia worker lock poisoned"))?;
-        *guard = Some(NvidiaWorker { tx, handle });
+        *guard = Some(NvidiaWorker {
+            assignment_tx,
+            control_tx,
+            handle,
+        });
 
         Ok(())
     }
@@ -580,9 +732,12 @@ impl PowBackend for NvidiaBackend {
             Err(_) => None,
         };
         if let Some(worker) = worker {
-            let _ = worker.tx.send(WorkerCommand::Stop);
+            if worker.control_tx.send(WorkerCommand::Stop).is_err() {
+                let _ = worker.assignment_tx.send(WorkerCommand::Stop);
+            }
             let _ = worker.handle.join();
         }
+        self.clear_nonblocking_control_state();
 
         self.shared.active_lanes.store(0, Ordering::Release);
         self.shared.pending_work.store(0, Ordering::Release);
@@ -595,7 +750,7 @@ impl PowBackend for NvidiaBackend {
     }
 
     fn assign_work(&self, work: WorkAssignment) -> Result<()> {
-        self.worker_tx()?
+        self.worker_assignment_tx()?
             .send(WorkerCommand::Assign(work))
             .map_err(|_| anyhow!("nvidia worker channel closed while assigning work"))
     }
@@ -622,30 +777,81 @@ impl PowBackend for NvidiaBackend {
         true
     }
 
+    fn supports_true_nonblocking(&self) -> bool {
+        true
+    }
+
+    fn assign_work_batch_nonblocking(&self, work: &[WorkAssignment]) -> Result<BackendCallStatus> {
+        let Some(collapsed) = collapse_assignment_batch(work)? else {
+            return Ok(BackendCallStatus::Complete);
+        };
+
+        let tx = self.worker_assignment_tx()?;
+        match tx.try_send(WorkerCommand::Assign(collapsed)) {
+            Ok(()) => Ok(BackendCallStatus::Complete),
+            Err(TrySendError::Full(_)) => Ok(BackendCallStatus::Pending),
+            Err(TrySendError::Disconnected(_)) => {
+                bail!("nvidia worker channel closed while assigning work")
+            }
+        }
+    }
+
+    fn wait_for_nonblocking_progress(&self, wait_for: Duration) -> Result<()> {
+        let wait_for = wait_for.max(Duration::from_micros(10));
+        let mut state = self
+            .nonblocking_control
+            .lock()
+            .map_err(|_| anyhow!("nvidia nonblocking control lock poisoned"))?;
+        let Some(pending) = state.pending.as_mut() else {
+            drop(state);
+            thread::sleep(wait_for);
+            return Ok(());
+        };
+
+        match pending.ack_rx.recv_timeout(wait_for) {
+            Ok(result) => {
+                state.pending = None;
+                result?;
+                Ok(())
+            }
+            Err(RecvTimeoutError::Timeout) => Ok(()),
+            Err(RecvTimeoutError::Disconnected) => {
+                let pending_kind = pending.kind;
+                state.pending = None;
+                bail!(
+                    "nvidia worker disconnected while waiting for {} acknowledgement",
+                    pending_kind.label()
+                );
+            }
+        }
+    }
+
+    fn cancel_work_nonblocking(&self) -> Result<BackendCallStatus> {
+        self.control_nonblocking(PendingControlKind::Cancel)
+    }
+
+    fn fence_nonblocking(&self) -> Result<BackendCallStatus> {
+        self.control_nonblocking(PendingControlKind::Fence)
+    }
+
     fn cancel_work(&self) -> Result<()> {
-        let tx = self.worker_tx()?;
-        let (ack_tx, ack_rx) = bounded::<Result<()>>(1);
-        tx.send(WorkerCommand::Cancel(ack_tx))
-            .map_err(|_| anyhow!("nvidia worker channel closed while cancelling"))?;
-        ack_rx
-            .recv()
-            .map_err(|_| anyhow!("nvidia worker did not acknowledge cancellation"))??;
-        Ok(())
+        self.send_control_blocking(PendingControlKind::Cancel)
     }
 
     fn request_timeout_interrupt(&self) -> Result<()> {
-        self.cancel_work()
+        let tx = match self.worker_control_tx() {
+            Ok(tx) => tx,
+            Err(_) => return Ok(()),
+        };
+        let (ack_tx, _ack_rx) = bounded::<Result<()>>(1);
+        match tx.try_send(WorkerCommand::Cancel(ack_tx)) {
+            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Err(TrySendError::Disconnected(_)) => Ok(()),
+        }
     }
 
     fn fence(&self) -> Result<()> {
-        let tx = self.worker_tx()?;
-        let (ack_tx, ack_rx) = bounded::<Result<()>>(1);
-        tx.send(WorkerCommand::Fence(ack_tx))
-            .map_err(|_| anyhow!("nvidia worker channel closed while fencing"))?;
-        ack_rx
-            .recv()
-            .map_err(|_| anyhow!("nvidia worker did not acknowledge fence"))??;
-        Ok(())
+        self.send_control_blocking(PendingControlKind::Fence)
     }
 
     fn take_hashes(&self) -> u64 {
@@ -705,7 +911,7 @@ impl PowBackend for NvidiaBackend {
             max_inflight_assignments: 32,
             deadline_support: DeadlineSupport::Cooperative,
             assignment_semantics: AssignmentSemantics::Replace,
-            execution_model: BackendExecutionModel::Blocking,
+            execution_model: BackendExecutionModel::Nonblocking,
             nonblocking_poll_min: Some(Duration::from_micros(50)),
             nonblocking_poll_max: Some(Duration::from_millis(1)),
         }
@@ -759,28 +965,132 @@ impl BenchBackend for NvidiaBackend {
 
 fn worker_loop(
     engine: &mut CudaArgon2Engine,
-    rx: Receiver<WorkerCommand>,
+    assignment_rx: Receiver<WorkerCommand>,
+    control_rx: Receiver<WorkerCommand>,
     shared: Arc<NvidiaShared>,
     instance_id: Arc<AtomicU64>,
 ) {
     let mut active: Option<ActiveAssignment> = None;
     let mut fence_waiters: Vec<Sender<Result<()>>> = Vec::new();
+    let mut assignment_open = true;
+    let mut control_open = true;
     let mut running = true;
     let mut nonce_buf = vec![0u64; engine.max_lanes().max(1)];
 
     while running {
-        if active.is_none() {
-            match rx.recv() {
+        while control_open {
+            match control_rx.try_recv() {
                 Ok(cmd) => {
                     running = handle_worker_command(cmd, &mut active, &mut fence_waiters, &shared);
+                    if !running {
+                        break;
+                    }
                 }
-                Err(_) => break,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    control_open = false;
+                    break;
+                }
+            }
+        }
+        if !running {
+            break;
+        }
+
+        if active.is_none() {
+            if assignment_open {
+                match assignment_rx.try_recv() {
+                    Ok(cmd) => {
+                        running =
+                            handle_worker_command(cmd, &mut active, &mut fence_waiters, &shared);
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => assignment_open = false,
+                }
+            }
+            if !running {
+                break;
+            }
+
+            if active.is_none() {
+                if !assignment_open && !control_open {
+                    break;
+                }
+                if assignment_open && control_open {
+                    crossbeam_channel::select! {
+                        recv(control_rx) -> cmd => match cmd {
+                            Ok(cmd) => {
+                                running = handle_worker_command(cmd, &mut active, &mut fence_waiters, &shared);
+                            }
+                            Err(_) => control_open = false,
+                        },
+                        recv(assignment_rx) -> cmd => match cmd {
+                            Ok(cmd) => {
+                                running = handle_worker_command(cmd, &mut active, &mut fence_waiters, &shared);
+                            }
+                            Err(_) => assignment_open = false,
+                        },
+                    }
+                } else if assignment_open {
+                    match assignment_rx.recv() {
+                        Ok(cmd) => {
+                            running = handle_worker_command(
+                                cmd,
+                                &mut active,
+                                &mut fence_waiters,
+                                &shared,
+                            );
+                        }
+                        Err(_) => assignment_open = false,
+                    }
+                } else if control_open {
+                    match control_rx.recv() {
+                        Ok(cmd) => {
+                            running = handle_worker_command(
+                                cmd,
+                                &mut active,
+                                &mut fence_waiters,
+                                &shared,
+                            );
+                        }
+                        Err(_) => control_open = false,
+                    }
+                }
+                continue;
             }
         }
 
-        while let Ok(cmd) = rx.try_recv() {
-            running = handle_worker_command(cmd, &mut active, &mut fence_waiters, &shared);
-            if !running {
+        loop {
+            let mut handled = false;
+            if control_open {
+                match control_rx.try_recv() {
+                    Ok(cmd) => {
+                        handled = true;
+                        running =
+                            handle_worker_command(cmd, &mut active, &mut fence_waiters, &shared);
+                        if !running {
+                            break;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => control_open = false,
+                }
+            }
+            if assignment_open {
+                match assignment_rx.try_recv() {
+                    Ok(cmd) => {
+                        handled = true;
+                        running =
+                            handle_worker_command(cmd, &mut active, &mut fence_waiters, &shared);
+                        if !running {
+                            break;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => assignment_open = false,
+                }
+            }
+            if !handled {
                 break;
             }
         }
@@ -1427,6 +1737,7 @@ fn load_nvidia_cached_tuning(path: &Path, key: &NvidiaAutotuneKey) -> Option<Nvi
         .max_by_key(|record| record.timestamp_unix_secs)?;
     Some(NvidiaKernelTuning {
         max_rregcount: record.max_rregcount,
+        block_loop_unroll: record.block_loop_unroll,
     })
 }
 
@@ -1449,6 +1760,7 @@ fn persist_nvidia_autotune_record(
     let updated = NvidiaAutotuneRecord {
         key: key.clone(),
         max_rregcount: tuning.max_rregcount.max(1),
+        block_loop_unroll: tuning.block_loop_unroll,
         measured_hps: if measured_hps.is_finite() {
             measured_hps.max(0.0)
         } else {
@@ -1472,12 +1784,8 @@ fn persist_nvidia_autotune_record(
         })?;
     }
     let payload = serde_json::to_string_pretty(&cache)?;
-    fs::write(path, payload).with_context(|| {
-        format!(
-            "failed to write NVIDIA autotune cache '{}'",
-            path.display()
-        )
-    })?;
+    fs::write(path, payload)
+        .with_context(|| format!("failed to write NVIDIA autotune cache '{}'", path.display()))?;
     Ok(())
 }
 
@@ -1524,17 +1832,23 @@ fn autotune_nvidia_kernel_tuning(
     let mut best: Option<(NvidiaKernelTuning, f64)> = None;
 
     for &max_rregcount in NVIDIA_AUTOTUNE_REGCAP_CANDIDATES {
-        let candidate = NvidiaKernelTuning { max_rregcount };
-        let measured = match measure_nvidia_kernel_tuning_hps(selected, candidate, autotune_secs) {
-            Ok(hps) => hps,
-            Err(_) => continue,
-        };
-        if !measured.is_finite() {
-            continue;
-        }
-        match best {
-            Some((_, best_hps)) if measured <= best_hps => {}
-            _ => best = Some((candidate, measured)),
+        for &block_loop_unroll in NVIDIA_AUTOTUNE_LOOP_UNROLL_CANDIDATES {
+            let candidate = NvidiaKernelTuning {
+                max_rregcount,
+                block_loop_unroll,
+            };
+            let measured =
+                match measure_nvidia_kernel_tuning_hps(selected, candidate, autotune_secs) {
+                    Ok(hps) => hps,
+                    Err(_) => continue,
+                };
+            if !measured.is_finite() {
+                continue;
+            }
+            match best {
+                Some((_, best_hps)) if measured <= best_hps => {}
+                _ => best = Some((candidate, measured)),
+            }
         }
     }
 
@@ -1623,7 +1937,10 @@ mod tests {
         persist_nvidia_autotune_record(
             &path,
             key.clone(),
-            NvidiaKernelTuning { max_rregcount: 160 },
+            NvidiaKernelTuning {
+                max_rregcount: 160,
+                block_loop_unroll: false,
+            },
             0.8,
             2,
         )
@@ -1631,7 +1948,10 @@ mod tests {
         persist_nvidia_autotune_record(
             &path,
             key.clone(),
-            NvidiaKernelTuning { max_rregcount: 224 },
+            NvidiaKernelTuning {
+                max_rregcount: 224,
+                block_loop_unroll: true,
+            },
             1.0,
             2,
         )
@@ -1640,6 +1960,7 @@ mod tests {
         let loaded =
             load_nvidia_cached_tuning(&path, &key).expect("cached tuning should be available");
         assert_eq!(loaded.max_rregcount, 224);
+        assert!(loaded.block_loop_unroll);
         let _ = fs::remove_file(path);
     }
 
