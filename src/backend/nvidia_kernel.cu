@@ -713,7 +713,9 @@ __global__ void argon2id_fill_kernel(
     unsigned int m_blocks,
     unsigned int t_cost,
     unsigned long long *__restrict__ lane_memory,
-    unsigned long long *__restrict__ out_last_blocks
+    unsigned long long *__restrict__ out_last_blocks,
+    const volatile unsigned int *__restrict__ cancel_flag,
+    unsigned int *__restrict__ completed_iters
 ) {
     const unsigned int lane = blockIdx.x;
     const unsigned int tid = threadIdx.x;
@@ -737,8 +739,17 @@ __global__ void argon2id_fill_kernel(
     __shared__ unsigned long long zero_block[128];
     __shared__ unsigned long long scratch_r[128];
     __shared__ unsigned long long scratch_q[128];
+    __shared__ unsigned int cancel_requested;
 
     for (unsigned int iter = 0U; iter < lane_launch_iters; ++iter) {
+        if (tid == 0U) {
+            cancel_requested = cancel_flag[0];
+        }
+        coop_sync();
+        if (cancel_requested != 0U) {
+            break;
+        }
+
         const unsigned long long global_hash_idx =
             static_cast<unsigned long long>(iter) * lanes_active +
             static_cast<unsigned long long>(lane);
@@ -878,6 +889,10 @@ __global__ void argon2id_fill_kernel(
         unsigned long long *out = out_last_blocks + global_hash_idx * 128ULL;
         for (unsigned int i = tid; i < 128U; i += ARGON2_COOP_THREADS) {
             out[i] = last[i];
+        }
+        coop_sync();
+        if (tid == 0U) {
+            atomicMax(completed_iters, iter + 1U);
         }
         coop_sync();
     }

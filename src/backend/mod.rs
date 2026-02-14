@@ -32,6 +32,8 @@ pub mod nvidia {
         pub dispatch_iters_per_lane: Option<u64>,
         pub allocation_iters_per_lane: Option<u64>,
         pub hashes_per_launch_per_lane: u32,
+        pub adaptive_launch_depth: bool,
+        pub enforce_template_stop: bool,
     }
 
     pub struct NvidiaBackend {

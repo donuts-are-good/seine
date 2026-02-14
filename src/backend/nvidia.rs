@@ -3,7 +3,7 @@ use std::convert::TryFrom;
 use std::ffi::{c_char, CStr, CString};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,7 +30,7 @@ use crate::backend::{
 };
 const BACKEND_NAME: &str = "nvidia";
 const CUDA_KERNEL_SRC: &str = include_str!("nvidia_kernel.cu");
-const MAX_RECOMMENDED_LANES: usize = 16;
+const MAX_LANES_HARD_LIMIT: usize = 1024;
 const ASSIGN_CHANNEL_CAPACITY: usize = 256;
 const CONTROL_CHANNEL_CAPACITY: usize = 32;
 const EVENT_SEND_WAIT: Duration = Duration::from_millis(5);
@@ -38,7 +38,7 @@ const KERNEL_THREADS: u32 = 32;
 const SEED_KERNEL_THREADS: u32 = 64;
 const EVAL_KERNEL_THREADS: u32 = 64;
 const DEFAULT_NVIDIA_MAX_RREGCOUNT: u32 = 240;
-const NVIDIA_AUTOTUNE_SCHEMA_VERSION: u32 = 5;
+const NVIDIA_AUTOTUNE_SCHEMA_VERSION: u32 = 6;
 const NVIDIA_AUTOTUNE_REGCAP_CANDIDATES: &[u32] = &[240, 224, 208, 192, 160];
 const NVIDIA_AUTOTUNE_LOOP_UNROLL_CANDIDATES: &[bool] = &[false];
 const DEFAULT_NVIDIA_AUTOTUNE_SAMPLES: u32 = 2;
@@ -48,6 +48,14 @@ const NVIDIA_AUTOTUNE_MEMORY_BUCKET_MIB: u64 = 512;
 const DEFAULT_DISPATCH_ITERS_PER_LANE: u64 = 1 << 21;
 const DEFAULT_ALLOCATION_ITERS_PER_LANE: u64 = 1 << 21;
 const DEFAULT_HASHES_PER_LAUNCH_PER_LANE: u32 = 2;
+const ADAPTIVE_DEPTH_PRESSURE_CONTROL_BONUS: u32 = 4;
+const ADAPTIVE_DEPTH_PRESSURE_REPLACE_BONUS: u32 = 2;
+const ADAPTIVE_DEPTH_PRESSURE_DECAY_PER_BATCH: u32 = 1;
+const ADAPTIVE_DEPTH_DEADLINE_SLACK_FRAC: f64 = 0.75;
+
+fn default_hashes_per_launch_per_lane() -> u32 {
+    DEFAULT_HASHES_PER_LAUNCH_PER_LANE
+}
 
 #[derive(Debug, Clone)]
 struct NvidiaDeviceInfo {
@@ -61,6 +69,8 @@ struct NvidiaDeviceInfo {
 struct NvidiaKernelTuning {
     max_rregcount: u32,
     block_loop_unroll: bool,
+    hashes_per_launch_per_lane: u32,
+    max_lanes_hint: Option<usize>,
 }
 
 impl Default for NvidiaKernelTuning {
@@ -68,6 +78,8 @@ impl Default for NvidiaKernelTuning {
         Self {
             max_rregcount: DEFAULT_NVIDIA_MAX_RREGCOUNT,
             block_loop_unroll: false,
+            hashes_per_launch_per_lane: DEFAULT_HASHES_PER_LAUNCH_PER_LANE,
+            max_lanes_hint: None,
         }
     }
 }
@@ -93,6 +105,10 @@ struct NvidiaAutotuneRecord {
     max_rregcount: u32,
     #[serde(default)]
     block_loop_unroll: bool,
+    #[serde(default = "default_hashes_per_launch_per_lane")]
+    hashes_per_launch_per_lane: u32,
+    #[serde(default)]
+    max_lanes_hint: Option<usize>,
     measured_hps: f64,
     autotune_secs: u64,
     #[serde(default)]
@@ -117,6 +133,8 @@ struct NvidiaShared {
     completed_assignments: AtomicU64,
     completed_assignment_hashes: AtomicU64,
     completed_assignment_micros: AtomicU64,
+    active_hashes_per_launch_per_lane: AtomicU32,
+    cancel_requested: AtomicBool,
     error_emitted: AtomicBool,
 }
 
@@ -128,6 +146,8 @@ pub struct NvidiaBackendTuningOptions {
     pub dispatch_iters_per_lane: Option<u64>,
     pub allocation_iters_per_lane: Option<u64>,
     pub hashes_per_launch_per_lane: u32,
+    pub adaptive_launch_depth: bool,
+    pub enforce_template_stop: bool,
 }
 
 impl Default for NvidiaBackendTuningOptions {
@@ -139,6 +159,8 @@ impl Default for NvidiaBackendTuningOptions {
             dispatch_iters_per_lane: None,
             allocation_iters_per_lane: None,
             hashes_per_launch_per_lane: DEFAULT_HASHES_PER_LAUNCH_PER_LANE,
+            adaptive_launch_depth: true,
+            enforce_template_stop: false,
         }
     }
 }
@@ -156,8 +178,34 @@ impl NvidiaShared {
             completed_assignments: AtomicU64::new(0),
             completed_assignment_hashes: AtomicU64::new(0),
             completed_assignment_micros: AtomicU64::new(0),
+            active_hashes_per_launch_per_lane: AtomicU32::new(
+                DEFAULT_HASHES_PER_LAUNCH_PER_LANE,
+            ),
+            cancel_requested: AtomicBool::new(false),
             error_emitted: AtomicBool::new(false),
         }
+    }
+}
+
+#[derive(Clone)]
+struct CudaInterruptController {
+    stream: Arc<CudaStream>,
+    cancel_flag: Arc<Mutex<CudaSlice<u32>>>,
+}
+
+impl CudaInterruptController {
+    fn signal_cancel(&self) -> Result<()> {
+        let mut flag = self
+            .cancel_flag
+            .lock()
+            .map_err(|_| anyhow!("nvidia cancel flag lock poisoned"))?;
+        let mut view = flag
+            .try_slice_mut(0..1)
+            .ok_or_else(|| anyhow!("failed to slice CUDA cancel flag"))?;
+        self.stream
+            .memcpy_htod(&[1u32], &mut view)
+            .map_err(cuda_driver_err)?;
+        Ok(())
     }
 }
 
@@ -227,6 +275,7 @@ struct FillBatchResult {
 
 struct CudaArgon2Engine {
     stream: Arc<CudaStream>,
+    interrupt_stream: Arc<CudaStream>,
     kernel: CudaFunction,
     seed_kernel: CudaFunction,
     evaluate_kernel: CudaFunction,
@@ -241,7 +290,10 @@ struct CudaArgon2Engine {
     nonce_input: CudaSlice<u64>,
     header_base_input: CudaSlice<u8>,
     target_input: CudaSlice<u8>,
+    cancel_flag: Arc<Mutex<CudaSlice<u32>>>,
+    completed_iters: CudaSlice<u32>,
     found_index: CudaSlice<u32>,
+    host_completed_iters: [u32; 1],
     host_found_index: [u32; 1],
 }
 
@@ -258,6 +310,7 @@ impl CudaArgon2Engine {
             anyhow!("failed to open CUDA context on device {device_index}: {err:?}")
         })?;
         let stream = ctx.default_stream();
+        let interrupt_stream = ctx.new_stream().unwrap_or_else(|_| stream.clone());
 
         let (cc_major, cc_minor) = ctx
             .compute_capability()
@@ -304,11 +357,11 @@ impl CudaArgon2Engine {
         let memory_budget_bytes = memory_budget_mib.saturating_mul(1024 * 1024);
         let usable_bytes = memory_budget_bytes;
         let by_memory = usize::try_from((usable_bytes / lane_bytes).max(1)).unwrap_or(1);
-        let max_lanes_budget = by_memory.max(1).min(MAX_RECOMMENDED_LANES);
+        let max_lanes_budget = by_memory.max(1).min(MAX_LANES_HARD_LIMIT);
         let max_lanes = max_lanes_override
             .map(|lanes| lanes.max(1))
             .unwrap_or(max_lanes_budget)
-            .min(MAX_RECOMMENDED_LANES)
+            .min(MAX_LANES_HARD_LIMIT)
             .max(1);
         let lane_stride_words = u64::from(m_blocks).saturating_mul(128);
         let hashes_per_launch_per_lane = hashes_per_launch_per_lane.max(1) as usize;
@@ -323,6 +376,8 @@ impl CudaArgon2Engine {
                     nonce_input,
                     header_base_input,
                     target_input,
+                    cancel_flag,
+                    completed_iters,
                     found_index,
                 )) => {
                     match probe_cuda_lane_memory(
@@ -342,6 +397,8 @@ impl CudaArgon2Engine {
                                     nonce_input,
                                     header_base_input,
                                     target_input,
+                                    cancel_flag,
+                                    completed_iters,
                                     found_index,
                                 ),
                             ));
@@ -382,6 +439,8 @@ impl CudaArgon2Engine {
                 nonce_input,
                 header_base_input,
                 target_input,
+                cancel_flag,
+                completed_iters,
                 found_index,
             ),
         ) = selected
@@ -389,6 +448,7 @@ impl CudaArgon2Engine {
 
         Ok(Self {
             stream,
+            interrupt_stream,
             kernel,
             seed_kernel,
             evaluate_kernel,
@@ -403,7 +463,10 @@ impl CudaArgon2Engine {
             nonce_input,
             header_base_input,
             target_input,
+            cancel_flag: Arc::new(Mutex::new(cancel_flag)),
+            completed_iters,
             found_index,
+            host_completed_iters: [0u32; 1],
             host_found_index: [u32::MAX; 1],
         })
     }
@@ -412,10 +475,21 @@ impl CudaArgon2Engine {
         self.max_lanes
     }
 
+    fn max_hashes_per_launch_per_lane(&self) -> usize {
+        self.hashes_per_launch_per_lane.max(1)
+    }
+
     fn max_hashes_per_launch(&self) -> usize {
         self.max_lanes
             .saturating_mul(self.hashes_per_launch_per_lane)
             .max(1)
+    }
+
+    fn interrupt_controller(&self) -> CudaInterruptController {
+        CudaInterruptController {
+            stream: self.interrupt_stream.clone(),
+            cancel_flag: Arc::clone(&self.cancel_flag),
+        }
     }
 
     fn run_fill_batch(
@@ -453,7 +527,7 @@ impl CudaArgon2Engine {
             );
         }
 
-        let hashes_done = nonces.len();
+        let requested_hashes = nonces.len();
         {
             let mut header_view = self
                 .header_base_input
@@ -466,24 +540,46 @@ impl CudaArgon2Engine {
         {
             let mut nonce_view = self
                 .nonce_input
-                .try_slice_mut(0..hashes_done)
+                .try_slice_mut(0..requested_hashes)
                 .ok_or_else(|| anyhow!("failed to slice CUDA nonce buffer"))?;
             self.stream
                 .memcpy_htod(nonces, &mut nonce_view)
                 .map_err(cuda_driver_err)?;
         }
+        {
+            self.host_completed_iters[0] = 0;
+            let mut completed_view = self
+                .completed_iters
+                .try_slice_mut(0..1)
+                .ok_or_else(|| anyhow!("failed to slice CUDA completed-iter buffer"))?;
+            self.stream
+                .memcpy_htod(&self.host_completed_iters, &mut completed_view)
+                .map_err(cuda_driver_err)?;
+        }
+        {
+            let mut cancel_flag = self
+                .cancel_flag
+                .lock()
+                .map_err(|_| anyhow!("nvidia cancel flag lock poisoned"))?;
+            let mut cancel_view = cancel_flag
+                .try_slice_mut(0..1)
+                .ok_or_else(|| anyhow!("failed to slice CUDA cancel-flag buffer"))?;
+            self.stream
+                .memcpy_htod(&[0u32], &mut cancel_view)
+                .map_err(cuda_driver_err)?;
+        }
 
         let lanes_u32 = u32::try_from(lanes_active).map_err(|_| anyhow!("lane count overflow"))?;
-        let active_hashes_u32 =
-            u32::try_from(hashes_done).map_err(|_| anyhow!("active hash count overflow"))?;
+        let requested_hashes_u32 =
+            u32::try_from(requested_hashes).map_err(|_| anyhow!("active hash count overflow"))?;
         let lane_launch_iters_u32 = u32::try_from(
-            hashes_done
+            requested_hashes
                 .saturating_add(lanes_active.saturating_sub(1))
                 .saturating_div(lanes_active),
         )
         .map_err(|_| anyhow!("lane launch iteration overflow"))?;
         {
-            let grid = active_hashes_u32
+            let grid = requested_hashes_u32
                 .saturating_add(SEED_KERNEL_THREADS.saturating_sub(1))
                 .saturating_div(SEED_KERNEL_THREADS)
                 .max(1);
@@ -498,7 +594,7 @@ impl CudaArgon2Engine {
                     .arg(&self.header_base_input)
                     .arg(&(POW_HEADER_BASE_LEN as u32))
                     .arg(&self.nonce_input)
-                    .arg(&active_hashes_u32)
+                    .arg(&requested_hashes_u32)
                     .arg(&self.m_cost_kib)
                     .arg(&self.t_cost)
                     .arg(&self.seed_blocks);
@@ -515,20 +611,46 @@ impl CudaArgon2Engine {
                 shared_mem_bytes: 0,
             };
 
+            let cancel_flag = self
+                .cancel_flag
+                .lock()
+                .map_err(|_| anyhow!("nvidia cancel flag lock poisoned"))?;
             unsafe {
                 let mut launch = self.stream.launch_builder(&self.kernel);
                 launch
                     .arg(&self.seed_blocks)
                     .arg(&lanes_u32)
-                    .arg(&active_hashes_u32)
+                    .arg(&requested_hashes_u32)
                     .arg(&lane_launch_iters_u32)
                     .arg(&self.m_blocks)
                     .arg(&self.t_cost)
                     .arg(&mut self.lane_memory)
-                    .arg(&mut self.last_blocks);
+                    .arg(&mut self.last_blocks)
+                    .arg(&*cancel_flag)
+                    .arg(&mut self.completed_iters);
                 launch.launch(cfg).map_err(cuda_driver_err)?;
             }
         }
+        {
+            let completed_view = self
+                .completed_iters
+                .try_slice(0..1)
+                .ok_or_else(|| anyhow!("failed to slice CUDA completed-iter buffer"))?;
+            self.stream
+                .memcpy_dtoh(&completed_view, &mut self.host_completed_iters)
+                .map_err(cuda_driver_err)?;
+        }
+
+        let completed_iters = self.host_completed_iters[0].min(lane_launch_iters_u32) as usize;
+        let hashes_done = requested_hashes.min(completed_iters.saturating_mul(lanes_active));
+        if hashes_done == 0 {
+            return Ok(FillBatchResult {
+                hashes_done: 0,
+                solved_nonce: None,
+            });
+        }
+        let evaluated_hashes_u32 =
+            u32::try_from(hashes_done).map_err(|_| anyhow!("active hash count overflow"))?;
 
         let mut solved_nonce = None;
         if let Some(target_hash) = target {
@@ -552,7 +674,7 @@ impl CudaArgon2Engine {
                     .map_err(cuda_driver_err)?;
             }
             {
-                let grid = active_hashes_u32
+                let grid = evaluated_hashes_u32
                     .saturating_add(EVAL_KERNEL_THREADS.saturating_sub(1))
                     .saturating_div(EVAL_KERNEL_THREADS)
                     .max(1);
@@ -565,7 +687,7 @@ impl CudaArgon2Engine {
                     let mut launch = self.stream.launch_builder(&self.evaluate_kernel);
                     launch
                         .arg(&self.last_blocks)
-                        .arg(&active_hashes_u32)
+                        .arg(&evaluated_hashes_u32)
                         .arg(&self.target_input)
                         .arg(&mut self.found_index);
                     launch.launch(cfg).map_err(cuda_driver_err)?;
@@ -582,12 +704,10 @@ impl CudaArgon2Engine {
             }
             if self.host_found_index[0] != u32::MAX && self.host_found_index[0] > 0 {
                 let idx = (self.host_found_index[0] - 1) as usize;
-                if idx < nonces.len() {
+                if idx < hashes_done {
                     solved_nonce = Some(nonces[idx]);
                 }
             }
-        } else {
-            self.stream.synchronize().map_err(cuda_driver_err)?;
         }
 
         Ok(FillBatchResult {
@@ -607,10 +727,11 @@ pub struct NvidiaBackend {
     kernel_tuning: RwLock<Option<NvidiaKernelTuning>>,
     shared: Arc<NvidiaShared>,
     nonblocking_control: Mutex<NonblockingControlState>,
+    interrupt_controller: RwLock<Option<CudaInterruptController>>,
     worker: Mutex<Option<NvidiaWorker>>,
     max_lanes: AtomicUsize,
     pinned_lanes: AtomicUsize,
-    hashes_per_launch_per_lane: u32,
+    max_hashes_per_launch_per_lane: AtomicU32,
 }
 
 impl NvidiaBackend {
@@ -634,15 +755,20 @@ impl NvidiaBackend {
                     .allocation_iters_per_lane
                     .filter(|v| *v > 0),
                 hashes_per_launch_per_lane: tuning_options.hashes_per_launch_per_lane.max(1),
+                adaptive_launch_depth: tuning_options.adaptive_launch_depth,
+                enforce_template_stop: tuning_options.enforce_template_stop,
             },
             resolved_device: RwLock::new(None),
             kernel_tuning: RwLock::new(None),
             shared: Arc::new(NvidiaShared::new()),
             nonblocking_control: Mutex::new(NonblockingControlState::default()),
+            interrupt_controller: RwLock::new(None),
             worker: Mutex::new(None),
             max_lanes: AtomicUsize::new(1),
             pinned_lanes: AtomicUsize::new(0),
-            hashes_per_launch_per_lane: tuning_options.hashes_per_launch_per_lane.max(1),
+            max_hashes_per_launch_per_lane: AtomicU32::new(
+                tuning_options.hashes_per_launch_per_lane.max(1),
+            ),
         }
     }
 
@@ -812,10 +938,12 @@ impl NvidiaBackend {
         }
 
         if let Some(forced_rregcount) = self.tuning_options.max_rregcount_override {
-            let forced = NvidiaKernelTuning {
+            let forced = self.apply_runtime_tuning_overrides(NvidiaKernelTuning {
                 max_rregcount: forced_rregcount.max(1),
                 block_loop_unroll: false,
-            };
+                hashes_per_launch_per_lane: self.tuning_options.hashes_per_launch_per_lane.max(1),
+                max_lanes_hint: self.resolve_max_lanes_override(),
+            });
             if let Ok(mut slot) = self.kernel_tuning.write() {
                 *slot = Some(forced);
             }
@@ -824,25 +952,42 @@ impl NvidiaBackend {
 
         let key = build_nvidia_autotune_key(selected);
         if let Some(cached) = load_nvidia_cached_tuning(&self.autotune_config_path, &key) {
+            let cached = self.apply_runtime_tuning_overrides(cached);
             if let Ok(mut slot) = self.kernel_tuning.write() {
                 *slot = Some(cached);
             }
             return cached;
         }
 
-        let tuned = autotune_nvidia_kernel_tuning(
-            selected,
-            &self.autotune_config_path,
-            self.autotune_secs,
-            self.tuning_options.autotune_samples,
-            self.resolve_max_lanes_override(),
-            self.tuning_options.hashes_per_launch_per_lane,
-        )
-        .unwrap_or_else(|_| NvidiaKernelTuning::default());
+        let tuned = self.apply_runtime_tuning_overrides(
+            autotune_nvidia_kernel_tuning(
+                selected,
+                &self.autotune_config_path,
+                self.autotune_secs,
+                self.tuning_options.autotune_samples,
+                self.resolve_max_lanes_override(),
+                self.tuning_options.hashes_per_launch_per_lane,
+            )
+            .unwrap_or_else(|_| NvidiaKernelTuning::default()),
+        );
         if let Ok(mut slot) = self.kernel_tuning.write() {
             *slot = Some(tuned);
         }
         tuned
+    }
+
+    fn apply_runtime_tuning_overrides(&self, mut tuning: NvidiaKernelTuning) -> NvidiaKernelTuning {
+        tuning.max_rregcount = tuning.max_rregcount.max(1);
+        tuning.hashes_per_launch_per_lane = tuning
+            .hashes_per_launch_per_lane
+            .max(1)
+            .min(self.tuning_options.hashes_per_launch_per_lane.max(1));
+        if let Some(forced) = self.tuning_options.max_lanes_override {
+            tuning.max_lanes_hint = Some(forced.max(1));
+        } else if tuning.max_lanes_hint.is_none() {
+            tuning.max_lanes_hint = self.resolve_max_lanes_override();
+        }
+        tuning
     }
 
     fn resolve_max_lanes_override(&self) -> Option<usize> {
@@ -908,8 +1053,8 @@ impl PowBackend for NvidiaBackend {
             selected.memory_total_mib,
             selected.memory_free_mib,
             tuning,
-            self.resolve_max_lanes_override(),
-            self.tuning_options.hashes_per_launch_per_lane,
+            tuning.max_lanes_hint,
+            tuning.hashes_per_launch_per_lane,
         )
         .with_context(|| {
             format!(
@@ -919,9 +1064,13 @@ impl PowBackend for NvidiaBackend {
         })?;
 
         let discovered_lanes = engine.max_lanes().max(1);
+        let discovered_hashes_per_launch = engine.max_hashes_per_launch_per_lane() as u32;
+        let interrupt_controller = engine.interrupt_controller();
         self.max_lanes.store(discovered_lanes, Ordering::Release);
         self.pinned_lanes
             .fetch_max(discovered_lanes, Ordering::AcqRel);
+        self.max_hashes_per_launch_per_lane
+            .store(discovered_hashes_per_launch.max(1), Ordering::Release);
 
         self.shared.error_emitted.store(false, Ordering::Release);
         self.shared.hashes.store(0, Ordering::Release);
@@ -930,8 +1079,15 @@ impl PowBackend for NvidiaBackend {
         self.shared
             .inflight_assignment_hashes
             .store(0, Ordering::Release);
+        self.shared
+            .active_hashes_per_launch_per_lane
+            .store(discovered_hashes_per_launch.max(1), Ordering::Release);
+        self.shared.cancel_requested.store(false, Ordering::Release);
         if let Ok(mut slot) = self.shared.inflight_assignment_started_at.lock() {
             *slot = None;
+        }
+        if let Ok(mut slot) = self.interrupt_controller.write() {
+            *slot = Some(interrupt_controller);
         }
         self.clear_nonblocking_control_state();
 
@@ -939,12 +1095,24 @@ impl PowBackend for NvidiaBackend {
         let (control_tx, control_rx) = bounded::<WorkerCommand>(CONTROL_CHANNEL_CAPACITY);
         let shared = Arc::clone(&self.shared);
         let instance_id = Arc::clone(&self.instance_id);
+        let adaptive_launch_depth = self.tuning_options.adaptive_launch_depth;
+        let enforce_template_stop = self.tuning_options.enforce_template_stop;
         let handle = thread::Builder::new()
             .name(format!(
                 "seine-nvidia-worker-{}",
                 self.instance_id.load(Ordering::Acquire)
             ))
-            .spawn(move || worker_loop(&mut engine, assignment_rx, control_rx, shared, instance_id))
+            .spawn(move || {
+                worker_loop(
+                    &mut engine,
+                    assignment_rx,
+                    control_rx,
+                    shared,
+                    instance_id,
+                    adaptive_launch_depth,
+                    enforce_template_stop,
+                )
+            })
             .map_err(|err| anyhow!("failed to spawn nvidia worker thread: {err}"))?;
 
         let mut guard = self
@@ -971,6 +1139,9 @@ impl PowBackend for NvidiaBackend {
             }
             let _ = worker.handle.join();
         }
+        if let Ok(mut slot) = self.interrupt_controller.write() {
+            *slot = None;
+        }
         self.clear_nonblocking_control_state();
 
         self.shared.active_lanes.store(0, Ordering::Release);
@@ -978,6 +1149,15 @@ impl PowBackend for NvidiaBackend {
         self.shared
             .inflight_assignment_hashes
             .store(0, Ordering::Release);
+        self.shared
+            .active_hashes_per_launch_per_lane
+            .store(
+                self.max_hashes_per_launch_per_lane
+                    .load(Ordering::Acquire)
+                    .max(1),
+                Ordering::Release,
+            );
+        self.shared.cancel_requested.store(false, Ordering::Release);
         if let Ok(mut slot) = self.shared.inflight_assignment_started_at.lock() {
             *slot = None;
         }
@@ -1090,6 +1270,15 @@ impl PowBackend for NvidiaBackend {
     }
 
     fn request_timeout_interrupt(&self) -> Result<()> {
+        self.shared.cancel_requested.store(true, Ordering::Release);
+        if let Some(controller) = self
+            .interrupt_controller
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().cloned())
+        {
+            let _ = controller.signal_cancel();
+        }
         let tx = match self.worker_control_tx() {
             Ok(tx) => tx,
             Err(_) => return Ok(()),
@@ -1147,7 +1336,11 @@ impl PowBackend for NvidiaBackend {
     }
 
     fn preemption_granularity(&self) -> PreemptionGranularity {
-        let per_launch = self.hashes_per_launch_per_lane.max(1) as u64;
+        let per_launch = self
+            .shared
+            .active_hashes_per_launch_per_lane
+            .load(Ordering::Acquire)
+            .max(1) as u64;
         PreemptionGranularity::Hashes((self.lanes() as u64).saturating_mul(per_launch).max(1))
     }
 
@@ -1193,8 +1386,8 @@ impl BenchBackend for NvidiaBackend {
             selected.memory_total_mib,
             selected.memory_free_mib,
             tuning,
-            self.resolve_max_lanes_override(),
-            self.tuning_options.hashes_per_launch_per_lane,
+            tuning.max_lanes_hint,
+            tuning.hashes_per_launch_per_lane,
         )
         .with_context(|| {
             format!(
@@ -1233,6 +1426,8 @@ fn worker_loop(
     control_rx: Receiver<WorkerCommand>,
     shared: Arc<NvidiaShared>,
     instance_id: Arc<AtomicU64>,
+    adaptive_launch_depth: bool,
+    enforce_template_stop: bool,
 ) {
     let mut active: Option<ActiveAssignment> = None;
     let mut queued: VecDeque<WorkAssignment> = VecDeque::new();
@@ -1240,7 +1435,13 @@ fn worker_loop(
     let mut assignment_open = true;
     let mut control_open = true;
     let mut running = true;
+    let mut adaptive_pressure = 0u32;
     let mut nonce_buf = vec![0u64; engine.max_hashes_per_launch()];
+    let max_launch_depth = engine.max_hashes_per_launch_per_lane().max(1);
+
+    shared
+        .active_hashes_per_launch_per_lane
+        .store(max_launch_depth as u32, Ordering::Release);
 
     while running {
         while control_open {
@@ -1252,6 +1453,7 @@ fn worker_loop(
                         &mut queued,
                         &mut fence_waiters,
                         &shared,
+                        &mut adaptive_pressure,
                     );
                     if !running {
                         break;
@@ -1278,6 +1480,7 @@ fn worker_loop(
                             &mut queued,
                             &mut fence_waiters,
                             &shared,
+                            &mut adaptive_pressure,
                         );
                     }
                     Err(TryRecvError::Empty) => {}
@@ -1302,6 +1505,7 @@ fn worker_loop(
                                     &mut queued,
                                     &mut fence_waiters,
                                     &shared,
+                                    &mut adaptive_pressure,
                                 );
                             }
                             Err(_) => control_open = false,
@@ -1314,6 +1518,7 @@ fn worker_loop(
                                     &mut queued,
                                     &mut fence_waiters,
                                     &shared,
+                                    &mut adaptive_pressure,
                                 );
                             }
                             Err(_) => assignment_open = false,
@@ -1328,6 +1533,7 @@ fn worker_loop(
                                 &mut queued,
                                 &mut fence_waiters,
                                 &shared,
+                                &mut adaptive_pressure,
                             );
                         }
                         Err(_) => assignment_open = false,
@@ -1341,6 +1547,7 @@ fn worker_loop(
                                 &mut queued,
                                 &mut fence_waiters,
                                 &shared,
+                                &mut adaptive_pressure,
                             );
                         }
                         Err(_) => control_open = false,
@@ -1362,6 +1569,7 @@ fn worker_loop(
                             &mut queued,
                             &mut fence_waiters,
                             &shared,
+                            &mut adaptive_pressure,
                         );
                         if !running {
                             break;
@@ -1381,6 +1589,7 @@ fn worker_loop(
                             &mut queued,
                             &mut fence_waiters,
                             &shared,
+                            &mut adaptive_pressure,
                         );
                         if !running {
                             break;
@@ -1399,6 +1608,19 @@ fn worker_loop(
             break;
         }
 
+        if shared.cancel_requested.swap(false, Ordering::AcqRel) {
+            if let Some(current) = active.as_ref() {
+                finalize_active_assignment(&shared, current, 0);
+            }
+            active = None;
+            queued.clear();
+            clear_worker_pending_state(&shared);
+            drain_fence_waiters(&mut fence_waiters, Ok(()));
+            adaptive_pressure =
+                adaptive_pressure.saturating_add(ADAPTIVE_DEPTH_PRESSURE_CONTROL_BONUS);
+            continue;
+        }
+
         let Some(current) = active.as_mut() else {
             continue;
         };
@@ -1415,7 +1637,7 @@ fn worker_loop(
             continue;
         }
 
-        if Instant::now() >= current.work.template.stop_at {
+        if enforce_template_stop && Instant::now() >= current.work.template.stop_at {
             queued.clear();
             finalize_active_assignment(&shared, current, 0);
             active = None;
@@ -1423,8 +1645,37 @@ fn worker_loop(
             continue;
         }
 
-        let hashes_per_batch = engine
-            .max_hashes_per_launch()
+        let mut hashes_per_launch_per_lane = max_launch_depth;
+        if adaptive_launch_depth {
+            let pressure_levels =
+                adaptive_pressure / ADAPTIVE_DEPTH_PRESSURE_CONTROL_BONUS.max(1);
+            for _ in 0..pressure_levels {
+                hashes_per_launch_per_lane =
+                    (hashes_per_launch_per_lane.saturating_add(1) / 2).max(1);
+            }
+
+            if enforce_template_stop {
+                let elapsed = current.started_at.elapsed();
+                let window = current
+                    .work
+                    .template
+                    .stop_at
+                    .saturating_duration_since(current.started_at);
+                if window > Duration::ZERO
+                    && elapsed.as_secs_f64()
+                        >= window.as_secs_f64() * ADAPTIVE_DEPTH_DEADLINE_SLACK_FRAC
+                {
+                    hashes_per_launch_per_lane = 1;
+                }
+            }
+        }
+        hashes_per_launch_per_lane = hashes_per_launch_per_lane.max(1);
+
+        let max_hashes_for_depth = engine
+            .max_lanes()
+            .saturating_mul(hashes_per_launch_per_lane)
+            .max(1);
+        let hashes_per_batch = max_hashes_for_depth
             .min(current.remaining as usize)
             .max(1);
         if nonce_buf.len() < hashes_per_batch {
@@ -1435,9 +1686,16 @@ fn worker_loop(
         }
 
         let active_lanes = engine.max_lanes().min(hashes_per_batch).max(1);
+        let effective_launch_depth = hashes_per_batch
+            .saturating_add(active_lanes.saturating_sub(1))
+            .saturating_div(active_lanes)
+            .max(1);
         shared
             .active_lanes
             .store(active_lanes as u64, Ordering::Release);
+        shared
+            .active_hashes_per_launch_per_lane
+            .store(effective_launch_depth as u32, Ordering::Release);
 
         let done = match engine.run_fill_batch(
             current.work.template.header_base.as_ref(),
@@ -1455,12 +1713,23 @@ fn worker_loop(
             }
         };
 
+        adaptive_pressure =
+            adaptive_pressure.saturating_sub(ADAPTIVE_DEPTH_PRESSURE_DECAY_PER_BATCH);
+
         if done.hashes_done == 0 {
-            let next_pending = queued.len() as u64;
+            let timeout_cancelled = shared.cancel_requested.swap(false, Ordering::AcqRel);
+            let next_pending = if timeout_cancelled { 0 } else { queued.len() as u64 };
+            if timeout_cancelled {
+                queued.clear();
+                adaptive_pressure =
+                    adaptive_pressure.saturating_add(ADAPTIVE_DEPTH_PRESSURE_CONTROL_BONUS);
+            }
             finalize_active_assignment(&shared, current, next_pending);
-            if let Some(next) = queued.pop_front() {
-                activate_assignment(&shared, &mut active, next, queued.len() as u64 + 1);
-                continue;
+            if !timeout_cancelled {
+                if let Some(next) = queued.pop_front() {
+                    activate_assignment(&shared, &mut active, next, queued.len() as u64 + 1);
+                    continue;
+                }
             }
             active = None;
             drain_fence_waiters(&mut fence_waiters, Ok(()));
@@ -1514,17 +1783,27 @@ fn handle_worker_command(
     queued: &mut VecDeque<WorkAssignment>,
     fence_waiters: &mut Vec<Sender<Result<()>>>,
     shared: &NvidiaShared,
+    adaptive_pressure: &mut u32,
 ) -> bool {
     match cmd {
         WorkerCommand::Assign(work) => {
+            shared.cancel_requested.store(false, Ordering::Release);
+            *adaptive_pressure = adaptive_pressure
+                .saturating_add(ADAPTIVE_DEPTH_PRESSURE_REPLACE_BONUS);
             replace_assignment_queue(shared, active, queued, vec![work]);
             true
         }
         WorkerCommand::AssignBatch(work) => {
+            shared.cancel_requested.store(false, Ordering::Release);
+            *adaptive_pressure = adaptive_pressure
+                .saturating_add(ADAPTIVE_DEPTH_PRESSURE_REPLACE_BONUS);
             replace_assignment_queue(shared, active, queued, work);
             true
         }
         WorkerCommand::Cancel(ack) => {
+            shared.cancel_requested.store(false, Ordering::Release);
+            *adaptive_pressure = adaptive_pressure
+                .saturating_add(ADAPTIVE_DEPTH_PRESSURE_CONTROL_BONUS);
             if let Some(current) = active.as_ref() {
                 finalize_active_assignment(shared, current, 0);
                 *active = None;
@@ -1538,6 +1817,8 @@ fn handle_worker_command(
             true
         }
         WorkerCommand::Fence(ack) => {
+            *adaptive_pressure = adaptive_pressure
+                .saturating_add(ADAPTIVE_DEPTH_PRESSURE_CONTROL_BONUS);
             if active.is_none() && queued.is_empty() {
                 let _ = ack.send(Ok(()));
             } else {
@@ -1930,7 +2211,11 @@ fn lane_capacity_tier_from_lanes(lanes: usize) -> u32 {
         2 | 3 => 2,
         4..=7 => 4,
         8..=15 => 8,
-        _ => 16,
+        16..=23 => 16,
+        24..=31 => 24,
+        32..=47 => 32,
+        48..=63 => 48,
+        _ => 64,
     }
 }
 
@@ -1939,7 +2224,7 @@ fn derive_lane_capacity_tier(memory_budget_mib: u64, m_cost_kib: u32) -> u32 {
     let memory_budget_bytes = memory_budget_mib.saturating_mul(1024 * 1024);
     let lanes = usize::try_from((memory_budget_bytes / lane_bytes).max(1))
         .unwrap_or(usize::MAX)
-        .min(MAX_RECOMMENDED_LANES)
+        .min(MAX_LANES_HARD_LIMIT)
         .max(1);
     lane_capacity_tier_from_lanes(lanes)
 }
@@ -1958,6 +2243,8 @@ fn try_allocate_cuda_buffers(
         CudaSlice<u8>,
         CudaSlice<u8>,
         CudaSlice<u32>,
+        CudaSlice<u32>,
+        CudaSlice<u32>,
     ),
     DriverError,
 > {
@@ -1974,6 +2261,8 @@ fn try_allocate_cuda_buffers(
     let nonce_input = unsafe { stream.alloc::<u64>(launch_capacity) }?;
     let header_base_input = unsafe { stream.alloc::<u8>(POW_HEADER_BASE_LEN) }?;
     let target_input = unsafe { stream.alloc::<u8>(POW_OUTPUT_LEN) }?;
+    let cancel_flag = unsafe { stream.alloc::<u32>(1) }?;
+    let completed_iters = unsafe { stream.alloc::<u32>(1) }?;
     let found_index = unsafe { stream.alloc::<u32>(1) }?;
     Ok((
         lane_memory,
@@ -1982,6 +2271,8 @@ fn try_allocate_cuda_buffers(
         nonce_input,
         header_base_input,
         target_input,
+        cancel_flag,
+        completed_iters,
         found_index,
     ))
 }
@@ -2069,6 +2360,8 @@ fn load_nvidia_cached_tuning(path: &Path, key: &NvidiaAutotuneKey) -> Option<Nvi
     Some(NvidiaKernelTuning {
         max_rregcount: record.max_rregcount,
         block_loop_unroll: record.block_loop_unroll,
+        hashes_per_launch_per_lane: record.hashes_per_launch_per_lane.max(1),
+        max_lanes_hint: record.max_lanes_hint,
     })
 }
 
@@ -2093,6 +2386,8 @@ fn persist_nvidia_autotune_record(
         key: key.clone(),
         max_rregcount: tuning.max_rregcount.max(1),
         block_loop_unroll: tuning.block_loop_unroll,
+        hashes_per_launch_per_lane: tuning.hashes_per_launch_per_lane.max(1),
+        max_lanes_hint: tuning.max_lanes_hint.filter(|lanes| *lanes > 0),
         measured_hps: if measured_hps.is_finite() {
             measured_hps.max(0.0)
         } else {
@@ -2126,16 +2421,14 @@ fn measure_nvidia_kernel_tuning_hps(
     selected: &NvidiaDeviceInfo,
     tuning: NvidiaKernelTuning,
     secs: u64,
-    max_lanes_override: Option<usize>,
-    hashes_per_launch_per_lane: u32,
 ) -> Result<f64> {
     let mut engine = CudaArgon2Engine::new(
         selected.index,
         selected.memory_total_mib,
         selected.memory_free_mib,
         tuning,
-        max_lanes_override,
-        hashes_per_launch_per_lane,
+        tuning.max_lanes_hint,
+        tuning.hashes_per_launch_per_lane,
     )?;
     let header = [0u8; POW_HEADER_BASE_LEN];
     let start = Instant::now();
@@ -2161,6 +2454,55 @@ fn measure_nvidia_kernel_tuning_hps(
     Ok(total as f64 / elapsed)
 }
 
+fn estimated_lane_capacity(selected: &NvidiaDeviceInfo, m_cost_kib: u32) -> usize {
+    let lane_bytes = CPU_LANE_MEMORY_BYTES.max(u64::from(m_cost_kib).saturating_mul(1024));
+    let memory_budget_mib = derive_memory_budget_mib(selected.memory_total_mib, selected.memory_free_mib);
+    let memory_budget_bytes = memory_budget_mib.saturating_mul(1024 * 1024);
+    usize::try_from((memory_budget_bytes / lane_bytes).max(1))
+        .unwrap_or(usize::MAX)
+        .min(MAX_LANES_HARD_LIMIT)
+        .max(1)
+}
+
+fn build_autotune_hash_depth_candidates(max_hashes_per_launch_per_lane: u32) -> Vec<u32> {
+    let max_hashes = max_hashes_per_launch_per_lane.max(1);
+    let mut candidates = vec![max_hashes];
+    if max_hashes > 1 {
+        candidates.push(((max_hashes + 1) / 2).max(1));
+        candidates.push(1);
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates.reverse();
+    candidates
+}
+
+fn build_autotune_lane_candidates(
+    selected: &NvidiaDeviceInfo,
+    forced_max_lanes: Option<usize>,
+    m_cost_kib: u32,
+) -> Vec<Option<usize>> {
+    if let Some(forced) = forced_max_lanes {
+        return vec![Some(forced.max(1).min(MAX_LANES_HARD_LIMIT))];
+    }
+
+    let estimated = estimated_lane_capacity(selected, m_cost_kib);
+    let mut candidates = vec![None, Some(estimated)];
+    if estimated >= 4 {
+        candidates.push(Some((estimated.saturating_mul(3) / 4).max(1)));
+    }
+    if estimated >= 8 {
+        candidates.push(Some((estimated / 2).max(1)));
+    }
+    candidates.sort_unstable_by(|a, b| {
+        let lhs = a.unwrap_or(usize::MAX);
+        let rhs = b.unwrap_or(usize::MAX);
+        rhs.cmp(&lhs)
+    });
+    candidates.dedup();
+    candidates
+}
+
 fn autotune_nvidia_kernel_tuning(
     selected: &NvidiaDeviceInfo,
     cache_path: &Path,
@@ -2171,42 +2513,53 @@ fn autotune_nvidia_kernel_tuning(
 ) -> Result<NvidiaKernelTuning> {
     let mut best: Option<(NvidiaKernelTuning, f64, f64)> = None;
     let sample_count = autotune_samples.max(1);
+    let (m_cost_kib, _) = pow_params()
+        .map(|params| (params.m_cost(), params.t_cost()))
+        .unwrap_or((0, 0));
+    let lane_candidates = build_autotune_lane_candidates(selected, max_lanes_override, m_cost_kib);
+    let hash_depth_candidates =
+        build_autotune_hash_depth_candidates(hashes_per_launch_per_lane.max(1));
 
     for &max_rregcount in NVIDIA_AUTOTUNE_REGCAP_CANDIDATES {
         for &block_loop_unroll in NVIDIA_AUTOTUNE_LOOP_UNROLL_CANDIDATES {
-            let candidate = NvidiaKernelTuning {
-                max_rregcount,
-                block_loop_unroll,
-            };
-            let mut samples = Vec::with_capacity(sample_count as usize);
-            for _ in 0..sample_count {
-                let measured = match measure_nvidia_kernel_tuning_hps(
-                    selected,
-                    candidate,
-                    autotune_secs,
-                    max_lanes_override,
-                    hashes_per_launch_per_lane,
-                ) {
-                    Ok(hps) if hps.is_finite() => hps,
-                    _ => continue,
-                };
-                samples.push(measured);
-            }
-            if samples.is_empty() {
-                continue;
-            }
-            samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median = if samples.len().is_multiple_of(2) {
-                let mid = samples.len() / 2;
-                (samples[mid - 1] + samples[mid]) / 2.0
-            } else {
-                samples[samples.len() / 2]
-            };
-            let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-            match best {
-                Some((_, best_median, best_mean))
-                    if median < best_median || (median == best_median && mean <= best_mean) => {}
-                _ => best = Some((candidate, median, mean)),
+            for hashes_per_launch_per_lane in hash_depth_candidates.iter().copied() {
+                for max_lanes_hint in lane_candidates.iter().copied() {
+                    let candidate = NvidiaKernelTuning {
+                        max_rregcount,
+                        block_loop_unroll,
+                        hashes_per_launch_per_lane,
+                        max_lanes_hint,
+                    };
+                    let mut samples = Vec::with_capacity(sample_count as usize);
+                    for _ in 0..sample_count {
+                        let measured = match measure_nvidia_kernel_tuning_hps(
+                            selected,
+                            candidate,
+                            autotune_secs,
+                        ) {
+                            Ok(hps) if hps.is_finite() => hps,
+                            _ => continue,
+                        };
+                        samples.push(measured);
+                    }
+                    if samples.is_empty() {
+                        continue;
+                    }
+                    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let median = if samples.len().is_multiple_of(2) {
+                        let mid = samples.len() / 2;
+                        (samples[mid - 1] + samples[mid]) / 2.0
+                    } else {
+                        samples[samples.len() / 2]
+                    };
+                    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+                    match best {
+                        Some((_, best_median, best_mean))
+                            if median < best_median
+                                || (median == best_median && mean <= best_mean) => {}
+                        _ => best = Some((candidate, median, mean)),
+                    }
+                }
             }
         }
     }
@@ -2304,6 +2657,8 @@ mod tests {
             NvidiaKernelTuning {
                 max_rregcount: 160,
                 block_loop_unroll: false,
+                hashes_per_launch_per_lane: 2,
+                max_lanes_hint: None,
             },
             0.8,
             2,
@@ -2316,6 +2671,8 @@ mod tests {
             NvidiaKernelTuning {
                 max_rregcount: 224,
                 block_loop_unroll: true,
+                hashes_per_launch_per_lane: 2,
+                max_lanes_hint: None,
             },
             1.0,
             2,

@@ -1030,6 +1030,8 @@ fn build_backend_instances(cfg: &Config) -> Vec<(BackendSpec, Arc<dyn PowBackend
                             dispatch_iters_per_lane: cfg.nvidia_dispatch_iters_per_lane,
                             allocation_iters_per_lane: cfg.nvidia_allocation_iters_per_lane,
                             hashes_per_launch_per_lane: cfg.nvidia_hashes_per_launch_per_lane,
+                            adaptive_launch_depth: true,
+                            enforce_template_stop: cfg.strict_round_accounting,
                         },
                     )) as Arc<dyn PowBackend>
                 }
