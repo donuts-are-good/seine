@@ -10,13 +10,16 @@ This log tracks every measurable NVIDIA backend optimization attempt so we can i
 
 ## Current Best Known Config
 - Commit: `working tree` (post-pass)
-- Kernel model: cooperative per-lane execution (`32` threads/lane block)
+- Kernel model: cooperative per-lane execution (`32` threads/lane block) with full-warp compression mapping (`8` states x `4` threads/state)
 - NVRTC flags include: `--maxrregcount=<autotuned>`, `-DSEINE_FIXED_M_BLOCKS=2097152U`, `-DSEINE_FIXED_T_COST=1U`
-- NVIDIA autotune schema: `3`; regcap sweep: `240/224/208/192/160` (autotune key now also includes CUDA compute capability; local cache currently selected `160`)
+- NVIDIA autotune schema: `4`; regcap sweep: `240/224/208/192/160`
+  - Autotune key includes CUDA compute capability and effective memory budget.
+  - Candidate scoring uses median across `nvidia_autotune_samples` (default `2`) with mean tie-break.
 - Startup lane sizing now uses free-VRAM-aware budgeting with a small reserve (`max(total/64, 64 MiB)`)
 - Kernel hot path writes compression output directly to destination memory (no `block_tmp` shared staging buffer)
 - Runtime hot path: no explicit pre-`memcpy_dtoh` stream synchronize in `run_fill_batch`
-- Observed best 3-round average so far: `1.214 H/s` (2026-02-13)
+- Default launch depth: `nvidia_hashes_per_launch_per_lane=2` (override to `1` for finer preemption).
+- Observed best 3-round averages so far (2026-02-14): kernel `1.600 H/s`, backend `1.503 H/s` (counted-window + fence accounting)
 
 ## Attempt History
 | Date | Commit/State | Change | Result | Outcome |
@@ -49,6 +52,9 @@ This log tracks every measurable NVIDIA backend optimization attempt so we can i
 | 2026-02-14 | working tree | True NVIDIA batch queueing (no collapse), free-VRAM-aware lane budgeting (`derive_memory_budget_mib`), autotune key/schema update (`schema=3`, include compute capability) | fresh baseline: kernel `0.964 H/s`, backend `1.045 H/s`; clean kernel candidates `1.149/1.117/1.155 H/s`; backend candidates `1.183/1.171/1.164 H/s` (additional low-clock samples `1.044/1.044 H/s`) | Kept (kernel mean `+18.29%`; backend mean `+7.29%` across all clean samples; queueing correctness + OOM resilience improved) |
 | 2026-02-14 | working tree | Deadline-tail dynamic lane throttling via per-assignment hash-time EMA | kernel candidate `0.881 H/s`; backend candidate `0.880 H/s` vs same-pass baseline `0.964/1.045 H/s` | Reverted (clear throughput regression; reduced late shares but hurt total H/s) |
 | 2026-02-14 | working tree | Little-endian memcpy fast path for seed-word expansion + final block byte packing | kernel `1.136 H/s` vs local kept-state `1.117 H/s`; backend `1.167 H/s` vs local kept-state `1.171 H/s` | Reverted (backend delta `-0.34%`, below keep gate and negative) |
+| 2026-02-14 | working tree | Warp-utilization rewrite in `compress_block_coop` (`tid<8` phases -> full-warp cooperative state mapping) | baseline: kernel `1.032 H/s`, backend `1.056 H/s`; candidates: kernel `1.282/1.220 H/s`, backend `1.105/1.207 H/s` | Kept (kernel mean `+21.22%`; backend mean `+9.47%`; clear sustained uplift) |
+| 2026-02-14 | working tree | NVIDIA tuning surface expansion (`--nvidia-max-rregcount`, `--nvidia-max-lanes`, `--nvidia-dispatch-iters-per-lane`, `--nvidia-allocation-iters-per-lane`, `--nvidia-autotune-samples`), autotune schema bump `3 -> 4`, key update (`memory_budget_mib`), per-candidate multi-sample median scoring | validation reruns (before launch-depth default switch): kernel `1.600 H/s` (`/tmp/nv-final-kernel.log`), backend `1.386 H/s` (`/tmp/nv-final-backend.log`) | Kept (robust autotune cache identity + lower tuning variance; no correctness/runtime regressions) |
+| 2026-02-14 | working tree | Multi-hash-per-launch path + increase default `nvidia_hashes_per_launch_per_lane` `1 -> 2` | baseline default(1) backend `1.386/1.330 H/s`; depth-2 runs `1.459/1.455 H/s`; final default-state validation `1.503 H/s` | Kept (higher counted throughput on RTX 3080; baseline-mean `1.358` -> final `1.503` (`+10.68%`); tradeoff: late-hash share increased from `25%` to `42.86-50.00%`, keep CLI override for finer preemption) |
 
 ## New Entry Template
 Copy this row and fill in all fields after each pass:

@@ -63,6 +63,8 @@ const DEFAULT_CPU_EVENT_DISPATCH_CAPACITY: usize = 256;
 const DEFAULT_CPU_AUTOTUNE_SECS: u64 = 6;
 const DEFAULT_CPU_AUTOTUNE_CONFIG_FILE: &str = "seine.cpu-autotune.json";
 const DEFAULT_NVIDIA_AUTOTUNE_SECS: u64 = 5;
+const DEFAULT_NVIDIA_AUTOTUNE_SAMPLES: u32 = 2;
+const DEFAULT_NVIDIA_HASHES_PER_LAUNCH_PER_LANE: u32 = 2;
 const DEFAULT_NVIDIA_AUTOTUNE_CONFIG_FILE: &str = "seine.nvidia-autotune.json";
 
 #[derive(Debug, Clone, Copy)]
@@ -266,9 +268,36 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_NVIDIA_AUTOTUNE_SECS)]
     nvidia_autotune_secs: u64,
 
+    /// Number of benchmark samples per NVIDIA autotune candidate (median score wins).
+    #[arg(long, default_value_t = DEFAULT_NVIDIA_AUTOTUNE_SAMPLES)]
+    nvidia_autotune_samples: u32,
+
     /// Path for persisted NVIDIA autotune result (default: <data-dir>/seine.nvidia-autotune.json).
     #[arg(long)]
     nvidia_autotune_config: Option<PathBuf>,
+
+    /// Force NVIDIA kernel register cap and skip autotune/cache lookup.
+    #[arg(long)]
+    nvidia_max_rregcount: Option<u32>,
+
+    /// Cap NVIDIA active lanes per device instance.
+    #[arg(long)]
+    nvidia_max_lanes: Option<usize>,
+
+    /// Override NVIDIA dispatch chunk hint (iterations per lane).
+    #[arg(long)]
+    nvidia_dispatch_iters_per_lane: Option<u64>,
+
+    /// Override NVIDIA reservation/allocation hint (iterations per lane).
+    #[arg(long)]
+    nvidia_allocation_iters_per_lane: Option<u64>,
+
+    /// Maximum hashes each lane executes per CUDA launch (higher = fewer launches, coarser preemption).
+    #[arg(
+        long,
+        default_value_t = DEFAULT_NVIDIA_HASHES_PER_LAUNCH_PER_LANE
+    )]
+    nvidia_hashes_per_launch_per_lane: u32,
 
     /// Maximum time to wait for one backend assignment dispatch call, in milliseconds.
     #[arg(long, default_value_t = 1000)]
@@ -428,7 +457,13 @@ pub struct Config {
     pub cpu_autotune_secs: u64,
     pub cpu_autotune_config_path: PathBuf,
     pub nvidia_autotune_secs: u64,
+    pub nvidia_autotune_samples: u32,
     pub nvidia_autotune_config_path: PathBuf,
+    pub nvidia_max_rregcount: Option<u32>,
+    pub nvidia_max_lanes: Option<usize>,
+    pub nvidia_dispatch_iters_per_lane: Option<u64>,
+    pub nvidia_allocation_iters_per_lane: Option<u64>,
+    pub nvidia_hashes_per_launch_per_lane: u32,
     pub backend_assign_timeout: Duration,
     pub backend_assign_timeout_strikes: u32,
     pub backend_control_timeout: Duration,
@@ -516,6 +551,24 @@ impl Config {
         }
         if cli.nvidia_autotune_secs == 0 {
             bail!("nvidia-autotune-secs must be >= 1");
+        }
+        if cli.nvidia_autotune_samples == 0 {
+            bail!("nvidia-autotune-samples must be >= 1");
+        }
+        if matches!(cli.nvidia_max_rregcount, Some(0)) {
+            bail!("nvidia-max-rregcount must be >= 1");
+        }
+        if matches!(cli.nvidia_max_lanes, Some(0)) {
+            bail!("nvidia-max-lanes must be >= 1");
+        }
+        if matches!(cli.nvidia_dispatch_iters_per_lane, Some(0)) {
+            bail!("nvidia-dispatch-iters-per-lane must be >= 1");
+        }
+        if matches!(cli.nvidia_allocation_iters_per_lane, Some(0)) {
+            bail!("nvidia-allocation-iters-per-lane must be >= 1");
+        }
+        if cli.nvidia_hashes_per_launch_per_lane == 0 {
+            bail!("nvidia-hashes-per-launch-per-lane must be >= 1");
         }
         if cli.backend_assign_timeout_ms == 0 {
             bail!("backend-assign-timeout-ms must be >= 1");
@@ -655,7 +708,17 @@ impl Config {
             cpu_autotune_secs: cli.cpu_autotune_secs.max(1),
             cpu_autotune_config_path,
             nvidia_autotune_secs: cli.nvidia_autotune_secs.max(1),
+            nvidia_autotune_samples: cli.nvidia_autotune_samples.max(1),
             nvidia_autotune_config_path,
+            nvidia_max_rregcount: cli.nvidia_max_rregcount.filter(|v| *v > 0),
+            nvidia_max_lanes: cli.nvidia_max_lanes.filter(|v| *v > 0),
+            nvidia_dispatch_iters_per_lane: cli
+                .nvidia_dispatch_iters_per_lane
+                .filter(|v| *v > 0),
+            nvidia_allocation_iters_per_lane: cli
+                .nvidia_allocation_iters_per_lane
+                .filter(|v| *v > 0),
+            nvidia_hashes_per_launch_per_lane: cli.nvidia_hashes_per_launch_per_lane.max(1),
             backend_assign_timeout: Duration::from_millis(cli.backend_assign_timeout_ms),
             backend_assign_timeout_strikes: cli.backend_assign_timeout_strikes.max(1),
             backend_control_timeout: Duration::from_millis(cli.backend_control_timeout_ms),
@@ -1111,7 +1174,13 @@ mod tests {
             cpu_autotune_secs: DEFAULT_CPU_AUTOTUNE_SECS,
             cpu_autotune_config: None,
             nvidia_autotune_secs: DEFAULT_NVIDIA_AUTOTUNE_SECS,
+            nvidia_autotune_samples: DEFAULT_NVIDIA_AUTOTUNE_SAMPLES,
             nvidia_autotune_config: None,
+            nvidia_max_rregcount: None,
+            nvidia_max_lanes: None,
+            nvidia_dispatch_iters_per_lane: None,
+            nvidia_allocation_iters_per_lane: None,
+            nvidia_hashes_per_launch_per_lane: DEFAULT_NVIDIA_HASHES_PER_LAUNCH_PER_LANE,
             backend_assign_timeout_ms: 1000,
             backend_assign_timeout_ms_per_instance: Vec::new(),
             backend_assign_timeout_strikes: 3,

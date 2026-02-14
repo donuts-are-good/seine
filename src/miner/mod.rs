@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::ApiClient;
 use crate::backend::cpu::{CpuBackend, CpuBackendTuning};
-use crate::backend::nvidia::NvidiaBackend;
+use crate::backend::nvidia::{NvidiaBackend, NvidiaBackendTuningOptions};
 use crate::backend::{
     normalize_backend_capabilities, BackendCapabilities, BackendEvent, BackendExecutionModel,
     BackendInstanceId, BackendTelemetry, BenchBackend, DeadlineSupport, PowBackend,
@@ -1023,6 +1023,14 @@ fn build_backend_instances(cfg: &Config) -> Vec<(BackendSpec, Arc<dyn PowBackend
                         backend_spec.device_index,
                         cfg.nvidia_autotune_config_path.clone(),
                         cfg.nvidia_autotune_secs,
+                        NvidiaBackendTuningOptions {
+                            max_rregcount_override: cfg.nvidia_max_rregcount,
+                            max_lanes_override: cfg.nvidia_max_lanes,
+                            autotune_samples: cfg.nvidia_autotune_samples,
+                            dispatch_iters_per_lane: cfg.nvidia_dispatch_iters_per_lane,
+                            allocation_iters_per_lane: cfg.nvidia_allocation_iters_per_lane,
+                            hashes_per_launch_per_lane: cfg.nvidia_hashes_per_launch_per_lane,
+                        },
                     )) as Arc<dyn PowBackend>
                 }
             };
@@ -2184,9 +2192,15 @@ mod tests {
             cpu_autotune_secs: 2,
             cpu_autotune_config_path: std::path::PathBuf::from("./data/seine.cpu-autotune.json"),
             nvidia_autotune_secs: 2,
+            nvidia_autotune_samples: 2,
             nvidia_autotune_config_path: std::path::PathBuf::from(
                 "./data/seine.nvidia-autotune.json",
             ),
+            nvidia_max_rregcount: None,
+            nvidia_max_lanes: None,
+            nvidia_dispatch_iters_per_lane: None,
+            nvidia_allocation_iters_per_lane: None,
+            nvidia_hashes_per_launch_per_lane: 2,
             backend_assign_timeout: Duration::from_millis(1_000),
             backend_assign_timeout_strikes: 3,
             backend_control_timeout: Duration::from_millis(60_000),

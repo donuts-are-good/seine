@@ -4,7 +4,7 @@
 
 Current status:
 - CPU backend: implemented (Argon2id, consensus-compatible params).
-- NVIDIA backend: native CUDA Argon2id lane-fill engine with runtime NVRTC compilation, persistent VRAM-sized lanes, and batched assignment collapsing.
+- NVIDIA backend: native CUDA Argon2id lane-fill engine with runtime NVRTC compilation, persistent VRAM-sized lanes, full-warp cooperative compression, and multi-hash-per-launch batching.
 - NVIDIA optimization journal: see `NVIDIA_OPTIMIZATION_LOG.md` for measured tuning history and kept/reverted attempts.
 - Runtime architecture: supports multiple backends in one process with persistent workers, configurable bounded backend event queues with lossless `Solution` delivery and deduplicated backend `Error` events (prevents multi-thread error storms from stalling worker teardown), coalesced tip notifications (deduped across SSE reconnects), template prefetch overlap to reduce round-boundary idle, and optional strict quiesce barriers for round-accurate hash accounting.
   - Backend assignment/control dispatch now runs through one shared per-backend task executor with panic capture and timeout quarantine to avoid duplicated control paths and extra thread churn.
@@ -138,6 +138,14 @@ Run headless/plain logs (no fullscreen TUI):
       - Final thread selection is profile-aware: `throughput` picks peak H/s, while `balanced` and `efficiency` bias toward lower thread counts when they remain close to peak throughput (reducing RAM pressure).
       - Candidate sampling auto-extends up to an internal cap to collect a minimum hash count on very slow lanes (reduces variance vs fixed very short windows).
       - `--cpu-autotune-config` overrides the persisted autotune config path.
+  - NVIDIA backend tuning knobs for faster CUDA perf iteration:
+    - `--nvidia-autotune-secs` (default `5`) controls per-candidate benchmark window for regcap autotune.
+    - `--nvidia-autotune-samples` (default `2`) runs multiple samples per regcap candidate; autotune picks by median H/s (mean tie-break).
+    - `--nvidia-autotune-config` overrides the persisted NVIDIA autotune cache path (`<data-dir>/seine.nvidia-autotune.json` by default).
+    - `--nvidia-max-rregcount` forces a fixed register cap and skips autotune/cache lookup.
+    - `--nvidia-max-lanes` caps active NVIDIA lanes per device instance.
+    - `--nvidia-dispatch-iters-per-lane` and `--nvidia-allocation-iters-per-lane` override scheduler/allocator lane-iteration hints.
+    - `--nvidia-hashes-per-launch-per-lane` (default `2`) controls CUDA launch depth per lane (`higher => fewer launches`, often higher H/s on this workload, but coarser cancel/fence preemption).
   - `--stats-secs` (default `10`) controls periodic stats log emission cadence.
   - `--work-allocation` (`adaptive` or `static`) controls backend nonce-chunk splitting policy in mining mode.
     - Adaptive mode now also incorporates solved/stale rounds with reduced gain so weights stay fresh under frequent tip churn.
@@ -170,6 +178,7 @@ Run deterministic local benchmarking (no API connection needed):
 - `--bench-kind kernel`: hash kernel only (single backend).
 - `--bench-kind backend`: persistent backend workers (steady-state throughput).
 - `--bench-kind end-to-end`: includes backend start/stop per round.
+- Kernel benchmarks report both `elapsed` (steady benchmark window, from `--bench-secs`) and `wall` (full runtime including startup/teardown) per round.
 - Worker benchmarks always apply a round-end measurement fence so round H/s is comparable across strict/relaxed accounting modes.
   - Worker benchmarks now honor `--work-allocation` (`adaptive`/`static`) so scheduler tuning can be measured without mining mode.
   - Benchmark reports now expose `counted_hashes`, `late_hashes`, and `late_hash_pct` per round plus aggregate late-hash accounting in the summary; throughput uses measured elapsed + fence time to avoid inflation when backend preemption is coarse.

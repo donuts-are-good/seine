@@ -24,6 +24,16 @@ pub mod nvidia {
         WorkAssignment,
     };
 
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct NvidiaBackendTuningOptions {
+        pub max_rregcount_override: Option<u32>,
+        pub max_lanes_override: Option<usize>,
+        pub autotune_samples: u32,
+        pub dispatch_iters_per_lane: Option<u64>,
+        pub allocation_iters_per_lane: Option<u64>,
+        pub hashes_per_launch_per_lane: u32,
+    }
+
     pub struct NvidiaBackend {
         _instance_id: AtomicU64,
         _device_index: Option<u32>,
@@ -34,6 +44,7 @@ pub mod nvidia {
             device_index: Option<u32>,
             _autotune_config_path: PathBuf,
             _autotune_secs: u64,
+            _tuning_options: NvidiaBackendTuningOptions,
         ) -> Self {
             Self {
                 _instance_id: AtomicU64::new(0),

@@ -167,6 +167,13 @@ struct BenchConfigFingerprint {
     cpu_autotune_max_threads: Option<usize>,
     cpu_autotune_secs: u64,
     cpu_auto_threads_cap: usize,
+    nvidia_autotune_secs: u64,
+    nvidia_autotune_samples: u32,
+    nvidia_max_rregcount: Option<u32>,
+    nvidia_max_lanes: Option<usize>,
+    nvidia_dispatch_iters_per_lane: Option<u64>,
+    nvidia_allocation_iters_per_lane: Option<u64>,
+    nvidia_hashes_per_launch_per_lane: u32,
     backend_assign_timeout_ms: u64,
     backend_assign_timeout_strikes: u32,
     backend_control_timeout_ms: u64,
@@ -225,7 +232,7 @@ struct WorkerBenchmarkIdentity {
 }
 
 type BackendEventAction = RuntimeBackendEventAction;
-const BENCH_REPORT_SCHEMA_VERSION: u32 = 7;
+const BENCH_REPORT_SCHEMA_VERSION: u32 = 8;
 const BENCH_REPORT_COMPAT_MIN_SCHEMA_VERSION: u32 = 2;
 
 pub(super) fn run_benchmark(cfg: &Config, shutdown: &AtomicBool) -> Result<()> {
@@ -311,18 +318,23 @@ fn run_kernel_benchmark(
         let is_warmup = round < cfg.bench_warmup_rounds;
         let round_start = Instant::now();
         let hashes = bench_backend.kernel_bench(cfg.bench_secs, shutdown)?;
-        let elapsed = round_start.elapsed().as_secs_f64().max(0.001);
-        let hps = hashes as f64 / elapsed;
+        let wall_elapsed = round_start.elapsed().as_secs_f64().max(0.001);
+        // Kernel benchmark backend hooks are expected to run for bench_secs.
+        // Use that steady-state window for H/s so backend init/setup overhead does not
+        // skew per-round throughput when the backend internally rebuilds engines.
+        let elapsed = cfg.bench_secs.max(1) as f64;
+        let hps = hashes as f64 / elapsed.max(0.001);
 
         if is_warmup {
             info(
                 "BENCH",
                 format!(
-                    "warmup {}/{} | hashes={} | elapsed={:.2}s | {}",
+                    "warmup {}/{} | hashes={} | elapsed={:.2}s | wall={:.2}s | {}",
                     round + 1,
                     cfg.bench_warmup_rounds,
                     hashes,
                     elapsed,
+                    wall_elapsed,
                     format_hashrate(hps),
                 ),
             );
@@ -333,11 +345,12 @@ fn run_kernel_benchmark(
         info(
             "BENCH",
             format!(
-                "round {}/{} | hashes={} | elapsed={:.2}s | {}",
+                "round {}/{} | hashes={} | elapsed={:.2}s | wall={:.2}s | {}",
                 measured_round,
                 cfg.bench_rounds,
                 hashes,
                 elapsed,
+                wall_elapsed,
                 format_hashrate(hps),
             ),
         );
@@ -1079,6 +1092,71 @@ fn baseline_compatibility_issues(
                 ));
             }
         }
+        if baseline.schema_version >= 8 && current.schema_version >= 8 {
+            if baseline.config_fingerprint.nvidia_autotune_secs
+                != current.config_fingerprint.nvidia_autotune_secs
+            {
+                issues.push(format!(
+                    "nvidia_autotune_secs mismatch baseline={} current={}",
+                    baseline.config_fingerprint.nvidia_autotune_secs,
+                    current.config_fingerprint.nvidia_autotune_secs
+                ));
+            }
+            if baseline.config_fingerprint.nvidia_autotune_samples
+                != current.config_fingerprint.nvidia_autotune_samples
+            {
+                issues.push(format!(
+                    "nvidia_autotune_samples mismatch baseline={} current={}",
+                    baseline.config_fingerprint.nvidia_autotune_samples,
+                    current.config_fingerprint.nvidia_autotune_samples
+                ));
+            }
+            if baseline.config_fingerprint.nvidia_max_rregcount
+                != current.config_fingerprint.nvidia_max_rregcount
+            {
+                issues.push(format!(
+                    "nvidia_max_rregcount mismatch baseline={:?} current={:?}",
+                    baseline.config_fingerprint.nvidia_max_rregcount,
+                    current.config_fingerprint.nvidia_max_rregcount
+                ));
+            }
+            if baseline.config_fingerprint.nvidia_max_lanes
+                != current.config_fingerprint.nvidia_max_lanes
+            {
+                issues.push(format!(
+                    "nvidia_max_lanes mismatch baseline={:?} current={:?}",
+                    baseline.config_fingerprint.nvidia_max_lanes,
+                    current.config_fingerprint.nvidia_max_lanes
+                ));
+            }
+            if baseline.config_fingerprint.nvidia_dispatch_iters_per_lane
+                != current.config_fingerprint.nvidia_dispatch_iters_per_lane
+            {
+                issues.push(format!(
+                    "nvidia_dispatch_iters_per_lane mismatch baseline={:?} current={:?}",
+                    baseline.config_fingerprint.nvidia_dispatch_iters_per_lane,
+                    current.config_fingerprint.nvidia_dispatch_iters_per_lane
+                ));
+            }
+            if baseline.config_fingerprint.nvidia_allocation_iters_per_lane
+                != current.config_fingerprint.nvidia_allocation_iters_per_lane
+            {
+                issues.push(format!(
+                    "nvidia_allocation_iters_per_lane mismatch baseline={:?} current={:?}",
+                    baseline.config_fingerprint.nvidia_allocation_iters_per_lane,
+                    current.config_fingerprint.nvidia_allocation_iters_per_lane
+                ));
+            }
+            if baseline.config_fingerprint.nvidia_hashes_per_launch_per_lane
+                != current.config_fingerprint.nvidia_hashes_per_launch_per_lane
+            {
+                issues.push(format!(
+                    "nvidia_hashes_per_launch_per_lane mismatch baseline={} current={}",
+                    baseline.config_fingerprint.nvidia_hashes_per_launch_per_lane,
+                    current.config_fingerprint.nvidia_hashes_per_launch_per_lane
+                ));
+            }
+        }
         if baseline.schema_version >= 6 && current.schema_version >= 6 {
             if baseline.config_fingerprint.cpu_hash_batch_size
                 != current.config_fingerprint.cpu_hash_batch_size
@@ -1427,6 +1505,13 @@ fn benchmark_config_fingerprint(
         cpu_autotune_max_threads: cfg.cpu_autotune_max_threads,
         cpu_autotune_secs: cfg.cpu_autotune_secs,
         cpu_auto_threads_cap: cfg.cpu_auto_threads_cap,
+        nvidia_autotune_secs: cfg.nvidia_autotune_secs,
+        nvidia_autotune_samples: cfg.nvidia_autotune_samples,
+        nvidia_max_rregcount: cfg.nvidia_max_rregcount,
+        nvidia_max_lanes: cfg.nvidia_max_lanes,
+        nvidia_dispatch_iters_per_lane: cfg.nvidia_dispatch_iters_per_lane,
+        nvidia_allocation_iters_per_lane: cfg.nvidia_allocation_iters_per_lane,
+        nvidia_hashes_per_launch_per_lane: cfg.nvidia_hashes_per_launch_per_lane,
         backend_assign_timeout_ms: cfg.backend_assign_timeout.as_millis() as u64,
         backend_assign_timeout_strikes: cfg.backend_assign_timeout_strikes,
         backend_control_timeout_ms: cfg.backend_control_timeout.as_millis() as u64,
@@ -1784,6 +1869,13 @@ mod tests {
                 cpu_autotune_max_threads: None,
                 cpu_autotune_secs: 2,
                 cpu_auto_threads_cap: 1,
+                nvidia_autotune_secs: 5,
+                nvidia_autotune_samples: 2,
+                nvidia_max_rregcount: None,
+                nvidia_max_lanes: None,
+                nvidia_dispatch_iters_per_lane: None,
+                nvidia_allocation_iters_per_lane: None,
+                nvidia_hashes_per_launch_per_lane: 2,
                 backend_assign_timeout_ms: 1000,
                 backend_assign_timeout_strikes: 1,
                 backend_control_timeout_ms: 60_000,
