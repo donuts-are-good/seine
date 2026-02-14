@@ -51,4 +51,66 @@ cargo run --release -- --bench --bench-kind backend --backend cpu --threads 1 --
 ## Validation
 
 - Correctness: `cargo test fixed_kernel_matches_reference_for_small_memory_configs -- --nocapture`
-- Full suite: `cargo test` (`177 passed`).
+- Full suite (at time of Attempt 2): `cargo test` (`177 passed`).
+
+## 2026-02-14 full miner + CPU backend rework sweep
+
+All runs in this section used the same protocol as above, plus long-window confirmation runs:
+
+```bash
+cargo run --release -- --bench --bench-kind backend --backend cpu --threads 1 --disable-cpu-autotune-threads --bench-secs 30 --bench-rounds 3 --bench-warmup-rounds 1 --ui plain --bench-output <report.json>
+```
+
+### Session baseline (same host/session, fresh capture)
+
+- Kernel baseline report: `data/bench_cpu_kernel_rework_baseline.json`
+- Kernel summary: `avg=1.125 H/s`, `median=1.125 H/s`, `counted=54`
+- Backend baseline report: `data/bench_cpu_backend_rework_baseline.json`
+- Backend summary: `avg=1.070 H/s`, `median=1.063 H/s`, `counted=49`, `late=4`
+
+### Attempt 3: deep fixed-argon hot-path refactor (reverted)
+
+- Changes trialed:
+  - BLAMKA arithmetic rewrite (`Wrapping` -> `wrapping_*` + low-word multiply helper).
+  - AVX2 path dispatch refactor.
+  - Loop/index structure rewrites (including one aggressive unrolled variant).
+- Probe result (aggressive unrolled variant): `data/bench_cpu_kernel_rework_probe1.json` => `avg=0.688 H/s` (severe regression).
+- A/B result vs head:
+  - Kernel: `data/bench_cpu_kernel_ab_opt.json` (`1.083`) vs `data/bench_cpu_kernel_ab_head.json` (`1.167`) => `-7.14%`.
+  - Backend: `data/bench_cpu_backend_ab_opt.json` (`1.045`) vs `data/bench_cpu_backend_ab_head.json` (`1.065`) => `-1.88%`.
+- Status: reverted.
+
+### Attempt 4: deadline-aware hash start gating (reverted)
+
+- Added per-worker rolling hash-time estimate and skipped starting hashes near `stop_at`.
+- Backend report: `data/bench_cpu_backend_rework_opt1.json`
+- Result: `avg=1.000 H/s`, `late=0` but lower counted throughput than session baseline (`1.070 H/s`).
+- Status: reverted.
+
+### Attempt 5: backend tuning sweep (not adopted)
+
+- Short sweep (`8s x 2 rounds`) over:
+  - `default (64/1/50)`, `128/1/100`, `256/4/200`, `256/8/200`, `512/16/250`, `64/8/50`.
+- Best short-run candidate: `256/4/200` (`data/bench_cpu_backend_tune_b256_c4_f200.json`, `avg=1.106 H/s`).
+- Long-run confirmation:
+  - Default: `data/bench_cpu_backend_default_long.json` => `avg=1.075 H/s`.
+  - Tuned `256/4/200`: `data/bench_cpu_backend_tuned_long.json` => `avg=1.067 H/s`.
+  - Throughput-like `256/8/200`: `data/bench_cpu_backend_throughput_long.json` => `avg=1.078 H/s` (effectively noise-level uplift vs default).
+  - Affinity off: `data/bench_cpu_backend_affinity_off_long.json` => `avg=1.073 H/s`.
+- Status: defaults unchanged.
+
+### Attempt 6: cache AVX2 feature detection at hasher construction (not adopted)
+
+- Change: store `use_avx2` in `FixedArgon2id::new` and branch on cached bool per hash instead of calling feature detection in `hash_password_into_with_memory`.
+- Long-run repeats:
+  - Kernel cached-bool: `data/bench_cpu_kernel_avx2cache_long.json` => `avg=1.089 H/s`.
+  - Kernel head repeat: `data/bench_cpu_kernel_head_long_repeat2.json` => `avg=1.089 H/s`.
+  - Backend cached-bool: `data/bench_cpu_backend_avx2cache_long.json` => `avg=1.089 H/s`.
+  - Backend head repeat: `data/bench_cpu_backend_head_long_repeat2.json` => `avg=1.081 H/s`.
+- Note: counted hashes were effectively identical in repeated runs; observed delta tracked fence jitter.
+- Status: not adopted (no reproducible throughput gain).
+
+### Sweep validation
+
+- Correctness checks during each retained candidate: `cargo test fixed_kernel_matches_reference_for_small_memory_configs -- --nocapture`
+- Full suite at end of sweep: `cargo test` (`180 passed`).
