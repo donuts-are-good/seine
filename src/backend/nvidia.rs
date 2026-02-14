@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::ffi::{c_char, CStr, CString};
 use std::fs;
@@ -24,10 +25,12 @@ use cudarc::{
 };
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use crate::backend::NonceChunk;
 use crate::backend::{
     AssignmentSemantics, BackendCallStatus, BackendCapabilities, BackendEvent,
     BackendExecutionModel, BackendInstanceId, BackendTelemetry, BenchBackend, DeadlineSupport,
-    MiningSolution, NonceChunk, PowBackend, PreemptionGranularity, WorkAssignment, WorkTemplate,
+    MiningSolution, PowBackend, PreemptionGranularity, WorkAssignment, WorkTemplate,
 };
 use crate::types::hash_meets_target;
 
@@ -39,9 +42,11 @@ const CONTROL_CHANNEL_CAPACITY: usize = 32;
 const EVENT_SEND_WAIT: Duration = Duration::from_millis(5);
 const KERNEL_THREADS: u32 = 32;
 const DEFAULT_NVIDIA_MAX_RREGCOUNT: u32 = 224;
-const NVIDIA_AUTOTUNE_SCHEMA_VERSION: u32 = 2;
+const NVIDIA_AUTOTUNE_SCHEMA_VERSION: u32 = 3;
 const NVIDIA_AUTOTUNE_REGCAP_CANDIDATES: &[u32] = &[240, 224, 208, 192, 160];
 const NVIDIA_AUTOTUNE_LOOP_UNROLL_CANDIDATES: &[bool] = &[false];
+const NVIDIA_MEMORY_RESERVE_MIB_FLOOR: u64 = 64;
+const NVIDIA_MEMORY_RESERVE_RATIO_DENOM: u64 = 64;
 const ARGON2_VERSION_V13: u32 = 0x13;
 const ARGON2_ALGORITHM_ID: u32 = 2; // Argon2id
 
@@ -72,6 +77,8 @@ impl Default for NvidiaKernelTuning {
 struct NvidiaAutotuneKey {
     device_name: String,
     memory_total_mib: u64,
+    compute_cap_major: u32,
+    compute_cap_minor: u32,
     m_cost_kib: u32,
     t_cost: u32,
     kernel_threads: u32,
@@ -134,6 +141,7 @@ struct NvidiaWorker {
 
 enum WorkerCommand {
     Assign(WorkAssignment),
+    AssignBatch(Vec<WorkAssignment>),
     Cancel(Sender<Result<()>>),
     Fence(Sender<Result<()>>),
     Stop,
@@ -246,7 +254,7 @@ impl CudaArgon2Engine {
             .map_err(|err| anyhow!("failed to load CUDA probe kernel function: {err:?}"))?;
 
         let lane_bytes = CPU_LANE_MEMORY_BYTES.max(u64::from(m_blocks) * 1024);
-        let memory_budget_mib = memory_total_mib.max(memory_free_mib.unwrap_or(0)).max(1);
+        let memory_budget_mib = derive_memory_budget_mib(memory_total_mib, memory_free_mib);
         let memory_budget_bytes = memory_budget_mib.saturating_mul(1024 * 1024);
         let usable_bytes = memory_budget_bytes;
         let by_memory = usize::try_from((usable_bytes / lane_bytes).max(1)).unwrap_or(1);
@@ -756,10 +764,15 @@ impl PowBackend for NvidiaBackend {
     }
 
     fn assign_work_batch(&self, work: &[WorkAssignment]) -> Result<()> {
-        let Some(collapsed) = collapse_assignment_batch(work)? else {
-            return Ok(());
-        };
-        self.assign_work(collapsed)
+        let mut batch = normalize_assignment_batch(work)?;
+        match batch.len() {
+            0 => Ok(()),
+            1 => self.assign_work(batch.pop().expect("single-item batch should be present")),
+            _ => self
+                .worker_assignment_tx()?
+                .send(WorkerCommand::AssignBatch(batch))
+                .map_err(|_| anyhow!("nvidia worker channel closed while assigning work")),
+        }
     }
 
     fn assign_work_batch_with_deadline(
@@ -767,10 +780,16 @@ impl PowBackend for NvidiaBackend {
         work: &[WorkAssignment],
         deadline: Instant,
     ) -> Result<()> {
-        let Some(collapsed) = collapse_assignment_batch(work)? else {
-            return Ok(());
-        };
-        self.assign_work_with_deadline(&collapsed, deadline)
+        self.assign_work_batch(work)?;
+        if Instant::now() > deadline {
+            return Err(anyhow!(
+                "assignment call exceeded deadline by {}ms",
+                Instant::now()
+                    .saturating_duration_since(deadline)
+                    .as_millis()
+            ));
+        }
+        Ok(())
     }
 
     fn supports_assignment_batching(&self) -> bool {
@@ -782,12 +801,18 @@ impl PowBackend for NvidiaBackend {
     }
 
     fn assign_work_batch_nonblocking(&self, work: &[WorkAssignment]) -> Result<BackendCallStatus> {
-        let Some(collapsed) = collapse_assignment_batch(work)? else {
+        let mut batch = normalize_assignment_batch(work)?;
+        if batch.is_empty() {
             return Ok(BackendCallStatus::Complete);
-        };
+        }
 
         let tx = self.worker_assignment_tx()?;
-        match tx.try_send(WorkerCommand::Assign(collapsed)) {
+        let cmd = if batch.len() == 1 {
+            WorkerCommand::Assign(batch.pop().expect("single-item batch should be present"))
+        } else {
+            WorkerCommand::AssignBatch(batch)
+        };
+        match tx.try_send(cmd) {
             Ok(()) => Ok(BackendCallStatus::Complete),
             Err(TrySendError::Full(_)) => Ok(BackendCallStatus::Pending),
             Err(TrySendError::Disconnected(_)) => {
@@ -971,6 +996,7 @@ fn worker_loop(
     instance_id: Arc<AtomicU64>,
 ) {
     let mut active: Option<ActiveAssignment> = None;
+    let mut queued: VecDeque<WorkAssignment> = VecDeque::new();
     let mut fence_waiters: Vec<Sender<Result<()>>> = Vec::new();
     let mut assignment_open = true;
     let mut control_open = true;
@@ -981,7 +1007,13 @@ fn worker_loop(
         while control_open {
             match control_rx.try_recv() {
                 Ok(cmd) => {
-                    running = handle_worker_command(cmd, &mut active, &mut fence_waiters, &shared);
+                    running = handle_worker_command(
+                        cmd,
+                        &mut active,
+                        &mut queued,
+                        &mut fence_waiters,
+                        &shared,
+                    );
                     if !running {
                         break;
                     }
@@ -1001,8 +1033,13 @@ fn worker_loop(
             if assignment_open {
                 match assignment_rx.try_recv() {
                     Ok(cmd) => {
-                        running =
-                            handle_worker_command(cmd, &mut active, &mut fence_waiters, &shared);
+                        running = handle_worker_command(
+                            cmd,
+                            &mut active,
+                            &mut queued,
+                            &mut fence_waiters,
+                            &shared,
+                        );
                     }
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Disconnected) => assignment_open = false,
@@ -1020,13 +1057,25 @@ fn worker_loop(
                     crossbeam_channel::select! {
                         recv(control_rx) -> cmd => match cmd {
                             Ok(cmd) => {
-                                running = handle_worker_command(cmd, &mut active, &mut fence_waiters, &shared);
+                                running = handle_worker_command(
+                                    cmd,
+                                    &mut active,
+                                    &mut queued,
+                                    &mut fence_waiters,
+                                    &shared,
+                                );
                             }
                             Err(_) => control_open = false,
                         },
                         recv(assignment_rx) -> cmd => match cmd {
                             Ok(cmd) => {
-                                running = handle_worker_command(cmd, &mut active, &mut fence_waiters, &shared);
+                                running = handle_worker_command(
+                                    cmd,
+                                    &mut active,
+                                    &mut queued,
+                                    &mut fence_waiters,
+                                    &shared,
+                                );
                             }
                             Err(_) => assignment_open = false,
                         },
@@ -1037,6 +1086,7 @@ fn worker_loop(
                             running = handle_worker_command(
                                 cmd,
                                 &mut active,
+                                &mut queued,
                                 &mut fence_waiters,
                                 &shared,
                             );
@@ -1049,6 +1099,7 @@ fn worker_loop(
                             running = handle_worker_command(
                                 cmd,
                                 &mut active,
+                                &mut queued,
                                 &mut fence_waiters,
                                 &shared,
                             );
@@ -1066,8 +1117,13 @@ fn worker_loop(
                 match control_rx.try_recv() {
                     Ok(cmd) => {
                         handled = true;
-                        running =
-                            handle_worker_command(cmd, &mut active, &mut fence_waiters, &shared);
+                        running = handle_worker_command(
+                            cmd,
+                            &mut active,
+                            &mut queued,
+                            &mut fence_waiters,
+                            &shared,
+                        );
                         if !running {
                             break;
                         }
@@ -1080,8 +1136,13 @@ fn worker_loop(
                 match assignment_rx.try_recv() {
                     Ok(cmd) => {
                         handled = true;
-                        running =
-                            handle_worker_command(cmd, &mut active, &mut fence_waiters, &shared);
+                        running = handle_worker_command(
+                            cmd,
+                            &mut active,
+                            &mut queued,
+                            &mut fence_waiters,
+                            &shared,
+                        );
                         if !running {
                             break;
                         }
@@ -1103,8 +1164,21 @@ fn worker_loop(
             continue;
         };
 
-        if current.remaining == 0 || Instant::now() >= current.work.template.stop_at {
-            finalize_active_assignment(&shared, current);
+        if current.remaining == 0 {
+            let next_pending = queued.len() as u64;
+            finalize_active_assignment(&shared, current, next_pending);
+            if let Some(next) = queued.pop_front() {
+                activate_assignment(&shared, &mut active, next, queued.len() as u64 + 1);
+                continue;
+            }
+            active = None;
+            drain_fence_waiters(&mut fence_waiters, Ok(()));
+            continue;
+        }
+
+        if Instant::now() >= current.work.template.stop_at {
+            queued.clear();
+            finalize_active_assignment(&shared, current, 0);
             active = None;
             drain_fence_waiters(&mut fence_waiters, Ok(()));
             continue;
@@ -1136,7 +1210,12 @@ fn worker_loop(
         };
 
         if done == 0 {
-            finalize_active_assignment(&shared, current);
+            let next_pending = queued.len() as u64;
+            finalize_active_assignment(&shared, current, next_pending);
+            if let Some(next) = queued.pop_front() {
+                activate_assignment(&shared, &mut active, next, queued.len() as u64 + 1);
+                continue;
+            }
             active = None;
             drain_fence_waiters(&mut fence_waiters, Ok(()));
             continue;
@@ -1169,7 +1248,8 @@ fn worker_loop(
                     backend: BACKEND_NAME,
                 }),
             );
-            finalize_active_assignment(&shared, current);
+            queued.clear();
+            finalize_active_assignment(&shared, current, 0);
             active = None;
             drain_fence_waiters(&mut fence_waiters, Ok(()));
             continue;
@@ -1177,17 +1257,10 @@ fn worker_loop(
     }
 
     if let Some(active_assignment) = active.as_ref() {
-        finalize_active_assignment(&shared, active_assignment);
-    } else {
-        shared.active_lanes.store(0, Ordering::Release);
-        shared.pending_work.store(0, Ordering::Release);
-        shared
-            .inflight_assignment_hashes
-            .store(0, Ordering::Release);
-        if let Ok(mut slot) = shared.inflight_assignment_started_at.lock() {
-            *slot = None;
-        }
+        finalize_active_assignment(&shared, active_assignment, 0);
     }
+    queued.clear();
+    clear_worker_pending_state(&shared);
 
     drain_fence_waiters(
         &mut fence_waiters,
@@ -1198,39 +1271,34 @@ fn worker_loop(
 fn handle_worker_command(
     cmd: WorkerCommand,
     active: &mut Option<ActiveAssignment>,
+    queued: &mut VecDeque<WorkAssignment>,
     fence_waiters: &mut Vec<Sender<Result<()>>>,
     shared: &NvidiaShared,
 ) -> bool {
     match cmd {
         WorkerCommand::Assign(work) => {
-            if let Some(current) = active.as_ref() {
-                finalize_active_assignment(shared, current);
-            }
-            shared.error_emitted.store(false, Ordering::Release);
-            shared.pending_work.store(1, Ordering::Release);
-            shared.active_lanes.store(0, Ordering::Release);
-            shared
-                .inflight_assignment_hashes
-                .store(0, Ordering::Release);
-            if let Ok(mut slot) = shared.inflight_assignment_started_at.lock() {
-                *slot = Some(Instant::now());
-            }
-            *active = Some(ActiveAssignment::new(work));
+            replace_assignment_queue(shared, active, queued, vec![work]);
+            true
+        }
+        WorkerCommand::AssignBatch(work) => {
+            replace_assignment_queue(shared, active, queued, work);
             true
         }
         WorkerCommand::Cancel(ack) => {
             if let Some(current) = active.as_ref() {
-                finalize_active_assignment(shared, current);
+                finalize_active_assignment(shared, current, 0);
                 *active = None;
             }
+            queued.clear();
+            clear_worker_pending_state(shared);
             let _ = ack.send(Ok(()));
-            if active.is_none() {
+            if active.is_none() && queued.is_empty() {
                 drain_fence_waiters(fence_waiters, Ok(()));
             }
             true
         }
         WorkerCommand::Fence(ack) => {
-            if active.is_none() {
+            if active.is_none() && queued.is_empty() {
                 let _ = ack.send(Ok(()));
             } else {
                 fence_waiters.push(ack);
@@ -1241,9 +1309,71 @@ fn handle_worker_command(
     }
 }
 
-fn finalize_active_assignment(shared: &NvidiaShared, active: &ActiveAssignment) {
+fn replace_assignment_queue(
+    shared: &NvidiaShared,
+    active: &mut Option<ActiveAssignment>,
+    queued: &mut VecDeque<WorkAssignment>,
+    assignments: Vec<WorkAssignment>,
+) {
+    let pending_after_replace = assignments.len() as u64;
+    if let Some(current) = active.as_ref() {
+        finalize_active_assignment(shared, current, pending_after_replace);
+    }
+    *active = None;
+    queued.clear();
+
+    shared.error_emitted.store(false, Ordering::Release);
+
+    if assignments.is_empty() {
+        clear_worker_pending_state(shared);
+        return;
+    }
+
+    let mut assignments = assignments.into_iter();
+    let first = assignments
+        .next()
+        .expect("non-empty assignments should include an active item");
+    queued.extend(assignments);
+    activate_assignment(shared, active, first, queued.len() as u64 + 1);
+}
+
+fn activate_assignment(
+    shared: &NvidiaShared,
+    active: &mut Option<ActiveAssignment>,
+    work: WorkAssignment,
+    pending_work: u64,
+) {
+    shared
+        .pending_work
+        .store(pending_work.max(1), Ordering::Release);
+    shared.active_lanes.store(0, Ordering::Release);
+    shared
+        .inflight_assignment_hashes
+        .store(0, Ordering::Release);
+    if let Ok(mut slot) = shared.inflight_assignment_started_at.lock() {
+        *slot = Some(Instant::now());
+    }
+    *active = Some(ActiveAssignment::new(work));
+}
+
+fn clear_worker_pending_state(shared: &NvidiaShared) {
     shared.active_lanes.store(0, Ordering::Release);
     shared.pending_work.store(0, Ordering::Release);
+    shared
+        .inflight_assignment_hashes
+        .store(0, Ordering::Release);
+    if let Ok(mut slot) = shared.inflight_assignment_started_at.lock() {
+        *slot = None;
+    }
+}
+
+fn finalize_active_assignment(
+    shared: &NvidiaShared,
+    active: &ActiveAssignment,
+    pending_after: u64,
+) {
+    shared.active_lanes.store(0, Ordering::Release);
+    shared.pending_work.store(pending_after, Ordering::Release);
     shared
         .inflight_assignment_hashes
         .store(0, Ordering::Release);
@@ -1490,22 +1620,16 @@ fn blake2b_long(inputs: &[&[u8]], out: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-fn collapse_assignment_batch(work: &[WorkAssignment]) -> Result<Option<WorkAssignment>> {
+fn normalize_assignment_batch(work: &[WorkAssignment]) -> Result<Vec<WorkAssignment>> {
     let Some(first) = work.first() else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
 
-    if work.len() == 1 {
-        return Ok(Some(first.clone()));
-    }
+    let mut normalized = Vec::with_capacity(work.len());
+    let mut expected_start = first.nonce_chunk.start_nonce;
+    let mut total_nonce_count = 0u64;
 
-    let mut expected_start = first
-        .nonce_chunk
-        .start_nonce
-        .wrapping_add(first.nonce_chunk.nonce_count);
-    let mut nonce_count = first.nonce_chunk.nonce_count;
-
-    for (idx, assignment) in work.iter().enumerate().skip(1) {
+    for (idx, assignment) in work.iter().enumerate() {
         ensure_compatible_template(&first.template, &assignment.template).with_context(|| {
             format!(
                 "assignment batch item {} references a different template",
@@ -1521,20 +1645,22 @@ fn collapse_assignment_batch(work: &[WorkAssignment]) -> Result<Option<WorkAssig
                 assignment.nonce_chunk.start_nonce
             );
         }
+        if assignment.nonce_chunk.nonce_count == 0 {
+            bail!("assignment batch item {} has zero nonce_count", idx + 1);
+        }
 
-        nonce_count = nonce_count
+        total_nonce_count = total_nonce_count
             .checked_add(assignment.nonce_chunk.nonce_count)
             .ok_or_else(|| anyhow!("assignment batch nonce_count overflow"))?;
         expected_start = expected_start.wrapping_add(assignment.nonce_chunk.nonce_count);
+        normalized.push(assignment.clone());
     }
 
-    Ok(Some(WorkAssignment {
-        template: Arc::clone(&first.template),
-        nonce_chunk: NonceChunk {
-            start_nonce: first.nonce_chunk.start_nonce,
-            nonce_count,
-        },
-    }))
+    if total_nonce_count == 0 {
+        bail!("assignment batch nonce_count must be non-zero");
+    }
+
+    Ok(normalized)
 }
 
 fn ensure_compatible_template(first: &Arc<WorkTemplate>, second: &Arc<WorkTemplate>) -> Result<()> {
@@ -1657,6 +1783,16 @@ fn parse_nvidia_smi_query_output(raw: &str) -> Result<Vec<NvidiaDeviceInfo>> {
     Ok(devices)
 }
 
+fn derive_memory_budget_mib(memory_total_mib: u64, memory_free_mib: Option<u64>) -> u64 {
+    let total = memory_total_mib.max(1);
+    let reserve = (total / NVIDIA_MEMORY_RESERVE_RATIO_DENOM)
+        .max(NVIDIA_MEMORY_RESERVE_MIB_FLOOR)
+        .min(total.saturating_sub(1).max(1));
+
+    let available = memory_free_mib.unwrap_or(total).max(1).min(total);
+    available.saturating_sub(reserve).max(1)
+}
+
 fn try_allocate_cuda_buffers(
     stream: &Arc<CudaStream>,
     m_blocks: u32,
@@ -1703,13 +1839,23 @@ fn build_nvidia_autotune_key(selected: &NvidiaDeviceInfo) -> NvidiaAutotuneKey {
     let (m_cost_kib, t_cost) = pow_params()
         .map(|params| (params.m_cost(), params.t_cost()))
         .unwrap_or((0, 0));
+    let (compute_cap_major, compute_cap_minor) =
+        query_cuda_compute_capability(selected.index).unwrap_or((0, 0));
     NvidiaAutotuneKey {
         device_name: selected.name.clone(),
         memory_total_mib: selected.memory_total_mib,
+        compute_cap_major,
+        compute_cap_minor,
         m_cost_kib,
         t_cost,
         kernel_threads: KERNEL_THREADS,
     }
+}
+
+fn query_cuda_compute_capability(device_index: u32) -> Option<(u32, u32)> {
+    let ctx = CudaContext::new(device_index as usize).ok()?;
+    let (major, minor) = ctx.compute_capability().ok()?;
+    Some((u32::try_from(major).ok()?, u32::try_from(minor).ok()?))
 }
 
 fn empty_nvidia_autotune_cache() -> NvidiaAutotuneCache {
@@ -1930,6 +2076,8 @@ mod tests {
         let key = NvidiaAutotuneKey {
             device_name: "NVIDIA GeForce RTX 3080".to_string(),
             memory_total_mib: 10_240,
+            compute_cap_major: 8,
+            compute_cap_minor: 6,
             m_cost_kib: 2_097_152,
             t_cost: 1,
             kernel_threads: KERNEL_THREADS,
@@ -1965,7 +2113,7 @@ mod tests {
     }
 
     #[test]
-    fn collapse_assignment_batch_merges_contiguous_chunks() {
+    fn normalize_assignment_batch_preserves_contiguous_chunks() {
         let template = test_template(11);
         let assignments = vec![
             WorkAssignment {
@@ -1984,15 +2132,17 @@ mod tests {
             },
         ];
 
-        let collapsed = collapse_assignment_batch(&assignments)
-            .expect("batch collapse should succeed")
-            .expect("batch should not be empty");
-        assert_eq!(collapsed.nonce_chunk.start_nonce, 100);
-        assert_eq!(collapsed.nonce_chunk.nonce_count, 10);
+        let normalized =
+            normalize_assignment_batch(&assignments).expect("batch normalization should succeed");
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0].nonce_chunk.start_nonce, 100);
+        assert_eq!(normalized[0].nonce_chunk.nonce_count, 4);
+        assert_eq!(normalized[1].nonce_chunk.start_nonce, 104);
+        assert_eq!(normalized[1].nonce_chunk.nonce_count, 6);
     }
 
     #[test]
-    fn collapse_assignment_batch_rejects_non_contiguous_chunks() {
+    fn normalize_assignment_batch_rejects_non_contiguous_chunks() {
         let template = test_template(11);
         let assignments = vec![
             WorkAssignment {
@@ -2011,9 +2161,15 @@ mod tests {
             },
         ];
 
-        let err =
-            collapse_assignment_batch(&assignments).expect_err("non-contiguous chunks should fail");
+        let err = normalize_assignment_batch(&assignments)
+            .expect_err("non-contiguous chunks should fail");
         assert!(format!("{err:#}").contains("not contiguous"));
+    }
+
+    #[test]
+    fn derive_memory_budget_uses_free_vram_with_headroom() {
+        let budget = derive_memory_budget_mib(10_240, Some(9_800));
+        assert_eq!(budget, 9_640);
     }
 
     #[test]

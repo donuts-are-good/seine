@@ -12,7 +12,8 @@ This log tracks every measurable NVIDIA backend optimization attempt so we can i
 - Commit: `working tree` (post-pass)
 - Kernel model: cooperative per-lane execution (`32` threads/lane block)
 - NVRTC flags include: `--maxrregcount=<autotuned>`, `-DSEINE_FIXED_M_BLOCKS=2097152U`, `-DSEINE_FIXED_T_COST=1U`
-- NVIDIA autotune schema: `2`; regcap sweep: `240/224/208/192/160` (local cache currently selected `160`)
+- NVIDIA autotune schema: `3`; regcap sweep: `240/224/208/192/160` (autotune key now also includes CUDA compute capability; local cache currently selected `160`)
+- Startup lane sizing now uses free-VRAM-aware budgeting with a small reserve (`max(total/64, 64 MiB)`)
 - Kernel hot path writes compression output directly to destination memory (no `block_tmp` shared staging buffer)
 - Runtime hot path: no explicit pre-`memcpy_dtoh` stream synchronize in `run_fill_batch`
 - Observed best 3-round average so far: `1.214 H/s` (2026-02-13)
@@ -45,6 +46,9 @@ This log tracks every measurable NVIDIA backend optimization attempt so we can i
 | 2026-02-14 | working tree | Split NVIDIA worker channels (`assign` vs `control`), enable true nonblocking backend calls, and initially add deadline-tail lane throttling plus loop-unroll autotune candidate | same-machine `HEAD` baseline (fixed regcap `160`): kernel `1.184 H/s`, backend `1.213 H/s`; initial candidate: kernel `1.119 H/s`, backend `1.049 H/s` | Partially reverted (tail throttling + active unroll path regressed throughput) |
 | 2026-02-14 | working tree | Keep worker channel split + nonblocking control path; revert deadline-tail lane throttling | backend reruns with fixed regcap `160`: `1.195/1.248 H/s` vs `HEAD` `1.213 H/s` | Kept (`+2.89%` best-vs-baseline; control enqueue no longer blocks behind long kernel batches) |
 | 2026-02-14 | working tree | Remove live `SEINE_BLOCK_LOOP_UNROLL` NVRTC/kernel path; keep cache compatibility (`schema=2`, `#[serde(default)] block_loop_unroll`) and unroll candidate disabled | kernel reruns with fixed regcap `160`: `1.163/1.201 H/s` vs `HEAD` `1.184 H/s`; backend rerun `1.279 H/s` vs `HEAD` `1.213 H/s` | Kept (kernel best `+1.44%`; backend best `+5.44%`; avoids forced cache-rebuild churn) |
+| 2026-02-14 | working tree | True NVIDIA batch queueing (no collapse), free-VRAM-aware lane budgeting (`derive_memory_budget_mib`), autotune key/schema update (`schema=3`, include compute capability) | fresh baseline: kernel `0.964 H/s`, backend `1.045 H/s`; clean kernel candidates `1.149/1.117/1.155 H/s`; backend candidates `1.183/1.171/1.164 H/s` (additional low-clock samples `1.044/1.044 H/s`) | Kept (kernel mean `+18.29%`; backend mean `+7.29%` across all clean samples; queueing correctness + OOM resilience improved) |
+| 2026-02-14 | working tree | Deadline-tail dynamic lane throttling via per-assignment hash-time EMA | kernel candidate `0.881 H/s`; backend candidate `0.880 H/s` vs same-pass baseline `0.964/1.045 H/s` | Reverted (clear throughput regression; reduced late shares but hurt total H/s) |
+| 2026-02-14 | working tree | Little-endian memcpy fast path for seed-word expansion + final block byte packing | kernel `1.136 H/s` vs local kept-state `1.117 H/s`; backend `1.167 H/s` vs local kept-state `1.171 H/s` | Reverted (backend delta `-0.34%`, below keep gate and negative) |
 
 ## New Entry Template
 Copy this row and fill in all fields after each pass:
