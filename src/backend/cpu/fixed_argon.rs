@@ -219,17 +219,19 @@ fn fill_block_from_refs<const ISA: u8>(
     debug_assert!(prev_index < memory_blocks.len());
     debug_assert!(ref_index < memory_blocks.len());
     debug_assert!(cur_index < memory_blocks.len());
+    debug_assert_ne!(cur_index, prev_index);
+    debug_assert_ne!(cur_index, ref_index);
 
-    // Safety: caller guarantees these indices are in-bounds and refer only to already
-    // initialized blocks in the same lane; dst index always advances forward.
-    let result = unsafe {
-        compress::<ISA>(
-            memory_blocks.get_unchecked(prev_index),
-            memory_blocks.get_unchecked(ref_index),
-        )
-    };
+    // Safety: caller guarantees these indices are in-bounds and cur_index does not
+    // alias prev_index or ref_index (dst always advances forward past both sources).
+    // We use raw pointer arithmetic to obtain the three disjoint references without
+    // triggering the borrow checker's simultaneous immutable+mutable restriction.
     unsafe {
-        *memory_blocks.get_unchecked_mut(cur_index) = result;
+        let base = memory_blocks.as_mut_ptr();
+        let prev = &*base.add(prev_index);
+        let refb = &*base.add(ref_index);
+        let dst = &mut *base.add(cur_index);
+        compress_into::<ISA>(prev, refb, dst);
     }
 }
 
@@ -330,6 +332,31 @@ fn compress<const ISA: u8>(rhs: &PowBlock, lhs: &PowBlock) -> PowBlock {
         }
     }
     PowBlock::compress(rhs, lhs)
+}
+
+/// In-place variant of [`compress`] that writes the result directly into `dst`,
+/// bypassing the ABI return-value memcpy that `#[target_feature]` functions incur.
+///
+/// # Safety (caller obligations)
+/// `dst` must not alias `rhs` or `lhs`.
+#[inline(always)]
+fn compress_into<const ISA: u8>(rhs: &PowBlock, lhs: &PowBlock, dst: &mut PowBlock) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if ISA == ISA_AVX512 {
+            unsafe {
+                compress_avx512_into(rhs, lhs, dst);
+                return;
+            }
+        }
+        if ISA == ISA_AVX2 {
+            unsafe {
+                compress_avx2_into(rhs, lhs, dst);
+                return;
+            }
+        }
+    }
+    *dst = PowBlock::compress(rhs, lhs);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -526,11 +553,134 @@ unsafe fn compress_avx2(rhs: &PowBlock, lhs: &PowBlock) -> PowBlock {
     q
 }
 
+/// In-place AVX2 block compression: writes result directly into `dst`, eliminating the
+/// 1 KiB ABI return-value memcpy that the by-value `compress_avx2` incurs per call.
+///
+/// # Safety
+/// * Requires AVX2.
+/// * `dst` must not alias `rhs` or `lhs`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn compress_avx2_into(rhs: &PowBlock, lhs: &PowBlock, dst: &mut PowBlock) {
+    use std::arch::x86_64::{
+        __m256i, _mm256_loadu_si256, _mm256_set_epi64x, _mm256_storeu_si256, _mm256_xor_si256,
+    };
+
+    // q lives on the stack as the working buffer for round permutations.
+    // dst doubles as the pre-round XOR backup (r), eliminating the second stack buffer.
+    let mut q = PowBlock::default();
+
+    let rhs_ptr = rhs.0.as_ptr();
+    let lhs_ptr = lhs.0.as_ptr();
+    let dst_ptr = dst.0.as_mut_ptr();
+    let q_ptr = q.0.as_mut_ptr();
+
+    // Phase 1: XOR rhs ^ lhs → store to both dst (pre-round backup) and q (working copy).
+    for vec_idx in 0..(PowBlock::SIZE / 32) {
+        let offset = vec_idx * 4;
+        let rv = _mm256_xor_si256(
+            _mm256_loadu_si256(rhs_ptr.add(offset) as *const __m256i),
+            _mm256_loadu_si256(lhs_ptr.add(offset) as *const __m256i),
+        );
+        _mm256_storeu_si256(dst_ptr.add(offset) as *mut __m256i, rv);
+        _mm256_storeu_si256(q_ptr.add(offset) as *mut __m256i, rv);
+    }
+
+    // Phase 2: Row rounds on q (contiguous 16-element rows).
+    for row in 0..8 {
+        let base = row * 16;
+        let mut a = _mm256_loadu_si256(q_ptr.add(base) as *const __m256i);
+        let mut b = _mm256_loadu_si256(q_ptr.add(base + 4) as *const __m256i);
+        let mut c = _mm256_loadu_si256(q_ptr.add(base + 8) as *const __m256i);
+        let mut d = _mm256_loadu_si256(q_ptr.add(base + 12) as *const __m256i);
+        avx2_round(&mut a, &mut b, &mut c, &mut d);
+        _mm256_storeu_si256(q_ptr.add(base) as *mut __m256i, a);
+        _mm256_storeu_si256(q_ptr.add(base + 4) as *mut __m256i, b);
+        _mm256_storeu_si256(q_ptr.add(base + 8) as *mut __m256i, c);
+        _mm256_storeu_si256(q_ptr.add(base + 12) as *mut __m256i, d);
+    }
+
+    // Phase 3: Column rounds on q (stride-16 gather/scatter).
+    for idx in 0..8 {
+        let base = idx * 2;
+
+        let mut a = _mm256_set_epi64x(
+            q.0[base + 17] as i64,
+            q.0[base + 16] as i64,
+            q.0[base + 1] as i64,
+            q.0[base] as i64,
+        );
+        let mut b = _mm256_set_epi64x(
+            q.0[base + 49] as i64,
+            q.0[base + 48] as i64,
+            q.0[base + 33] as i64,
+            q.0[base + 32] as i64,
+        );
+        let mut c = _mm256_set_epi64x(
+            q.0[base + 81] as i64,
+            q.0[base + 80] as i64,
+            q.0[base + 65] as i64,
+            q.0[base + 64] as i64,
+        );
+        let mut d = _mm256_set_epi64x(
+            q.0[base + 113] as i64,
+            q.0[base + 112] as i64,
+            q.0[base + 97] as i64,
+            q.0[base + 96] as i64,
+        );
+
+        avx2_round(&mut a, &mut b, &mut c, &mut d);
+
+        let mut aa = [0u64; 4];
+        let mut bb = [0u64; 4];
+        let mut cc = [0u64; 4];
+        let mut dd = [0u64; 4];
+        _mm256_storeu_si256(aa.as_mut_ptr() as *mut __m256i, a);
+        _mm256_storeu_si256(bb.as_mut_ptr() as *mut __m256i, b);
+        _mm256_storeu_si256(cc.as_mut_ptr() as *mut __m256i, c);
+        _mm256_storeu_si256(dd.as_mut_ptr() as *mut __m256i, d);
+
+        q.0[base] = aa[0];
+        q.0[base + 1] = aa[1];
+        q.0[base + 16] = aa[2];
+        q.0[base + 17] = aa[3];
+        q.0[base + 32] = bb[0];
+        q.0[base + 33] = bb[1];
+        q.0[base + 48] = bb[2];
+        q.0[base + 49] = bb[3];
+        q.0[base + 64] = cc[0];
+        q.0[base + 65] = cc[1];
+        q.0[base + 80] = cc[2];
+        q.0[base + 81] = cc[3];
+        q.0[base + 96] = dd[0];
+        q.0[base + 97] = dd[1];
+        q.0[base + 112] = dd[2];
+        q.0[base + 113] = dd[3];
+    }
+
+    // Phase 4: Final XOR — dst = q ^ dst, where dst still holds the pre-round XOR.
+    for vec_idx in 0..(PowBlock::SIZE / 32) {
+        let offset = vec_idx * 4;
+        let qv = _mm256_loadu_si256(q_ptr.add(offset) as *const __m256i);
+        let dv = _mm256_loadu_si256(dst_ptr.add(offset) as *const __m256i);
+        _mm256_storeu_si256(
+            dst_ptr.add(offset) as *mut __m256i,
+            _mm256_xor_si256(qv, dv),
+        );
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512vl")]
 unsafe fn compress_avx512(rhs: &PowBlock, lhs: &PowBlock) -> PowBlock {
     // Keep AVX-512 dispatch wired while reusing the known-correct scalar transform.
     PowBlock::compress(rhs, lhs)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vl")]
+unsafe fn compress_avx512_into(rhs: &PowBlock, lhs: &PowBlock, dst: &mut PowBlock) {
+    *dst = PowBlock::compress(rhs, lhs);
 }
 
 fn blake2b_long(inputs: &[&[u8]], out: &mut [u8]) -> Result<()> {

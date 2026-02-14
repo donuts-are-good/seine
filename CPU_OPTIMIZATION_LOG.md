@@ -226,3 +226,35 @@ This pass implemented the remaining rework items that were previously proposed:
 
 - Correctness: `cargo test fixed_kernel_matches_reference_for_small_memory_configs -- --nocapture`
 - Full suite after changes: `cargo test` (`177 passed`).
+
+## 2026-02-14 in-place compress to eliminate memcpy ABI overhead
+
+### Attempt 13: AVX2 explicit rotation shuffles & column-round 128-bit loads (not adopted)
+
+- Replaced scalar `rotr32` / `rotr24` / `rotr16` with explicit `_mm256_shuffle_epi32` / `_mm256_shuffle_epi8`.
+- Replaced column-round scalar gather/scatter with 128-bit `_mm_loadu_si128` / `_mm_storeu_si128` loads.
+- Assembly comparison (`objdump -d`) showed LLVM was already emitting identical `vpshufd $0xb1`, `vpshufb`, and aligned loads in the baseline.
+- Kernel A/B result: 0% delta (no-op).
+- Status: reverted.
+
+### Attempt 14: in-place `compress_into` to eliminate 1 KB memcpy per block (adopted)
+
+- **Root cause identified**: `compress_avx2` is annotated with `#[target_feature(enable = "avx2")]`, which prevents inlining across ABI boundaries. Since `PowBlock` is 1024 bytes, the x86-64 SysV ABI returns it via a hidden pointer + `memcpy`. This `call memcpy@GLIBC` executes ~2M times per hash (~2 GB of unnecessary copies per hash).
+- **Fix**: Added `compress_into<ISA>(rhs, lhs, dst)` dispatch + `compress_avx2_into` that writes XOR and permutation results directly to `dst` (the destination block in the memory array) instead of returning a stack-allocated `PowBlock`.
+- **Borrow checker workaround**: `fill_block_from_refs` now uses raw pointer arithmetic (`as_mut_ptr() + .add()`) to obtain simultaneous `&prev`, `&refb`, `&mut dst` from the same `memory_blocks` slice, since the caller guarantees non-overlapping indices.
+- Original `compress` / `compress_avx2` retained for `update_address_block` (precomputation, not hot path).
+- Interleaved A/B (4 pairs, 30s rounds, 3 rounds + 1 warmup, 20s cooldown, release profile):
+  - Kernel summary: `data/bench_cpu_ab_kernel_inplace/summary.txt`
+    - Baseline avg: `1.372 H/s`
+    - Candidate avg: `1.428 H/s`
+    - Delta: `+4.05%`
+  - Backend summary: `data/bench_cpu_ab_backend_inplace/summary.txt`
+    - Baseline avg: `1.361 H/s`
+    - Candidate avg: `1.449 H/s`
+    - Delta: `+6.41%`
+  - Per-pair backend breakdown (candidate wins all 4):
+    - Pair 1: baseline=1.361, candidate=1.483 (B first)
+    - Pair 2: baseline=1.395, candidate=1.461 (C first)
+    - Pair 3: baseline=1.382, candidate=1.414 (B first)
+    - Pair 4: baseline=1.309, candidate=1.438 (C first)
+- Status: adopted.
