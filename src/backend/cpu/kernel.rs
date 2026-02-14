@@ -2,17 +2,15 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use argon2::{Algorithm, Argon2, Block, Version};
-use blocknet_pow_spec::POW_OUTPUT_LEN;
+use blocknet_pow_spec::{POW_MEMORY_KB, POW_OUTPUT_LEN};
 
 use crate::backend::{BackendEvent, MiningSolution};
 use crate::types::hash_meets_target;
 
 use super::{
-    emit_error, emit_event, flush_hashes, lane_quota_for_chunk, mark_startup_failed,
-    mark_worker_active, mark_worker_inactive, mark_worker_ready, pow_params, request_shutdown,
-    request_work_pause, should_flush_hashes, wait_for_work_update, Shared,
-    MAX_DEADLINE_CHECK_INTERVAL, SOLVED_MASK,
+    emit_error, emit_event, fixed_argon, flush_hashes, lane_quota_for_chunk, mark_worker_active,
+    mark_worker_inactive, mark_worker_ready, request_shutdown, request_work_pause,
+    should_flush_hashes, wait_for_work_update, Shared, MAX_DEADLINE_CHECK_INTERVAL, SOLVED_MASK,
 };
 
 pub(super) fn cpu_worker_loop(
@@ -24,21 +22,8 @@ pub(super) fn cpu_worker_loop(
         let _ = core_affinity::set_for_current(core_id);
     }
 
-    let params = match pow_params() {
-        Ok(p) => p,
-        Err(_) => {
-            mark_startup_failed(&shared);
-            emit_error(
-                &shared,
-                format!("cpu thread {thread_idx}: invalid Argon2 params"),
-            );
-            request_shutdown(&shared);
-            return;
-        }
-    };
-
-    let mut memory_blocks = vec![Block::default(); params.block_count()];
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let hasher = fixed_argon::FixedArgon2id::new(POW_MEMORY_KB);
+    let mut memory_blocks = vec![fixed_argon::PowBlock::default(); hasher.block_count()];
     let mut output = [0u8; POW_OUTPUT_LEN];
     mark_worker_ready(&shared);
     let mut local_generation = 0u64;
@@ -135,7 +120,7 @@ pub(super) fn cpu_worker_loop(
         }
 
         let nonce_bytes = nonce.to_le_bytes();
-        if argon2
+        if hasher
             .hash_password_into_with_memory(
                 &nonce_bytes,
                 &template.header_base,

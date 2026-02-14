@@ -4,8 +4,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use argon2::{Algorithm, Argon2, Block, Version};
-use blocknet_pow_spec::{pow_params, CPU_LANE_MEMORY_BYTES, POW_OUTPUT_LEN};
+use blocknet_pow_spec::{CPU_LANE_MEMORY_BYTES, POW_MEMORY_KB, POW_OUTPUT_LEN};
 use crossbeam_channel::{bounded, Sender};
 
 use crate::backend::{
@@ -17,6 +16,8 @@ use crate::config::CpuAffinityMode;
 
 #[path = "cpu/events.rs"]
 mod events;
+#[path = "cpu/fixed_argon.rs"]
+mod fixed_argon;
 #[path = "cpu/kernel.rs"]
 mod kernel;
 
@@ -588,14 +589,9 @@ impl BenchBackend for CpuBackend {
                     if let Some(core_id) = core_id {
                         let _ = core_affinity::set_for_current(core_id);
                     }
-                    let mut worker_state = match pow_params() {
-                        Ok(params) => {
-                            let memory_blocks = vec![Block::default(); params.block_count()];
-                            let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-                            Some((argon2, memory_blocks))
-                        }
-                        Err(_) => None,
-                    };
+                    let hasher = fixed_argon::FixedArgon2id::new(POW_MEMORY_KB);
+                    let mut memory_blocks =
+                        vec![fixed_argon::PowBlock::default(); hasher.block_count()];
 
                     let mut header_base = [0u8; blocknet_pow_spec::POW_HEADER_BASE_LEN];
                     for (i, byte) in header_base.iter_mut().enumerate() {
@@ -612,13 +608,10 @@ impl BenchBackend for CpuBackend {
                     let Some(stop_at) = stop_at.get().copied() else {
                         return;
                     };
-                    let Some((argon2, mut memory_blocks)) = worker_state.take() else {
-                        return;
-                    };
 
                     while Instant::now() < stop_at && !shutdown.load(Ordering::Relaxed) {
                         let nonce_bytes = nonce.to_le_bytes();
-                        if argon2
+                        if hasher
                             .hash_password_into_with_memory(
                                 &nonce_bytes,
                                 &header_base,
@@ -792,11 +785,6 @@ fn startup_ready_timeout(workers: usize) -> Duration {
 
 fn mark_worker_ready(shared: &Shared) {
     shared.ready_workers.fetch_add(1, Ordering::AcqRel);
-    shared.ready_cv.notify_all();
-}
-
-fn mark_startup_failed(shared: &Shared) {
-    shared.startup_failed.store(true, Ordering::Release);
     shared.ready_cv.notify_all();
 }
 

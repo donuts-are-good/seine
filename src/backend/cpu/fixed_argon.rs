@@ -1,0 +1,493 @@
+use std::convert::TryInto;
+use std::num::Wrapping;
+
+use blake2::digest::{Digest, VariableOutput};
+use blake2::{Blake2b512, Blake2bVar};
+
+const ARGON2_VERSION_13: u32 = 0x13;
+const ARGON2_TYPE_ID: u32 = 2;
+const ARGON2_LANES: u32 = 1;
+const ARGON2_T_COST: u32 = 1;
+const ADDRESSES_IN_BLOCK: usize = 128;
+const SYNC_POINTS: usize = 4;
+const MIN_PWD_LEN: usize = 0;
+const MAX_PWD_LEN: usize = 0xFFFF_FFFF;
+const MIN_SALT_LEN: usize = 8;
+const MAX_SALT_LEN: usize = 0xFFFF_FFFF;
+const MIN_OUTPUT_LEN: usize = 4;
+const TRUNC: u64 = u32::MAX as u64;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum Error {
+    PwdTooLong,
+    SaltTooShort,
+    SaltTooLong,
+    OutputTooShort,
+    OutputTooLong,
+    MemoryTooLittle,
+}
+
+type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FixedArgon2id {
+    requested_memory_kib: u32,
+    block_count: usize,
+    segment_length: usize,
+}
+
+impl FixedArgon2id {
+    pub(super) fn new(requested_memory_kib: u32) -> Self {
+        let lanes = ARGON2_LANES as usize;
+        let min_blocks = 2 * SYNC_POINTS * lanes;
+        let memory_blocks = requested_memory_kib.max(min_blocks as u32) as usize;
+        let segment_length = memory_blocks / (lanes * SYNC_POINTS);
+        let block_count = segment_length * lanes * SYNC_POINTS;
+        Self {
+            requested_memory_kib,
+            block_count,
+            segment_length,
+        }
+    }
+
+    pub(super) const fn block_count(&self) -> usize {
+        self.block_count
+    }
+
+    pub(super) fn hash_password_into_with_memory(
+        &self,
+        pwd: &[u8],
+        salt: &[u8],
+        out: &mut [u8],
+        memory_blocks: &mut [PowBlock],
+    ) -> Result<()> {
+        verify_inputs(pwd, salt, out)?;
+        let memory_blocks = memory_blocks
+            .get_mut(..self.block_count)
+            .ok_or(Error::MemoryTooLittle)?;
+
+        let initial_hash = initial_hash(
+            self.requested_memory_kib,
+            ARGON2_T_COST,
+            ARGON2_LANES,
+            pwd,
+            salt,
+            out,
+        );
+
+        initialize_lane_blocks(memory_blocks, initial_hash)?;
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                self.fill_blocks::<true>(memory_blocks);
+            } else {
+                self.fill_blocks::<false>(memory_blocks);
+            }
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            self.fill_blocks::<false>(memory_blocks);
+        }
+
+        finalize(memory_blocks, out)
+    }
+
+    fn fill_blocks<const AVX2: bool>(&self, memory_blocks: &mut [PowBlock]) {
+        for slice in 0..SYNC_POINTS {
+            let data_independent_addressing = slice < (SYNC_POINTS / 2);
+            let mut address_block = PowBlock::default();
+            let mut input_block = PowBlock::default();
+            let zero_block = PowBlock::default();
+
+            if data_independent_addressing {
+                input_block.as_mut()[..6].copy_from_slice(&[
+                    0,
+                    0,
+                    slice as u64,
+                    self.block_count as u64,
+                    ARGON2_T_COST as u64,
+                    ARGON2_TYPE_ID as u64,
+                ]);
+            }
+
+            let first_block = if slice == 0 {
+                if data_independent_addressing {
+                    update_address_block::<AVX2>(&mut address_block, &mut input_block, &zero_block);
+                }
+                2
+            } else {
+                0
+            };
+
+            let mut cur_index = slice * self.segment_length + first_block;
+            let mut prev_index = cur_index.saturating_sub(1);
+
+            for block in first_block..self.segment_length {
+                let rand = if data_independent_addressing {
+                    let address_idx = block % ADDRESSES_IN_BLOCK;
+                    if address_idx == 0 {
+                        update_address_block::<AVX2>(
+                            &mut address_block,
+                            &mut input_block,
+                            &zero_block,
+                        );
+                    }
+                    address_block.as_ref()[address_idx]
+                } else {
+                    memory_blocks[prev_index].as_ref()[0]
+                };
+
+                let reference_area_size = if slice == 0 {
+                    block.saturating_sub(1)
+                } else {
+                    slice
+                        .saturating_mul(self.segment_length)
+                        .saturating_add(block)
+                        .saturating_sub(1)
+                };
+
+                let mut map = rand & 0xFFFF_FFFF;
+                map = (map * map) >> 32;
+                let relative_position = reference_area_size
+                    .saturating_sub(1)
+                    .saturating_sub(((reference_area_size as u64 * map) >> 32) as usize);
+                let ref_index = relative_position % self.block_count;
+
+                let result =
+                    compress::<AVX2>(&memory_blocks[prev_index], &memory_blocks[ref_index]);
+                memory_blocks[cur_index] = result;
+                prev_index = cur_index;
+                cur_index = cur_index.saturating_add(1);
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn verify_inputs(pwd: &[u8], salt: &[u8], out: &[u8]) -> Result<()> {
+    if pwd.len() < MIN_PWD_LEN || pwd.len() > MAX_PWD_LEN {
+        return Err(Error::PwdTooLong);
+    }
+    if salt.len() < MIN_SALT_LEN {
+        return Err(Error::SaltTooShort);
+    }
+    if salt.len() > MAX_SALT_LEN {
+        return Err(Error::SaltTooLong);
+    }
+    if out.len() < MIN_OUTPUT_LEN {
+        return Err(Error::OutputTooShort);
+    }
+    if out.len() > u32::MAX as usize {
+        return Err(Error::OutputTooLong);
+    }
+    Ok(())
+}
+
+fn initial_hash(
+    memory_kib: u32,
+    t_cost: u32,
+    lanes: u32,
+    pwd: &[u8],
+    salt: &[u8],
+    out: &[u8],
+) -> [u8; 64] {
+    let mut digest = Blake2b512::new();
+    Digest::update(&mut digest, lanes.to_le_bytes());
+    Digest::update(&mut digest, (out.len() as u32).to_le_bytes());
+    Digest::update(&mut digest, memory_kib.to_le_bytes());
+    Digest::update(&mut digest, t_cost.to_le_bytes());
+    Digest::update(&mut digest, ARGON2_VERSION_13.to_le_bytes());
+    Digest::update(&mut digest, ARGON2_TYPE_ID.to_le_bytes());
+    Digest::update(&mut digest, (pwd.len() as u32).to_le_bytes());
+    Digest::update(&mut digest, pwd);
+    Digest::update(&mut digest, (salt.len() as u32).to_le_bytes());
+    Digest::update(&mut digest, salt);
+    Digest::update(&mut digest, 0u32.to_le_bytes());
+    Digest::update(&mut digest, 0u32.to_le_bytes());
+    let output = digest.finalize();
+    output.into()
+}
+
+fn initialize_lane_blocks(memory_blocks: &mut [PowBlock], initial_hash: [u8; 64]) -> Result<()> {
+    for (idx, block) in memory_blocks.iter_mut().take(2).enumerate() {
+        let mut hash = [0u8; PowBlock::SIZE];
+        let i = idx as u32;
+        let lane = 0u32;
+        blake2b_long(
+            &[&initial_hash, &i.to_le_bytes(), &lane.to_le_bytes()],
+            &mut hash,
+        )?;
+        block.load(&hash);
+    }
+    Ok(())
+}
+
+fn finalize(memory_blocks: &[PowBlock], out: &mut [u8]) -> Result<()> {
+    let Some(last_block) = memory_blocks.last() else {
+        return Err(Error::MemoryTooLittle);
+    };
+    let mut blockhash_bytes = [0u8; PowBlock::SIZE];
+    for (chunk, value) in blockhash_bytes.chunks_mut(8).zip(last_block.iter()) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+    blake2b_long(&[&blockhash_bytes], out)
+}
+
+#[inline(always)]
+fn update_address_block<const AVX2: bool>(
+    address_block: &mut PowBlock,
+    input_block: &mut PowBlock,
+    zero_block: &PowBlock,
+) {
+    input_block.as_mut()[6] = input_block.as_mut()[6].wrapping_add(1);
+    *address_block = compress::<AVX2>(zero_block, input_block);
+    *address_block = compress::<AVX2>(zero_block, address_block);
+}
+
+#[inline(always)]
+fn compress<const AVX2: bool>(rhs: &PowBlock, lhs: &PowBlock) -> PowBlock {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if AVX2 {
+        unsafe {
+            return compress_avx2(rhs, lhs);
+        }
+    }
+    PowBlock::compress(rhs, lhs)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn compress_avx2(rhs: &PowBlock, lhs: &PowBlock) -> PowBlock {
+    PowBlock::compress(rhs, lhs)
+}
+
+fn blake2b_long(inputs: &[&[u8]], out: &mut [u8]) -> Result<()> {
+    if out.is_empty() {
+        return Err(Error::OutputTooShort);
+    }
+    if out.len() > u32::MAX as usize {
+        return Err(Error::OutputTooLong);
+    }
+    let len_bytes = (out.len() as u32).to_le_bytes();
+
+    if out.len() <= Blake2b512::output_size() {
+        let mut digest = Blake2bVar::new(out.len()).map_err(|_| Error::OutputTooLong)?;
+        blake2::digest::Update::update(&mut digest, &len_bytes);
+        for input in inputs {
+            blake2::digest::Update::update(&mut digest, input);
+        }
+        digest
+            .finalize_variable(out)
+            .map_err(|_| Error::OutputTooLong)?;
+        return Ok(());
+    }
+
+    let half_hash_len = Blake2b512::output_size() / 2;
+    let mut digest = Blake2b512::new();
+    Digest::update(&mut digest, len_bytes);
+    for input in inputs {
+        Digest::update(&mut digest, input);
+    }
+    let mut last_output = digest.finalize();
+    out[..half_hash_len].copy_from_slice(&last_output[..half_hash_len]);
+
+    let mut counter = 0usize;
+    let out_len = out.len();
+    for chunk in out[half_hash_len..]
+        .chunks_exact_mut(half_hash_len)
+        .take_while(|_| {
+            counter = counter.saturating_add(half_hash_len);
+            out_len.saturating_sub(counter) > 64
+        })
+    {
+        last_output = Blake2b512::digest(last_output);
+        chunk.copy_from_slice(&last_output[..half_hash_len]);
+    }
+
+    let last_block_size = out.len().saturating_sub(counter);
+    let mut digest = Blake2bVar::new(last_block_size).map_err(|_| Error::OutputTooLong)?;
+    blake2::digest::Update::update(&mut digest, &last_output);
+    digest
+        .finalize_variable(&mut out[counter..])
+        .map_err(|_| Error::OutputTooLong)?;
+    Ok(())
+}
+
+#[rustfmt::skip]
+macro_rules! permute_step {
+    ($a:expr, $b:expr, $c:expr, $d:expr) => {
+        $a = (Wrapping($a) + Wrapping($b) + (Wrapping(2) * Wrapping(($a & TRUNC) * ($b & TRUNC)))).0;
+        $d = ($d ^ $a).rotate_right(32);
+        $c = (Wrapping($c) + Wrapping($d) + (Wrapping(2) * Wrapping(($c & TRUNC) * ($d & TRUNC)))).0;
+        $b = ($b ^ $c).rotate_right(24);
+
+        $a = (Wrapping($a) + Wrapping($b) + (Wrapping(2) * Wrapping(($a & TRUNC) * ($b & TRUNC)))).0;
+        $d = ($d ^ $a).rotate_right(16);
+        $c = (Wrapping($c) + Wrapping($d) + (Wrapping(2) * Wrapping(($c & TRUNC) * ($d & TRUNC)))).0;
+        $b = ($b ^ $c).rotate_right(63);
+    };
+}
+
+macro_rules! permute {
+    (
+        $v0:expr, $v1:expr, $v2:expr, $v3:expr,
+        $v4:expr, $v5:expr, $v6:expr, $v7:expr,
+        $v8:expr, $v9:expr, $v10:expr, $v11:expr,
+        $v12:expr, $v13:expr, $v14:expr, $v15:expr,
+    ) => {
+        permute_step!($v0, $v4, $v8, $v12);
+        permute_step!($v1, $v5, $v9, $v13);
+        permute_step!($v2, $v6, $v10, $v14);
+        permute_step!($v3, $v7, $v11, $v15);
+        permute_step!($v0, $v5, $v10, $v15);
+        permute_step!($v1, $v6, $v11, $v12);
+        permute_step!($v2, $v7, $v8, $v13);
+        permute_step!($v3, $v4, $v9, $v14);
+    };
+}
+
+#[derive(Copy, Clone, Debug)]
+#[repr(align(64))]
+pub(super) struct PowBlock([u64; Self::SIZE / 8]);
+
+impl PowBlock {
+    pub(super) const SIZE: usize = 1024;
+
+    #[inline(always)]
+    fn load(&mut self, input: &[u8; Self::SIZE]) {
+        for (idx, chunk) in input.chunks(8).enumerate() {
+            self.0[idx] = u64::from_le_bytes(chunk.try_into().expect("chunk must be 8 bytes"));
+        }
+    }
+
+    #[inline(always)]
+    fn iter(&self) -> std::slice::Iter<'_, u64> {
+        self.0.iter()
+    }
+
+    #[inline(always)]
+    fn compress(rhs: &Self, lhs: &Self) -> Self {
+        let r = *rhs ^ lhs;
+        let mut q = r;
+
+        for chunk in q.0.chunks_exact_mut(16) {
+            #[rustfmt::skip]
+            permute!(
+                chunk[0], chunk[1], chunk[2], chunk[3],
+                chunk[4], chunk[5], chunk[6], chunk[7],
+                chunk[8], chunk[9], chunk[10], chunk[11],
+                chunk[12], chunk[13], chunk[14], chunk[15],
+            );
+        }
+
+        for idx in 0..8 {
+            let base = idx * 2;
+            #[rustfmt::skip]
+            permute!(
+                q.0[base], q.0[base + 1],
+                q.0[base + 16], q.0[base + 17],
+                q.0[base + 32], q.0[base + 33],
+                q.0[base + 48], q.0[base + 49],
+                q.0[base + 64], q.0[base + 65],
+                q.0[base + 80], q.0[base + 81],
+                q.0[base + 96], q.0[base + 97],
+                q.0[base + 112], q.0[base + 113],
+            );
+        }
+
+        q ^= &r;
+        q
+    }
+}
+
+impl Default for PowBlock {
+    fn default() -> Self {
+        Self([0u64; Self::SIZE / 8])
+    }
+}
+
+impl AsRef<[u64]> for PowBlock {
+    fn as_ref(&self) -> &[u64] {
+        &self.0
+    }
+}
+
+impl AsMut<[u64]> for PowBlock {
+    fn as_mut(&mut self) -> &mut [u64] {
+        &mut self.0
+    }
+}
+
+impl std::ops::BitXor<&PowBlock> for PowBlock {
+    type Output = PowBlock;
+
+    fn bitxor(mut self, rhs: &PowBlock) -> Self::Output {
+        self ^= rhs;
+        self
+    }
+}
+
+impl std::ops::BitXorAssign<&PowBlock> for PowBlock {
+    fn bitxor_assign(&mut self, rhs: &PowBlock) {
+        for (dst, src) in self.0.iter_mut().zip(rhs.0.iter()) {
+            *dst ^= src;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    use super::{FixedArgon2id, PowBlock};
+
+    #[test]
+    fn fixed_kernel_matches_reference_for_small_memory_configs() {
+        let memory_kib_values = [8u32, 32u32, 65u32, 4096u32];
+        let salts = [
+            b"12345678".as_slice(),
+            b"headerbase0123456789abcdefghijklmnop".as_slice(),
+        ];
+        let nonces = [0u64, 1u64, 7u64, 42u64, 1_000_003u64];
+
+        for memory_kib in memory_kib_values {
+            let params =
+                Params::new(memory_kib, 1, 1, Some(32)).expect("reference params should be valid");
+            let reference_block_count = params.block_count();
+            let reference = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+            let fixed = FixedArgon2id::new(memory_kib);
+            let mut fixed_memory = vec![PowBlock::default(); fixed.block_count()];
+            let mut reference_memory = vec![argon2::Block::default(); reference_block_count];
+
+            for salt in salts {
+                for nonce in nonces {
+                    let nonce_bytes = nonce.to_le_bytes();
+                    let mut expected = [0u8; 32];
+                    let mut actual = [0u8; 32];
+
+                    reference
+                        .hash_password_into_with_memory(
+                            &nonce_bytes,
+                            salt,
+                            &mut expected,
+                            &mut reference_memory,
+                        )
+                        .expect("reference hashing should succeed");
+                    fixed
+                        .hash_password_into_with_memory(
+                            &nonce_bytes,
+                            salt,
+                            &mut actual,
+                            &mut fixed_memory,
+                        )
+                        .expect("fixed hashing should succeed");
+                    assert_eq!(
+                        actual, expected,
+                        "mismatch for m_cost={memory_kib} nonce={nonce}"
+                    );
+                }
+            }
+        }
+    }
+}

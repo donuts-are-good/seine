@@ -7,7 +7,7 @@ license = "BSD-3-Clause"
 [dependencies]
 anyhow = "1.0"
 argon2 = "0.5"
-blake2 = { version = "0.10", optional = true }
+blake2 = "0.10"
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.28"
 ctrlc = "3.4"
@@ -25,7 +25,7 @@ sysinfo = "0.31"
 
 [features]
 default = ["nvidia"]
-nvidia = ["dep:blake2", "dep:cudarc"]
+nvidia = ["dep:cudarc"]
 
 [dev-dependencies]
 httpmock = "0.7"
