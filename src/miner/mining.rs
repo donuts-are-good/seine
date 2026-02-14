@@ -1002,10 +1002,12 @@ pub(super) fn run_mining_loop(
 
     if !backends.is_empty() {
         let final_submit_template = SubmitTemplate::from_template(&template);
+        info("MINER", "shutting down: quiescing backends...");
         match quiesce_backend_slots(backends, RuntimeMode::Mining, backend_executor) {
             Ok(_) => {}
             Err(err) => warn("BACKEND", format!("final backend quiesce failed: {err:#}")),
         }
+        info("MINER", "shutting down: draining final events...");
         let mut final_pending_solution = None;
         {
             let mut deferred_state = DeferredQueueState {
@@ -1095,6 +1097,7 @@ pub(super) fn run_mining_loop(
         &mut inflight_solution_keys,
         &stats,
     );
+    info("MINER", "shutting down: flushing pending submits...");
     process_submit_results(
         control_plane.finish(&stats, &mut tui),
         &mut deferred_solutions,

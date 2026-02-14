@@ -379,11 +379,17 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
     );
 
     let shutdown_requested = shutdown.load(Ordering::SeqCst);
+    info("MINER", "shutting down: stopping backends...");
+    let stop_t = Instant::now();
     stop_backend_slots(
         &mut backends,
         &backend_executor,
         cfg.backend_control_timeout,
         "BACKEND",
+    );
+    info(
+        "MINER",
+        format!("backends stopped in {:.1}s", stop_t.elapsed().as_secs_f64()),
     );
     shutdown.store(true, Ordering::SeqCst);
     if let Some(listener) = tip_listener {
@@ -1059,8 +1065,31 @@ fn activate_backends(
         let (backend_event_tx, backend_event_rx) =
             bounded::<BackendEvent>(per_backend_event_capacity);
         backend.set_event_sink(backend_event_tx);
+        let backend_start_detail = match backend_name {
+            "cpu" => {
+                let lanes = backend.lanes();
+                let ram_gib =
+                    (lanes as f64 * CPU_LANE_MEMORY_BYTES as f64) / (1024.0 * 1024.0 * 1024.0);
+                format!(
+                    "{backend_name}: initializing {lanes} workers (~{ram_gib:.1} GiB RAM, precomputing refs)...",
+                )
+            }
+            "nvidia" => format!(
+                "{backend_name}: compiling CUDA kernel and allocating device memory (first launch may take ~2 min)...",
+            ),
+            _ => format!("{backend_name}: initializing..."),
+        };
+        info("BACKEND", &backend_start_detail);
+        let start_t = Instant::now();
         match backend.start() {
             Ok(()) => {
+                info(
+                    "BACKEND",
+                    format!(
+                        "{backend_name}: ready in {:.1}s",
+                        start_t.elapsed().as_secs_f64()
+                    ),
+                );
                 let capabilities = match backend_capabilities_for_start(
                     backend.as_ref(),
                     backend_name,
