@@ -1875,22 +1875,28 @@ fn handle_worker_command(
     match cmd {
         WorkerCommand::Assign(work) => {
             shared.cancel_requested.store(false, Ordering::Release);
-            *adaptive_pressure =
-                adaptive_pressure.saturating_add(ADAPTIVE_DEPTH_PRESSURE_REPLACE_BONUS);
+            if active.is_some() || !queued.is_empty() {
+                *adaptive_pressure =
+                    adaptive_pressure.saturating_add(ADAPTIVE_DEPTH_PRESSURE_REPLACE_BONUS);
+            }
             replace_assignment_queue(shared, active, queued, vec![work]);
             true
         }
         WorkerCommand::AssignBatch(work) => {
             shared.cancel_requested.store(false, Ordering::Release);
-            *adaptive_pressure =
-                adaptive_pressure.saturating_add(ADAPTIVE_DEPTH_PRESSURE_REPLACE_BONUS);
+            if active.is_some() || !queued.is_empty() {
+                *adaptive_pressure =
+                    adaptive_pressure.saturating_add(ADAPTIVE_DEPTH_PRESSURE_REPLACE_BONUS);
+            }
             replace_assignment_queue(shared, active, queued, work);
             true
         }
         WorkerCommand::Cancel(ack) => {
             shared.cancel_requested.store(false, Ordering::Release);
-            *adaptive_pressure =
-                adaptive_pressure.saturating_add(ADAPTIVE_DEPTH_PRESSURE_CONTROL_BONUS);
+            if active.is_some() || !queued.is_empty() {
+                *adaptive_pressure =
+                    adaptive_pressure.saturating_add(ADAPTIVE_DEPTH_PRESSURE_CONTROL_BONUS);
+            }
             if let Some(current) = active.as_ref() {
                 finalize_active_assignment(shared, current, 0);
                 *active = None;
@@ -1904,11 +1910,11 @@ fn handle_worker_command(
             true
         }
         WorkerCommand::Fence(ack) => {
-            *adaptive_pressure =
-                adaptive_pressure.saturating_add(ADAPTIVE_DEPTH_PRESSURE_CONTROL_BONUS);
             if active.is_none() && queued.is_empty() {
                 let _ = ack.send(Ok(()));
             } else {
+                *adaptive_pressure =
+                    adaptive_pressure.saturating_add(ADAPTIVE_DEPTH_PRESSURE_CONTROL_BONUS);
                 fence_waiters.push(ack);
             }
             true
