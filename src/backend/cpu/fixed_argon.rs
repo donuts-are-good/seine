@@ -870,7 +870,11 @@ unsafe fn compress_neon(rhs: &PowBlock, lhs: &PowBlock) -> PowBlock {
     result
 }
 
-/// In-place NEON block compression.
+/// In-place NEON block compression with fused phases.
+///
+/// Fuses Phase 1 (XOR) with Phase 2 (row rounds) and Phase 3 (column rounds)
+/// with Phase 4 (final XOR).  This eliminates 128 stores to q in Phase 1 and
+/// 128 loads from q in Phase 2/4, reducing total memory ops by ~36%.
 ///
 /// # Safety
 /// `dst` must not alias `rhs` or `lhs`.
@@ -879,9 +883,8 @@ unsafe fn compress_neon(rhs: &PowBlock, lhs: &PowBlock) -> PowBlock {
 unsafe fn compress_neon_into(rhs: &PowBlock, lhs: &PowBlock, dst: &mut PowBlock) {
     use std::arch::aarch64::{uint64x2_t, veorq_u64, vld1q_u64, vst1q_u64};
 
-    // q is the working buffer for round permutations.
-    // dst doubles as the pre-round XOR backup, eliminating a second stack buffer.
-    // Use MaybeUninit to skip zero-initialization — Phase 1 fully overwrites q.
+    // q is the working buffer between row and column rounds.
+    // Use MaybeUninit — the fused Phase 1+2 loop fully writes q.
     let mut q = std::mem::MaybeUninit::<PowBlock>::uninit();
 
     let rhs_ptr = rhs.0.as_ptr();
@@ -889,29 +892,31 @@ unsafe fn compress_neon_into(rhs: &PowBlock, lhs: &PowBlock, dst: &mut PowBlock)
     let dst_ptr = dst.0.as_mut_ptr();
     let q_ptr = q.as_mut_ptr() as *mut u64;
 
-    // Phase 1: XOR rhs ^ lhs → store to both dst (backup) and q (working copy).
-    for vec_idx in 0..(PowBlock::SIZE / 16) {
-        let off = vec_idx * 2;
-        let v = veorq_u64(
-            vld1q_u64(rhs_ptr.add(off)),
-            vld1q_u64(lhs_ptr.add(off)),
-        );
-        vst1q_u64(dst_ptr.add(off), v);
-        vst1q_u64(q_ptr.add(off), v);
-    }
-
-    // Phase 2: Row rounds on q (8 rows × 16 contiguous u64 elements each).
+    // Fused Phase 1+2: XOR rhs^lhs directly into registers, store backup to
+    // dst, row-round in registers, store result to q.  Eliminates the separate
+    // Phase 1 store-to-q and Phase 2 load-from-q round-trip.
     for row in 0..8 {
         let base = row * 16;
-        let mut a_lo: uint64x2_t = vld1q_u64(q_ptr.add(base));
-        let mut a_hi: uint64x2_t = vld1q_u64(q_ptr.add(base + 2));
-        let mut b_lo: uint64x2_t = vld1q_u64(q_ptr.add(base + 4));
-        let mut b_hi: uint64x2_t = vld1q_u64(q_ptr.add(base + 6));
-        let mut c_lo: uint64x2_t = vld1q_u64(q_ptr.add(base + 8));
-        let mut c_hi: uint64x2_t = vld1q_u64(q_ptr.add(base + 10));
-        let mut d_lo: uint64x2_t = vld1q_u64(q_ptr.add(base + 12));
-        let mut d_hi: uint64x2_t = vld1q_u64(q_ptr.add(base + 14));
+        let mut a_lo: uint64x2_t = veorq_u64(vld1q_u64(rhs_ptr.add(base)), vld1q_u64(lhs_ptr.add(base)));
+        let mut a_hi: uint64x2_t = veorq_u64(vld1q_u64(rhs_ptr.add(base + 2)), vld1q_u64(lhs_ptr.add(base + 2)));
+        let mut b_lo: uint64x2_t = veorq_u64(vld1q_u64(rhs_ptr.add(base + 4)), vld1q_u64(lhs_ptr.add(base + 4)));
+        let mut b_hi: uint64x2_t = veorq_u64(vld1q_u64(rhs_ptr.add(base + 6)), vld1q_u64(lhs_ptr.add(base + 6)));
+        let mut c_lo: uint64x2_t = veorq_u64(vld1q_u64(rhs_ptr.add(base + 8)), vld1q_u64(lhs_ptr.add(base + 8)));
+        let mut c_hi: uint64x2_t = veorq_u64(vld1q_u64(rhs_ptr.add(base + 10)), vld1q_u64(lhs_ptr.add(base + 10)));
+        let mut d_lo: uint64x2_t = veorq_u64(vld1q_u64(rhs_ptr.add(base + 12)), vld1q_u64(lhs_ptr.add(base + 12)));
+        let mut d_hi: uint64x2_t = veorq_u64(vld1q_u64(rhs_ptr.add(base + 14)), vld1q_u64(lhs_ptr.add(base + 14)));
 
+        // Store pre-round XOR to dst as backup for Phase 4.
+        vst1q_u64(dst_ptr.add(base), a_lo);
+        vst1q_u64(dst_ptr.add(base + 2), a_hi);
+        vst1q_u64(dst_ptr.add(base + 4), b_lo);
+        vst1q_u64(dst_ptr.add(base + 6), b_hi);
+        vst1q_u64(dst_ptr.add(base + 8), c_lo);
+        vst1q_u64(dst_ptr.add(base + 10), c_hi);
+        vst1q_u64(dst_ptr.add(base + 12), d_lo);
+        vst1q_u64(dst_ptr.add(base + 14), d_hi);
+
+        // Row round in registers — no load/store needed.
         neon_round(
             &mut a_lo, &mut a_hi,
             &mut b_lo, &mut b_hi,
@@ -919,6 +924,7 @@ unsafe fn compress_neon_into(rhs: &PowBlock, lhs: &PowBlock, dst: &mut PowBlock)
             &mut d_lo, &mut d_hi,
         );
 
+        // Store row-rounded result to q for column rounds.
         vst1q_u64(q_ptr.add(base), a_lo);
         vst1q_u64(q_ptr.add(base + 2), a_hi);
         vst1q_u64(q_ptr.add(base + 4), b_lo);
@@ -929,8 +935,9 @@ unsafe fn compress_neon_into(rhs: &PowBlock, lhs: &PowBlock, dst: &mut PowBlock)
         vst1q_u64(q_ptr.add(base + 14), d_hi);
     }
 
-    // Phase 3: Column rounds on q (8 columns, stride-16 gather via contiguous
-    // pair loads at offsets base, base+16, base+32, …, base+112).
+    // Fused Phase 3+4: Column-round q, then XOR with dst backup and store
+    // directly to dst.  Eliminates the separate Phase 3 store-to-q and
+    // Phase 4 load-from-q round-trip.
     for idx in 0..8 {
         let base = idx * 2;
         let mut a_lo: uint64x2_t = vld1q_u64(q_ptr.add(base));
@@ -949,23 +956,15 @@ unsafe fn compress_neon_into(rhs: &PowBlock, lhs: &PowBlock, dst: &mut PowBlock)
             &mut d_lo, &mut d_hi,
         );
 
-        vst1q_u64(q_ptr.add(base), a_lo);
-        vst1q_u64(q_ptr.add(base + 16), a_hi);
-        vst1q_u64(q_ptr.add(base + 32), b_lo);
-        vst1q_u64(q_ptr.add(base + 48), b_hi);
-        vst1q_u64(q_ptr.add(base + 64), c_lo);
-        vst1q_u64(q_ptr.add(base + 80), c_hi);
-        vst1q_u64(q_ptr.add(base + 96), d_lo);
-        vst1q_u64(q_ptr.add(base + 112), d_hi);
-    }
-
-    // Phase 4: Final XOR — dst = q ^ dst.
-    for vec_idx in 0..(PowBlock::SIZE / 16) {
-        let off = vec_idx * 2;
-        vst1q_u64(
-            dst_ptr.add(off),
-            veorq_u64(vld1q_u64(q_ptr.add(off)), vld1q_u64(dst_ptr.add(off))),
-        );
+        // XOR column-rounded result with pre-round backup in dst, store to dst.
+        vst1q_u64(dst_ptr.add(base), veorq_u64(a_lo, vld1q_u64(dst_ptr.add(base))));
+        vst1q_u64(dst_ptr.add(base + 16), veorq_u64(a_hi, vld1q_u64(dst_ptr.add(base + 16))));
+        vst1q_u64(dst_ptr.add(base + 32), veorq_u64(b_lo, vld1q_u64(dst_ptr.add(base + 32))));
+        vst1q_u64(dst_ptr.add(base + 48), veorq_u64(b_hi, vld1q_u64(dst_ptr.add(base + 48))));
+        vst1q_u64(dst_ptr.add(base + 64), veorq_u64(c_lo, vld1q_u64(dst_ptr.add(base + 64))));
+        vst1q_u64(dst_ptr.add(base + 80), veorq_u64(c_hi, vld1q_u64(dst_ptr.add(base + 80))));
+        vst1q_u64(dst_ptr.add(base + 96), veorq_u64(d_lo, vld1q_u64(dst_ptr.add(base + 96))));
+        vst1q_u64(dst_ptr.add(base + 112), veorq_u64(d_hi, vld1q_u64(dst_ptr.add(base + 112))));
     }
 }
 
