@@ -289,8 +289,7 @@ fn fill_block_from_refs<const ISA: u8>(
 /// entry and prime the hardware prefetcher for the full 1 KiB block.
 ///
 /// - x86_64: offsets 0 and 512 (64-byte cache lines).
-/// - AArch64: offsets 0 and 128 (Apple Silicon 128-byte cache lines); the
-///   hardware sequential prefetcher handles the remaining 768 bytes.
+/// - AArch64: all 8 cache lines at 128-byte stride (full 1024-byte block).
 #[inline(always)]
 fn prefetch_pow_block(block: &PowBlock) {
     #[cfg(target_arch = "x86_64")]
@@ -311,6 +310,10 @@ fn prefetch_pow_block(block: &PowBlock) {
                 "prfm pldl1keep, [{ptr}, #128]",
                 "prfm pldl1keep, [{ptr}, #256]",
                 "prfm pldl1keep, [{ptr}, #384]",
+                "prfm pldl1keep, [{ptr}, #512]",
+                "prfm pldl1keep, [{ptr}, #640]",
+                "prfm pldl1keep, [{ptr}, #768]",
+                "prfm pldl1keep, [{ptr}, #896]",
                 ptr = in(reg) ptr,
                 options(nostack, preserves_flags),
             );
