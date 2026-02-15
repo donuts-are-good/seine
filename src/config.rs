@@ -1111,9 +1111,53 @@ fn expand_backend_specs(
     Ok(specs)
 }
 
+/// Returns the number of performance (P) cores on macOS Apple Silicon.
+/// Uses `sysctlbyname("hw.perflevel0.logicalcpu")` which returns the P-core
+/// count on heterogeneous (big.LITTLE) Apple Silicon SoCs.  Falls back to
+/// `None` on non-macOS, Intel Macs (no perflevels), or if the query fails.
+fn pcore_count() -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn sysctlbyname(
+                name: *const u8,
+                oldp: *mut std::ffi::c_void,
+                oldlenp: *mut usize,
+                newp: *const std::ffi::c_void,
+                newlen: usize,
+            ) -> i32;
+        }
+        let mut val: u32 = 0;
+        let mut len = std::mem::size_of::<u32>();
+        let name = b"hw.perflevel0.logicalcpu\0";
+        let ret = unsafe {
+            sysctlbyname(
+                name.as_ptr(),
+                &mut val as *mut u32 as *mut std::ffi::c_void,
+                &mut len,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if ret == 0 && val > 0 {
+            Some(val as usize)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 fn auto_cpu_threads(cpu_backend_instances: usize, gpu_memory_reservation: u64) -> usize {
-    let cpu_parallelism = std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get())
+    let cpu_parallelism = pcore_count()
+        .or_else(|| {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .ok()
+        })
         .unwrap_or(1)
         .max(1);
     let memory_cap_total = detect_memory_budget_bytes()

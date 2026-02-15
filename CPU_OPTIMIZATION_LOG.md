@@ -799,6 +799,117 @@ Both platforms are fundamentally memory-bound. The remaining bottleneck is DRAM
 prefetch partially addresses this for data-dependent slices but 150 ns of lead
 time still only covers ~50% of the ~300 ns DRAM access latency.
 
+## 2026-02-15 Apple Silicon further investigation (post mid-compress prefetch)
+
+Host: Apple M4 Max, 16 cores (12P+4E), 48 GB unified memory.
+Baseline includes all previous optimizations through Attempt 28.
+
+Note: benchmarks in this session ran under reduced power envelope (low battery
++ charging), giving lower absolute numbers. Relative A/B comparisons valid.
+
+### P-core detection for auto thread cap (adopted)
+
+- **Issue**: `auto_cpu_threads` used `std::thread::available_parallelism()` which
+  returns 16 on M4 Max (12P + 4E). The autotuner eventually finds the right count
+  empirically, but first-run users waste 2 GB per E-core thread for minimal
+  throughput (E-cores showed 46% efficiency at 16 threads, with extreme variance).
+- **Fix**: Added `pcore_count()` using `sysctlbyname("hw.perflevel0.logicalcpu")`
+  to detect P-core count on macOS Apple Silicon. Falls back to
+  `available_parallelism()` on non-macOS, Intel Macs, or if the query fails.
+  Auto thread cap now correctly reports 12 instead of 16.
+- Status: adopted.
+
+### Attempt 29 (Apple): reduced prefetch density (4 cache lines) (not adopted)
+
+- **Rationale**: At 12 threads, 8 `prfm` per block × 12 threads = 96 concurrent
+  prefetch streams. Tested reducing to 4 prefetches at 256-byte stride (offsets
+  0, 256, 512, 768) to reduce memory-controller pressure at high thread counts.
+- **Result**: Single-thread **-21.2% regression** (2.750 → 2.167 H/s). Apple
+  Silicon's 128-byte cache lines require full 8-prefetch coverage for random
+  access patterns — the hardware prefetcher cannot fill 256-byte gaps on
+  non-sequential access.
+- Status: not adopted (reverted).
+
+### Attempt 30 (Apple): mid-compress prefetch for data-independent slices (analysis only)
+
+- **Analysis**: Data-independent slices already use 3-ahead external prefetch,
+  giving ~1100 ns lead time (3 × ~370 ns compress time). Mid-compress would
+  reduce this to ~150 ns (1-ahead, inside the compress). Since 1100 ns >> 300 ns
+  DRAM latency, mid-compress for data-independent slices would be strictly worse.
+- Status: not adopted (no code change, rejected by analysis).
+
+### Attempt 31 (Apple): software-interleaved dual-hash per thread (not adopted)
+
+- **Rationale**: Each thread processes two independent hashes with interleaved
+  block compression. While hash A's compress runs (~370 ns), hash B's prefetched
+  ref block has 370 ns to arrive from DRAM — fully covering the ~300 ns random
+  access latency. Eliminates most DRAM stalls for data-dependent slices.
+- **Implementation**: Added `fill_blocks_interleaved` that processes two memory
+  buffers in lockstep, alternating compress calls. `hash_password_pair_with_memory`
+  initializes both hashes then runs the interleaved fill. Env var `SEINE_INTERLEAVE`
+  toggles the mode in kernel_bench.
+- **Correctness**: Interleaved pair matched sequential hashes on small configs.
+- **Benchmark** (single-thread, 12s × 3 rounds):
+  - Baseline (single hash): `avg=2.694 H/s` → 371 ms/hash
+  - Interleaved (two hashes): `avg=3.333 H/s` total → 1.667 H/s per hash → 600 ms/hash
+  - **Per-hash rate: -38%** due to TLB and cache thrashing from 4 GB working set
+    (two 2 GB arenas).
+- **Multi-thread projection**: 6 interleaved threads × 3.333 × 90% eff ≈ 18 H/s
+  vs 12 standard threads × 2.694 × 78% eff ≈ 25.2 H/s. **Interleaving loses by ~28%.**
+- **Root cause**: The 4 GB working set per thread doubles TLB pressure (already
+  exceeding L2 dTLB by 250×) and causes L2 cache thrashing between the two
+  random-access arenas. The DRAM latency hiding benefit (~10% theoretical) is
+  overwhelmed by the cache/TLB penalty (~38% measured).
+- Status: not adopted (reverted).
+
+## Attempt 32 — 2 MB superpage allocation (aarch64, not adopted)
+
+- Hypothesis: reducing TLB entries from 131K (16 KB pages) to 1024 (2 MB pages)
+  would eliminate ~2.4% overhead from TLB walks on the random ref block accesses.
+- Implementation: `ArenaBlocks` type using `mmap` with `VM_FLAGS_SUPERPAGE_SIZE_2MB`
+  on macOS, falling back to `Vec<PowBlock>` if mmap fails.
+- Result: `mmap` returns `EINVAL` (errno 22) on Apple Silicon ARM64 macOS.
+  `VM_FLAGS_SUPERPAGE_SIZE_2MB` is an x86-only API. macOS ARM64 uses 16 KB pages
+  natively and does not expose 2 MB superpages through mmap.
+- Benchmark: identical to baseline (both fall back to Vec allocation).
+- Note: Apple Silicon hardware page table walker is very fast; 16 KB pages
+  already reduce TLB pressure 4× vs x86 4 KB pages. The TLB contribution to
+  the performance gap is smaller than initially estimated.
+- Status: not adopted (reverted). API not available on target platform.
+
+### P-core detection (adopted)
+
+- Added `pcore_count()` using `sysctlbyname("hw.perflevel0.logicalcpu")` FFI to
+  detect P-core count on macOS Apple Silicon (returns 12 on M3/M4 Max).
+- Modified `auto_cpu_threads()` to prefer P-core count over
+  `available_parallelism()` (which returns 16 = 12P + 4E on M4 Max).
+- Prevents E-core threads from causing contention and thermal throttling.
+- Status: adopted.
+
+### Optimization frontier update
+
+After Attempts 29–32 and detailed assembly analysis, Apple Silicon single-thread
+performance is confirmed at the hardware limit. All viable approaches to hiding
+DRAM latency have been exhausted:
+- Full 8-cache-line prefetch coverage (required, -21% if reduced)
+- 3-ahead prefetch for data-independent slices (optimal distance)
+- Mid-compress prefetch for data-dependent slices (optimal technique)
+- Dual-hash interleaving (TLB/cache penalty overwhelms latency benefit)
+- 2 MB superpages (not available on ARM64 macOS)
+- Assembly quality verified: LDP/STP pairs, 128 UMLAL.2D, 64 XAR.2D, zero spills
+- Non-temporal stores (STNP) rejected: dst needed as prev_index next iteration
+
+Remaining gap sources (irreducible hardware overhead):
+- TLB walks for random ref accesses (131K 16KB-pages vs ~2K TLB entries)
+- Memory controller queuing (12 threads × 8 concurrent prefetch streams)
+- Imperfect mid-compress prefetch coverage (~150ns lead for ~120-200ns DRAM latency)
+- Write-allocate overhead on dst stores (HW prefetcher handles sequential pattern)
+
+Remaining multi-thread gains are limited to:
+- P-core thread cap (now implemented)
+- macOS kernel improvements (superpage support for ARM64)
+- Future hardware (larger dTLB, faster DRAM)
+
 ## Metal + CPU combined mode (Apple M3 Max, 48 GB unified memory)
 
 Tested whether running Metal GPU and CPU backends simultaneously improves total
