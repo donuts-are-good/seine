@@ -349,3 +349,53 @@ not affect x86_64 builds.
 - Correctness: `cargo test fixed_kernel_matches_reference_for_small_memory_configs -- --nocapture` ✓
 - Cross-arch safety: all NEON changes `#[cfg(target_arch = "aarch64")]`-gated; x86_64 path unchanged.
 - Status: adopted.
+
+## 2026-02-14 Apple Silicon prefetch tuning + PGO investigation
+
+Host: Apple M4 Max, 16 cores, 48 GB unified memory.
+Post-rebase baseline includes all upstream optimizations (AVX2, in-place compress,
+x86 prefetch, fat LTO) plus the NEON SIMD commit (Attempt 17).
+
+### Post-rebase Apple Silicon baseline (long-window, 30s × 3 rounds)
+
+- Kernel: `data/bench_cpu_kernel_apple_baseline_long2.json` => `avg=1.533 H/s`
+- Backend: `data/bench_cpu_backend_apple_baseline_long2.json` => `avg=1.503 H/s`
+
+### Attempt 18: deeper prefetch on AArch64 (3-ahead + 4 cache lines) (adopted)
+
+- **Rationale**: Apple M4 Max has higher DRAM latency relative to x86 desktop CPUs,
+  and its unified memory architecture benefits from earlier prefetch hints. The
+  128-byte cache line means 2 prefetches only prime 256 bytes of a 1024-byte block.
+- **Changes** (all `#[cfg(target_arch = "aarch64")]`-gated, x86 unchanged):
+  - Data-independent slices: increased prefetch distance from 2-ahead to 3-ahead.
+  - Pre-loop priming: prefetch first 3 blocks (was 1) before entering the fill loop.
+  - `prefetch_pow_block` on AArch64: expanded from 2 `prfm` instructions (offsets 0,
+    128 = 256 bytes) to 4 `prfm` instructions (offsets 0, 128, 256, 384 = 512 bytes),
+    covering half the 1 KiB block and letting the hardware prefetcher handle the rest.
+- **Long-window confirmation** (30s × 3 rounds, sequential A/B):
+  - Kernel: `data/bench_cpu_kernel_apple_prefetch3ahead_long.json` => `avg=1.578 H/s`
+  - Backend: `data/bench_cpu_backend_apple_prefetch3ahead_long.json` => `avg=1.540 H/s`
+  - **Kernel delta vs post-rebase baseline: +2.94%** (`1.578 / 1.533 - 1`)
+  - **Backend delta vs post-rebase baseline: +2.46%** (`1.540 / 1.503 - 1`)
+- Correctness: `cargo test` (169 passed) ✓
+- Cross-arch safety: all changes `#[cfg(target_arch = "aarch64")]`-gated.
+- Status: adopted.
+
+### Attempt 19: Profile-Guided Optimization (PGO) (not adopted)
+
+- **Rationale**: PGO allows LLVM to optimize branch prediction, inlining, and code
+  layout based on actual runtime behavior. Potentially beneficial for the complex
+  control flow in `fill_blocks` (data-independent vs data-dependent paths).
+- **Methodology**:
+  - Instrumented build: `RUSTFLAGS="-Cprofile-generate=/tmp/seine-pgo-profiles"`.
+  - Profile collection: kernel bench (12s × 2 rounds + 1 warmup).
+  - Merged profiles: `llvm-profdata merge`.
+  - Optimized build: `RUSTFLAGS="-Cprofile-use=/tmp/seine-pgo-merged.profdata"`.
+- **Long-window results** (30s × 3 rounds, includes Attempt 18 prefetch changes):
+  - Kernel: `avg=1.567 H/s` (vs 1.578 without PGO, **-0.7%**)
+  - Backend: `avg=1.580 H/s` (vs 1.540 without PGO, **+2.6%**)
+- **Outcome**: mixed/inconsistent results — kernel regressed slightly, backend
+  improved slightly. With fat LTO + codegen-units=1 already providing whole-program
+  optimization, PGO adds no consistent benefit. The two-step build complexity
+  (machine-specific profiles, fragile across code changes) is not justified.
+- Status: not adopted.

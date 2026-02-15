@@ -126,19 +126,30 @@ impl FixedArgon2id {
 
             if data_independent_addressing {
                 let ref_base = slice * self.segment_length;
-                // Prefetch the first ref block before entering the loop.
+                // Prefetch the first ref blocks before entering the loop.
+                // AArch64 uses 3-ahead, so prime the first 3; others use 1-ahead.
+                #[cfg(target_arch = "aarch64")]
+                {
+                    for pre in 0..3usize {
+                        let idx = first_block + pre;
+                        if idx < self.segment_length {
+                            prefetch_pow_block(&memory_blocks[self.data_independent_ref_indexes[ref_base + idx]]);
+                        }
+                    }
+                }
+                #[cfg(not(target_arch = "aarch64"))]
                 if first_block < self.segment_length {
                     prefetch_pow_block(&memory_blocks[self.data_independent_ref_indexes[ref_base + first_block]]);
                 }
                 for block in first_block..self.segment_length {
                     let ref_index = self.data_independent_ref_indexes[ref_base + block];
                     // Prefetch a future iteration's ref block while current
-                    // compress runs.  On AArch64, look 2 iterations ahead to
+                    // compress runs.  On AArch64, look 3 iterations ahead to
                     // give the memory system more time; on x86_64, 1-ahead is
                     // sufficient given lower random-access latency.
                     #[cfg(target_arch = "aarch64")]
                     {
-                        let ahead = block + 2;
+                        let ahead = block + 3;
                         if ahead < self.segment_length {
                             prefetch_pow_block(&memory_blocks[self.data_independent_ref_indexes[ref_base + ahead]]);
                         }
@@ -298,6 +309,8 @@ fn prefetch_pow_block(block: &PowBlock) {
             std::arch::asm!(
                 "prfm pldl1keep, [{ptr}]",
                 "prfm pldl1keep, [{ptr}, #128]",
+                "prfm pldl1keep, [{ptr}, #256]",
+                "prfm pldl1keep, [{ptr}, #384]",
                 ptr = in(reg) ptr,
                 options(nostack, preserves_flags),
             );
