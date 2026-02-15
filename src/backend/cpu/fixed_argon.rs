@@ -788,13 +788,10 @@ unsafe fn neon_blamka(
     b: std::arch::aarch64::uint64x2_t,
 ) -> std::arch::aarch64::uint64x2_t {
     // a + b + 2*(lo32(a)*lo32(b))  =  (a+b) + lo(a)*lo(b) + lo(a)*lo(b)
-    // Use inline asm to force UMLAL.2D (widening multiply-accumulate):
-    //   xtn  lo_a, a       -- narrow a to 32-bit lanes
-    //   xtn  lo_b, b       -- narrow b to 32-bit lanes
-    //   add  out, a, b     -- out = a + b
-    //   umlal out, lo_a, lo_b  -- out += lo(a)*lo(b)
-    //   umlal out, lo_a, lo_b  -- out += lo(a)*lo(b)  [total: 2*product]
-    // 5 instructions, fused multiply-accumulate on critical path.
+    // Use inline asm to force UMLAL.2D (widening multiply-accumulate).
+    // LLVM decomposes vmlal_u32 intrinsics into UMULL+ADD, missing the fused
+    // instruction.  The double-UMLAL has fast accumulator forwarding on Apple
+    // Silicon, making it faster than the theoretically shorter UMULL+SHL+ADD.
     let out: std::arch::aarch64::uint64x2_t;
     std::arch::asm!(
         "xtn  {lo_a}.2s, {a:v}.2d",
