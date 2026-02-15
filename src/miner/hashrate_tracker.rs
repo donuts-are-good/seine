@@ -4,7 +4,6 @@ use std::time::Instant;
 use crate::backend::BackendInstanceId;
 
 const CURRENT_WINDOW_SECS: f64 = 30.0;
-const AVERAGE_WINDOW_SECS: f64 = 300.0;
 const MAX_SAMPLES: usize = 600;
 const MIN_WINDOW_SECS: f64 = 2.0;
 
@@ -17,6 +16,7 @@ struct HashrateSnapshot {
 
 pub struct HashrateTracker {
     samples: VecDeque<HashrateSnapshot>,
+    session_start: Option<Instant>,
     completed_rounds_device_hashes: BTreeMap<BackendInstanceId, u64>,
     last_round_start: Option<Instant>,
     last_round_device_hashes: BTreeMap<BackendInstanceId, u64>,
@@ -33,6 +33,7 @@ impl HashrateTracker {
     pub fn new() -> Self {
         Self {
             samples: VecDeque::with_capacity(MAX_SAMPLES),
+            session_start: None,
             completed_rounds_device_hashes: BTreeMap::new(),
             last_round_start: None,
             last_round_device_hashes: BTreeMap::new(),
@@ -67,8 +68,13 @@ impl HashrateTracker {
             *cumulative_device.entry(id).or_insert(0) += hashes;
         }
 
+        let now = Instant::now();
+        if self.session_start.is_none() {
+            self.session_start = Some(now);
+        }
+
         let snapshot = HashrateSnapshot {
-            time: Instant::now(),
+            time: now,
             total: total_hashes,
             per_device: cumulative_device,
         };
@@ -79,15 +85,40 @@ impl HashrateTracker {
         self.samples.push_back(snapshot);
     }
 
-    /// Compute rolling hashrates for the current (30s) and average (5min) windows.
+    /// Compute hashrates: current uses a 30s rolling window, average is session-lifetime.
     pub fn rates(&self) -> HashrateRates {
         let now = Instant::now();
+        let (average_total, average_per_device) = self.session_rates(now);
         HashrateRates {
             current_total: self.window_rate_total(now, CURRENT_WINDOW_SECS),
-            average_total: self.window_rate_total(now, AVERAGE_WINDOW_SECS),
+            average_total,
             current_per_device: self.window_rates_per_device(now, CURRENT_WINDOW_SECS),
-            average_per_device: self.window_rates_per_device(now, AVERAGE_WINDOW_SECS),
+            average_per_device,
         }
+    }
+
+    fn session_rates(&self, now: Instant) -> (f64, BTreeMap<BackendInstanceId, f64>) {
+        let latest = match self.samples.back() {
+            Some(s) => s,
+            None => return (0.0, BTreeMap::new()),
+        };
+        let session_start = match self.session_start {
+            Some(t) => t,
+            None => return (0.0, BTreeMap::new()),
+        };
+        let dt = now.duration_since(session_start).as_secs_f64();
+        if dt < MIN_WINDOW_SECS {
+            return (0.0, BTreeMap::new());
+        }
+
+        let total = latest.total as f64 / dt;
+
+        let mut per_device = BTreeMap::new();
+        for (&id, &hashes) in &latest.per_device {
+            per_device.insert(id, hashes as f64 / dt);
+        }
+
+        (total, per_device)
     }
 
     fn window_rate_total(&self, now: Instant, window_secs: f64) -> f64 {
