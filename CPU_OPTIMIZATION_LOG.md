@@ -451,3 +451,75 @@ Host: AMD Ryzen 9 5900X (Zen 3), 12C/24T, DDR4-3600.
     - Delta: `+1.29%`
     - Candidate wins 3 of 4 pairs (pair 4 loss attributed to thermal drift after extended benchmarking).
 - Status: adopted.
+
+### Attempt 18: `target-cpu=native` with fat LTO (not adopted)
+
+- **Rationale**: Re-testing `target-cpu=native` (previously rejected in attempt 12 with thin LTO) now that fat LTO is enabled. Fat LTO enables deeper cross-crate optimization which could interact favorably with native instruction scheduling.
+- **No code change**: build flag only (`--candidate-native` in A/B harness).
+- Baseline: commit `78447f4` (fat LTO, standard `release` profile).
+- Interleaved A/B (4 pairs, 30s rounds, 3 rounds + 1 warmup, 20s cooldown):
+  - Kernel summary: `data/bench_cpu_ab_kernel_native_fatlto/summary.txt`
+    - Baseline avg: `1.642 H/s`
+    - Candidate avg: `1.617 H/s`
+    - Delta: `-1.52%`
+    - Baseline wins 3 of 4 pairs.
+  - Per-pair breakdown:
+    - Pair 1: baseline=1.600 (first), candidate=1.611 (second)
+    - Pair 2: candidate=1.633 (first), baseline=1.667 (second)
+    - Pair 3: baseline=1.667 (first), candidate=1.633 (second)
+    - Pair 4: candidate=1.589 (first), baseline=1.633 (second)
+- Status: not adopted. Confirms attempt 12 finding — `target-cpu=native` provides no benefit on this workload (Zen 3 / AVX2). The generic x86-64 scheduling is already optimal for the BLAMKA permutation pattern.
+
+### Attempt 19: Profile-Guided Optimization (PGO) (not adopted)
+
+- **Rationale**: PGO uses runtime profile data to guide LLVM's branch prediction, code layout, and inlining decisions. Built with `-Cprofile-generate`, ran kernel training workload (3 × 30s rounds), merged profiles, rebuilt with `-Cprofile-use`.
+- **No code change**: build process only.
+- Baseline: commit `78447f4` (standard release build, fat LTO).
+- Manual 4-pair interleaved A/B (pre-built binaries, 30s rounds, 3 rounds + 1 warmup, 20s cooldown):
+  - Baseline avg: `1.658 H/s`
+  - PGO candidate avg: `1.653 H/s`
+  - Delta: `-0.3%` (within noise)
+  - Per-pair: PGO wins pair 1 (1.644 vs 1.689), ties pair 2, loses pairs 3-4.
+- Status: not adopted. Expected for a memory-bound workload — PGO primarily helps instruction-cache-bound code with complex branching. Argon2's hot loop is simple and predictable; the bottleneck is DRAM/TLB latency.
+
+### Attempt 20: reusable scratch buffer for compress (not adopted)
+
+- **Rationale**: `compress_avx2_into` allocates a 1 KiB stack buffer `q` on every call (~2M calls/hash). By passing `q` as a caller-provided parameter, the function becomes frameless (no push/sub rsp/leave), saving per-call stack frame churn.
+- **Assembly verification**: Confirmed the candidate function emits NO prologue (no push, no sub rsp) — just a bare `ret`. The stack allocation was successfully eliminated.
+- **Unexpected regression**: The caller-provided `&mut PowBlock` parameter prevents LLVM from treating `q` as a known-noalias stack local. This inhibits store-load forwarding and reordering optimizations, overwhelming the stack frame savings.
+- Baseline: commit `78447f4`.
+- Interleaved A/B (4 pairs, 30s rounds, 3 rounds + 1 warmup, 20s cooldown):
+  - Kernel summary: `data/bench_cpu_ab_kernel_scratch_buf/summary.txt`
+    - Baseline avg: `1.683 H/s`
+    - Candidate avg: `1.639 H/s`
+    - Delta: `-2.64%`
+    - Baseline wins 3 of 4 pairs.
+- Status: not adopted. Stack-local `q` with noalias guarantees is faster than an external buffer despite the per-call frame overhead.
+
+### Attempt 21: deeper prefetch distance (2-ahead T1 for data-independent slices) (not adopted)
+
+- **Rationale**: For data-independent slices (slices 0, 1), all ref_indexes are precomputed. By adding a second prefetch 2 iterations ahead with `_MM_HINT_T1` (into L2), TLB misses for the block N+2 are resolved while block N+1 fills L1. This gives ~572ns lead time (2 compress iterations) for TLB resolution vs current ~286ns.
+- **Implementation**: Added `prefetch_pow_block_t1()` helper (uses `_MM_HINT_T1`). Data-independent loop issues both `prefetch_pow_block(N+1)` and `prefetch_pow_block_t1(N+2)`.
+- Baseline: commit `78447f4`.
+- Interleaved A/B (4 pairs, 30s rounds, 3 rounds + 1 warmup, 20s cooldown):
+  - Kernel summary: `data/bench_cpu_ab_kernel_deeper_prefetch/summary.txt`
+    - Baseline avg: `1.672 H/s`
+    - Candidate avg: `1.631 H/s`
+    - Delta: `-2.49%`
+    - Baseline wins all 4 pairs.
+- Status: not adopted. The extra prefetch instructions add overhead without meaningful cache benefit — the existing 1-ahead T0 prefetch already provides sufficient lead time on Zen 3, and the hardware prefetcher handles sequential access within blocks.
+
+## Summary of cumulative adopted optimizations
+
+| Attempt | Change | Kernel delta | Backend delta | Status |
+|---------|--------|-------------|---------------|--------|
+| 2 | Precomputed data-independent refs | +5.26% | +0.70% | Adopted |
+| 11 | AVX2 SIMD block compression | +18.75% | +20.10% | Adopted |
+| 14 | In-place `compress_into` | +4.05% | +6.41% | Adopted |
+| 15 | Software prefetching | +3.81% | +3.82% | Adopted |
+| 16 | Fat LTO | +7.80% | +6.31% | Adopted |
+| 17 | Fused column-scatter + final XOR | +2.58% | +1.29% | Adopted |
+
+Cumulative measured: from ~1.19 H/s (original baseline) to ~1.65 H/s (current), a ~39% total improvement.
+
+The workload is fundamentally memory-bound: each hash processes ~2 GB with random access across a 2 GB array. The remaining bottleneck is DRAM + TLB latency, which software optimizations alone cannot significantly reduce further. Additional attempts to optimize instruction-side behavior (PGO, native build, inlining, prefetch tuning) all showed ≤noise-level impact, confirming the memory subsystem is the limiting factor.
