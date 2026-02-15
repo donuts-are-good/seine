@@ -14,6 +14,7 @@ ctrlc = "3.4"
 crossbeam-channel = "0.5"
 core_affinity = "0.8"
 cudarc = { version = "0.19.2", default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-12080"], optional = true }
+metal = { version = "0.33", optional = true }
 hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rpassword = "7.3"
@@ -26,6 +27,7 @@ sysinfo = "0.31"
 [features]
 default = ["nvidia"]
 nvidia = ["dep:cudarc"]
+metal = ["dep:metal"]
 
 [dev-dependencies]
 httpmock = "0.7"

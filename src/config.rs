@@ -14,6 +14,7 @@ use std::process::Command;
 pub enum BackendKind {
     Cpu,
     Nvidia,
+    Metal,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -73,6 +74,7 @@ const DEFAULT_NVIDIA_AUTOTUNE_SECS: u64 = 5;
 const DEFAULT_NVIDIA_AUTOTUNE_SAMPLES: u32 = 2;
 const DEFAULT_NVIDIA_HASHES_PER_LAUNCH_PER_LANE: u32 = 2;
 const DEFAULT_NVIDIA_AUTOTUNE_CONFIG_FILE: &str = "seine.nvidia-autotune.json";
+const DEFAULT_METAL_HASHES_PER_LAUNCH_PER_LANE: u32 = 2;
 
 #[derive(Debug, Clone, Copy)]
 struct CpuProfileDefaults {
@@ -319,6 +321,17 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = NvidiaTemplateStopPolicy::Auto)]
     nvidia_template_stop_policy: NvidiaTemplateStopPolicy,
 
+    /// Cap Metal active lanes (each uses ~2GB unified memory).
+    #[arg(long)]
+    metal_max_lanes: Option<usize>,
+
+    /// Maximum hashes each lane executes per Metal dispatch (higher = fewer dispatches, coarser preemption).
+    #[arg(
+        long,
+        default_value_t = DEFAULT_METAL_HASHES_PER_LAUNCH_PER_LANE
+    )]
+    metal_hashes_per_launch_per_lane: u32,
+
     /// Maximum time to wait for one backend assignment dispatch call, in milliseconds.
     #[arg(long, default_value_t = 1000)]
     backend_assign_timeout_ms: u64,
@@ -487,6 +500,8 @@ pub struct Config {
     pub nvidia_fused_target_check: bool,
     pub nvidia_adaptive_launch_depth: bool,
     pub nvidia_enforce_template_stop: bool,
+    pub metal_max_lanes: Option<usize>,
+    pub metal_hashes_per_launch_per_lane: u32,
     pub backend_assign_timeout: Duration,
     pub backend_assign_timeout_strikes: u32,
     pub backend_control_timeout: Duration,
@@ -593,6 +608,12 @@ impl Config {
         if cli.nvidia_hashes_per_launch_per_lane == 0 {
             bail!("nvidia-hashes-per-launch-per-lane must be >= 1");
         }
+        if matches!(cli.metal_max_lanes, Some(0)) {
+            bail!("metal-max-lanes must be >= 1");
+        }
+        if cli.metal_hashes_per_launch_per_lane == 0 {
+            bail!("metal-hashes-per-launch-per-lane must be >= 1");
+        }
         if cli.backend_assign_timeout_ms == 0 {
             bail!("backend-assign-timeout-ms must be >= 1");
         }
@@ -639,6 +660,7 @@ impl Config {
             &cli.backends,
             &cli.nvidia_devices,
             detect_nvidia_backend_available(),
+            detect_metal_backend_available(),
         );
         let cpu_backend_instances = backends
             .iter()
@@ -749,6 +771,8 @@ impl Config {
             nvidia_fused_target_check: cli.nvidia_fused_target_check,
             nvidia_adaptive_launch_depth: !cli.nvidia_no_adaptive_launch_depth,
             nvidia_enforce_template_stop,
+            metal_max_lanes: cli.metal_max_lanes.filter(|v| *v > 0),
+            metal_hashes_per_launch_per_lane: cli.metal_hashes_per_launch_per_lane.max(1),
             backend_assign_timeout: Duration::from_millis(cli.backend_assign_timeout_ms),
             backend_assign_timeout_strikes: cli.backend_assign_timeout_strikes.max(1),
             backend_control_timeout: Duration::from_millis(cli.backend_control_timeout_ms),
@@ -787,6 +811,7 @@ fn resolve_backend_selection(
     requested_backends: &[BackendKind],
     nvidia_devices: &[u32],
     nvidia_available: bool,
+    metal_available: bool,
 ) -> Vec<BackendKind> {
     if !requested_backends.is_empty() {
         return requested_backends.to_vec();
@@ -795,6 +820,9 @@ fn resolve_backend_selection(
     let mut selected = vec![BackendKind::Cpu];
     if nvidia_available || !nvidia_devices.is_empty() {
         selected.push(BackendKind::Nvidia);
+    }
+    if metal_available {
+        selected.push(BackendKind::Metal);
     }
     selected
 }
@@ -822,6 +850,16 @@ fn detect_nvidia_backend_available() -> bool {
 
 #[cfg(not(feature = "nvidia"))]
 fn detect_nvidia_backend_available() -> bool {
+    false
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn detect_metal_backend_available() -> bool {
+    metal::Device::system_default().is_some()
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn detect_metal_backend_available() -> bool {
     false
 }
 
@@ -947,6 +985,15 @@ fn expand_backend_specs(
                     }
                 }
             }
+            BackendKind::Metal => specs.push(BackendSpec {
+                kind: BackendKind::Metal,
+                device_index: None,
+                cpu_threads: None,
+                cpu_affinity: None,
+                assign_timeout_override: None,
+                control_timeout_override: None,
+                assign_timeout_strikes_override: None,
+            }),
         }
     }
 
@@ -1214,6 +1261,8 @@ mod tests {
             nvidia_fused_target_check: false,
             nvidia_no_adaptive_launch_depth: false,
             nvidia_template_stop_policy: NvidiaTemplateStopPolicy::Auto,
+            metal_max_lanes: None,
+            metal_hashes_per_launch_per_lane: DEFAULT_METAL_HASHES_PER_LAUNCH_PER_LANE,
             backend_assign_timeout_ms: 1000,
             backend_assign_timeout_ms_per_instance: Vec::new(),
             backend_assign_timeout_strikes: 3,
@@ -1516,25 +1565,25 @@ mod tests {
     #[test]
     fn resolve_backend_selection_uses_requested_backends_verbatim() {
         let selected =
-            resolve_backend_selection(&[BackendKind::Nvidia, BackendKind::Cpu], &[], false);
+            resolve_backend_selection(&[BackendKind::Nvidia, BackendKind::Cpu], &[], false, false);
         assert_eq!(selected, vec![BackendKind::Nvidia, BackendKind::Cpu]);
     }
 
     #[test]
     fn resolve_backend_selection_defaults_to_cpu_only_when_nvidia_unavailable() {
-        let selected = resolve_backend_selection(&[], &[], false);
+        let selected = resolve_backend_selection(&[], &[], false, false);
         assert_eq!(selected, vec![BackendKind::Cpu]);
     }
 
     #[test]
     fn resolve_backend_selection_defaults_to_cpu_and_nvidia_when_available() {
-        let selected = resolve_backend_selection(&[], &[], true);
+        let selected = resolve_backend_selection(&[], &[], true, false);
         assert_eq!(selected, vec![BackendKind::Cpu, BackendKind::Nvidia]);
     }
 
     #[test]
     fn resolve_backend_selection_enables_nvidia_when_devices_are_explicit() {
-        let selected = resolve_backend_selection(&[], &[0, 1], false);
+        let selected = resolve_backend_selection(&[], &[0, 1], false, false);
         assert_eq!(selected, vec![BackendKind::Cpu, BackendKind::Nvidia]);
     }
 }

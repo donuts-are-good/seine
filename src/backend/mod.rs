@@ -7,6 +7,103 @@ use anyhow::{anyhow, bail, Result};
 use crossbeam_channel::Sender;
 
 pub mod cpu;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal;
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+pub mod metal {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use anyhow::{bail, Result};
+    use crossbeam_channel::Sender;
+
+    use super::{
+        AssignmentSemantics, BackendCapabilities, BackendEvent, BackendExecutionModel,
+        BackendInstanceId, BenchBackend, DeadlineSupport, PowBackend, PreemptionGranularity,
+        WorkAssignment,
+    };
+
+    pub struct MetalBackend {
+        _instance_id: AtomicU64,
+    }
+
+    impl MetalBackend {
+        pub fn new(
+            _max_lanes: Option<usize>,
+            _hashes_per_launch_per_lane: u32,
+        ) -> Self {
+            Self {
+                _instance_id: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl PowBackend for MetalBackend {
+        fn name(&self) -> &'static str {
+            "metal"
+        }
+
+        fn lanes(&self) -> usize {
+            1
+        }
+
+        fn set_instance_id(&self, id: BackendInstanceId) {
+            self._instance_id.store(id, Ordering::Release);
+        }
+
+        fn set_event_sink(&self, _sink: Sender<BackendEvent>) {}
+
+        fn start(&self) -> Result<()> {
+            bail!("Metal backend is disabled in this build (rebuild with --features metal on macOS)")
+        }
+
+        fn stop(&self) {}
+
+        fn assign_work(&self, _work: WorkAssignment) -> Result<()> {
+            Ok(())
+        }
+
+        fn cancel_work(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn fence(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn preemption_granularity(&self) -> PreemptionGranularity {
+            PreemptionGranularity::Unknown
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                preferred_iters_per_lane: Some(1),
+                preferred_allocation_iters_per_lane: None,
+                preferred_hash_poll_interval: Some(Duration::from_millis(50)),
+                preferred_assignment_timeout: None,
+                preferred_control_timeout: None,
+                preferred_assignment_timeout_strikes: None,
+                preferred_worker_queue_depth: None,
+                max_inflight_assignments: 1,
+                deadline_support: DeadlineSupport::BestEffort,
+                assignment_semantics: AssignmentSemantics::Replace,
+                execution_model: BackendExecutionModel::Blocking,
+                nonblocking_poll_min: Some(Duration::from_micros(100)),
+                nonblocking_poll_max: Some(Duration::from_millis(5)),
+            }
+        }
+
+        fn bench_backend(&self) -> Option<&dyn BenchBackend> {
+            Some(self)
+        }
+    }
+
+    impl BenchBackend for MetalBackend {
+        fn kernel_bench(&self, _seconds: u64, _shutdown: &AtomicBool) -> Result<u64> {
+            bail!("kernel benchmark is not implemented for metal backend stub")
+        }
+    }
+}
 #[cfg(feature = "nvidia")]
 pub mod nvidia;
 #[cfg(not(feature = "nvidia"))]

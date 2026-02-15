@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::ApiClient;
 use crate::backend::cpu::{CpuBackend, CpuBackendTuning};
+use crate::backend::metal::MetalBackend;
 use crate::backend::nvidia::{NvidiaBackend, NvidiaBackendTuningOptions};
 use crate::backend::{
     normalize_backend_capabilities, BackendCapabilities, BackendEvent, BackendExecutionModel,
@@ -1039,6 +1040,10 @@ fn build_backend_instances(cfg: &Config) -> Vec<(BackendSpec, Arc<dyn PowBackend
                         adaptive_launch_depth: cfg.nvidia_adaptive_launch_depth,
                         enforce_template_stop: cfg.nvidia_enforce_template_stop,
                     },
+                )) as Arc<dyn PowBackend>,
+                BackendKind::Metal => Arc::new(MetalBackend::new(
+                    cfg.metal_max_lanes,
+                    cfg.metal_hashes_per_launch_per_lane,
                 )) as Arc<dyn PowBackend>,
             };
             (backend_spec, backend)
@@ -2234,6 +2239,8 @@ mod tests {
             nvidia_fused_target_check: false,
             nvidia_adaptive_launch_depth: true,
             nvidia_enforce_template_stop: false,
+            metal_max_lanes: None,
+            metal_hashes_per_launch_per_lane: 2,
             backend_assign_timeout: Duration::from_millis(1_000),
             backend_assign_timeout_strikes: 3,
             backend_control_timeout: Duration::from_millis(60_000),
