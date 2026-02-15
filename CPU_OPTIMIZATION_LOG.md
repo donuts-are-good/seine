@@ -630,6 +630,55 @@ maximized:
 - **Remaining levers**: multi-thread scaling, x86_64 platform optimizations,
   future macOS superpage support, or Metal GPU backend.
 
+## 2026-02-15 x86_64 cross-porting Apple Silicon optimizations
+
+Host: AMD Ryzen 9 5900X (Zen 3), 12C/24T, DDR4-3600.
+
+### Attempt 22: fused Phase 1+2 (XOR into registers → row round) + wider prefetch (not adopted)
+
+Porting Apple Silicon optimizations to x86_64. On NEON, fusing Phase 1 (XOR) with
+Phase 2 (row rounds) eliminated 256 memory ops per compress and gave +9.1% kernel.
+On AArch64, prefetching all 8 cache lines of the 1 KiB ref block (vs 4) gave +46%
+cumulative.
+
+- **Phase 1+2 fusion (AVX2)**: Replace separate Phase 1 (XOR → store to dst + q)
+  and Phase 2 (load q → row round → store q) with a single loop that XORs rhs^lhs
+  directly into registers, stores backup to dst, row-rounds in registers, then stores
+  to q. Also uses MaybeUninit for q to skip zero-init.
+- **Wider prefetch (x86_64)**: Expand from 2 prefetches (offsets 0, 512 = 128 bytes)
+  to 8 prefetches at 128-byte stride (full 1024-byte block), matching AArch64 density.
+
+Combined benchmark (Phase 1+2 fusion + wider prefetch):
+- Baseline: commit `127eb6b`.
+- Interleaved A/B (4 pairs, 30s rounds, 3 rounds + 1 warmup, 20s cooldown):
+  - Kernel summary: `data/bench_cpu_ab_kernel_fused_phase12_prefetch/summary.txt`
+    - Baseline avg: `1.633 H/s`
+    - Candidate avg: `1.464 H/s`
+    - Delta: **`-10.37%`**
+    - Baseline wins all 4 pairs.
+
+Phase 1+2 fusion alone (wider prefetch reverted):
+- Interleaved A/B (4 pairs, 30s rounds, 3 rounds + 1 warmup, 20s cooldown):
+  - Kernel summary: `data/bench_cpu_ab_kernel_fused_phase12_only/summary.txt`
+    - Baseline avg: `1.628 H/s`
+    - Candidate avg: `1.375 H/s`
+    - Delta: **`-15.53%`**
+    - Baseline wins all 4 pairs.
+
+- **Root cause**: The NEON path benefits from fusion because (a) no `#[target_feature]`
+  boundary — functions inline freely, giving LLVM full scheduling freedom, and
+  (b) AArch64 has 32 NEON registers vs AVX2's 16 YMM registers. On Zen 3, the fused
+  loop body overwhelms the µop cache and causes register spilling. The baseline's
+  separate tight Phase 1 loop (simple XOR-and-store, 32 iterations) is highly
+  pipeline-friendly; merging it with the complex row-round body destroys that.
+- **Wider prefetch**: Adding 6 more prefetches per block (×2M blocks/hash) creates
+  instruction overhead and L1 cache pollution that outweighs cache-miss savings —
+  consistent with Attempt 21's T1 prefetch regression. Zen 3's hardware prefetcher
+  handles sequential access within blocks after the initial 2-prefetch TLB priming.
+- Status: not adopted. Confirms that NEON optimizations do not transfer to AVX2 due
+  to fundamental architectural differences (register count, target_feature inlining
+  barrier, µop cache sensitivity).
+
 ## Summary of cumulative adopted optimizations
 
 ### x86_64 (AMD Ryzen 9 5900X, Zen 3)
