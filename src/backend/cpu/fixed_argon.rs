@@ -43,6 +43,7 @@ pub(super) struct FixedArgon2id {
     block_count: usize,
     segment_length: usize,
     data_independent_ref_indexes: Box<[usize]>,
+    isa: u8,
 }
 
 impl FixedArgon2id {
@@ -54,11 +55,34 @@ impl FixedArgon2id {
         let block_count = segment_length * lanes * SYNC_POINTS;
         let data_independent_ref_indexes =
             precompute_data_independent_ref_indexes(block_count, segment_length);
+        let isa = {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::arch::is_x86_feature_detected!("avx512f")
+                    && std::arch::is_x86_feature_detected!("avx512vl")
+                {
+                    ISA_AVX512
+                } else if std::arch::is_x86_feature_detected!("avx2") {
+                    ISA_AVX2
+                } else {
+                    ISA_SCALAR
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                ISA_NEON
+            }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            {
+                ISA_SCALAR
+            }
+        };
         Self {
             requested_memory_kib,
             block_count,
             segment_length,
             data_independent_ref_indexes,
+            isa,
         }
     }
 
@@ -89,25 +113,11 @@ impl FixedArgon2id {
 
         initialize_lane_blocks(memory_blocks, initial_hash)?;
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::arch::is_x86_feature_detected!("avx512f")
-                && std::arch::is_x86_feature_detected!("avx512vl")
-            {
-                self.fill_blocks::<ISA_AVX512>(memory_blocks);
-            } else if std::arch::is_x86_feature_detected!("avx2") {
-                self.fill_blocks::<ISA_AVX2>(memory_blocks);
-            } else {
-                self.fill_blocks::<ISA_SCALAR>(memory_blocks);
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.fill_blocks::<ISA_NEON>(memory_blocks);
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            self.fill_blocks::<ISA_SCALAR>(memory_blocks);
+        match self.isa {
+            ISA_AVX512 => self.fill_blocks::<ISA_AVX512>(memory_blocks),
+            ISA_AVX2 => self.fill_blocks::<ISA_AVX2>(memory_blocks),
+            ISA_NEON => self.fill_blocks::<ISA_NEON>(memory_blocks),
+            _ => self.fill_blocks::<ISA_SCALAR>(memory_blocks),
         }
 
         finalize(memory_blocks, out)
