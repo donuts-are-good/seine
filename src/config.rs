@@ -157,12 +157,16 @@ struct Cli {
     #[arg(long)]
     wallet_password_file: Option<PathBuf>,
 
-    /// Path to api.cookie file (defaults to <data-dir>/api.cookie).
+    /// Path to api.cookie file (defaults to <daemon-dir>/api.cookie).
     #[arg(long)]
     cookie: Option<PathBuf>,
 
     /// Daemon data directory (used to locate api.cookie when --cookie is unset).
     #[arg(long, default_value = "./blocknet-data-mainnet")]
+    daemon_dir: PathBuf,
+
+    /// Seine's own data directory for persisted configs (e.g. autotune results).
+    #[arg(long, default_value = "./seine-data")]
     data_dir: PathBuf,
 
     /// One or more mining backends. Repeat the flag or pass comma-separated values.
@@ -938,7 +942,7 @@ fn resolve_token_with_source(
     }
 
     // Build candidate cookie paths in priority order.
-    let mut candidates: Vec<PathBuf> = vec![cli.data_dir.join("api.cookie")];
+    let mut candidates: Vec<PathBuf> = vec![cli.daemon_dir.join("api.cookie")];
 
     // Try to discover the daemon's data directory from a running process.
     if let Some(context) = daemon_context {
@@ -1526,7 +1530,8 @@ mod tests {
             wallet_password: None,
             wallet_password_file: None,
             cookie: None,
-            data_dir: PathBuf::from("./blocknet-data-mainnet"),
+            daemon_dir: PathBuf::from("./blocknet-data-mainnet"),
+            data_dir: PathBuf::from("./seine-data"),
             backends: vec![BackendKind::Cpu],
             nvidia_devices: Vec::new(),
             threads: Some(1),
@@ -1693,7 +1698,7 @@ mod tests {
 
         let mut cli = sample_cli();
         cli.cookie = Some(cookie.clone());
-        cli.data_dir = dir.clone();
+        cli.daemon_dir = dir.clone();
 
         let (token, source) = resolve_token_with_source(&cli, None).expect("cookie should be read");
         assert_eq!(token, "deadbeef");

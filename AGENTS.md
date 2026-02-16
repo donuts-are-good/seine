@@ -44,7 +44,7 @@ This file preserves the full engineering reference for AI agents doing optimizat
 - `--cpu-hash-flush-ms` (default `50`) controls time-based hash counter flush cadence.
 - `--cpu-event-dispatch-capacity` (default `256`) controls internal CPU backend event dispatch buffering.
 - CPU thread autotuning is enabled by default when `--threads` is omitted.
-  - Results are persisted to `<data-dir>/seine.cpu-autotune.json` and reused on subsequent runs.
+  - Results are persisted to `<seine-data-dir>/seine.cpu-autotune.json` and reused on subsequent runs.
   - `--cpu-autotune-threads` forces autotuning even when `--threads` is set.
   - `--disable-cpu-autotune-threads` disables autotuning.
   - `--cpu-autotune-min-threads`, `--cpu-autotune-max-threads`, and `--cpu-autotune-secs` bound autotuner search range and base sample window (`--cpu-autotune-secs` default: `6`).
@@ -57,7 +57,7 @@ This file preserves the full engineering reference for AI agents doing optimizat
 
 - `--nvidia-autotune-secs` (default `5`) controls per-candidate benchmark window for regcap autotune.
 - `--nvidia-autotune-samples` (default `2`) runs multiple samples per candidate; autotune prioritizes median deadline-window counted H/s (then mean counted H/s, then throughput tie-breaks).
-- `--nvidia-autotune-config` overrides the persisted NVIDIA autotune cache path (`<data-dir>/seine.nvidia-autotune.json` by default).
+- `--nvidia-autotune-config` overrides the persisted NVIDIA autotune cache path (`<seine-data-dir>/seine.nvidia-autotune.json` by default).
 - `--nvidia-max-rregcount` forces a fixed register cap and skips autotune/cache lookup.
 - `--nvidia-max-lanes` caps active NVIDIA lanes per device instance.
 - `--nvidia-dispatch-iters-per-lane` and `--nvidia-allocation-iters-per-lane` override scheduler/allocator lane-iteration hints.
