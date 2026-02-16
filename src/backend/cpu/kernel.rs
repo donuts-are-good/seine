@@ -7,14 +7,14 @@ use blocknet_pow_spec::{POW_MEMORY_KB, POW_OUTPUT_LEN};
 use crate::backend::{BackendEvent, MiningSolution};
 use crate::types::hash_meets_target;
 
-use super::{
-    emit_error, emit_event, fixed_argon, flush_hashes, lane_quota_for_chunk,
-    mark_worker_active, mark_worker_inactive, mark_worker_ready, request_shutdown,
-    request_work_pause, set_thread_high_perf, should_flush_hashes, wait_for_work_update, Shared,
-    MAX_DEADLINE_CHECK_INTERVAL, SOLVED_MASK,
-};
 #[cfg(target_os = "linux")]
 use super::emit_warning;
+use super::{
+    emit_error, emit_event, fixed_argon, flush_hashes, lane_quota_for_chunk, mark_worker_active,
+    mark_worker_inactive, mark_worker_ready, request_shutdown, request_work_pause,
+    set_thread_high_perf, should_flush_hashes, wait_for_work_update, Shared,
+    MAX_DEADLINE_CHECK_INTERVAL, SOLVED_MASK,
+};
 
 pub(super) fn cpu_worker_loop(
     shared: Arc<Shared>,

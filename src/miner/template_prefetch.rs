@@ -283,7 +283,10 @@ mod tests {
     fn prefetch_full_queue_does_not_overstate_inflight_tip() {
         let (request_tx, _request_rx) = bounded::<PrefetchRequest>(1);
         request_tx
-            .try_send(PrefetchRequest { tip_sequence: 1, address: None })
+            .try_send(PrefetchRequest {
+                tip_sequence: 1,
+                address: None,
+            })
             .expect("prefill request channel should succeed");
         let (_result_tx, result_rx) = unbounded::<PrefetchResult>();
         let (_done_tx, done_rx) = bounded::<()>(1);
@@ -305,7 +308,10 @@ mod tests {
     fn prefetch_full_queue_preserves_existing_inflight_marker() {
         let (request_tx, _request_rx) = bounded::<PrefetchRequest>(1);
         request_tx
-            .try_send(PrefetchRequest { tip_sequence: 1, address: None })
+            .try_send(PrefetchRequest {
+                tip_sequence: 1,
+                address: None,
+            })
             .expect("prefill request channel should succeed");
         let (_result_tx, result_rx) = unbounded::<PrefetchResult>();
         let (_done_tx, done_rx) = bounded::<()>(1);

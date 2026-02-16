@@ -28,10 +28,7 @@ pub mod metal {
     }
 
     impl MetalBackend {
-        pub fn new(
-            _max_lanes: Option<usize>,
-            _hashes_per_launch_per_lane: u32,
-        ) -> Self {
+        pub fn new(_max_lanes: Option<usize>, _hashes_per_launch_per_lane: u32) -> Self {
             Self {
                 _instance_id: AtomicU64::new(0),
             }
@@ -54,7 +51,9 @@ pub mod metal {
         fn set_event_sink(&self, _sink: Sender<BackendEvent>) {}
 
         fn start(&self) -> Result<()> {
-            bail!("Metal backend is disabled in this build (rebuild with --features metal on macOS)")
+            bail!(
+                "Metal backend is disabled in this build (rebuild with --features metal on macOS)"
+            )
         }
 
         fn stop(&self) {}

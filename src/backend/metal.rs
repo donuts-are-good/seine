@@ -88,12 +88,7 @@ impl MetalShared {
         }
     }
 
-    fn emit_solution(
-        &self,
-        instance_id: BackendInstanceId,
-        epoch: u64,
-        nonce: u64,
-    ) {
+    fn emit_solution(&self, instance_id: BackendInstanceId, epoch: u64, nonce: u64) {
         self.emit_event(
             instance_id,
             BackendEvent::Solution(MiningSolution {
@@ -159,12 +154,8 @@ fn div_ceil(a: u32, b: u32) -> u32 {
 }
 
 impl MetalArgon2Engine {
-    fn new(
-        max_lanes_override: Option<usize>,
-        hashes_per_launch_per_lane: u32,
-    ) -> Result<Self> {
-        let device = Device::system_default()
-            .ok_or_else(|| anyhow!("no Metal device found"))?;
+    fn new(max_lanes_override: Option<usize>, hashes_per_launch_per_lane: u32) -> Result<Self> {
+        let device = Device::system_default().ok_or_else(|| anyhow!("no Metal device found"))?;
 
         let (m_cost_kib, t_cost) = pow_params()
             .map(|params| (params.m_cost(), params.t_cost()))
@@ -250,26 +241,13 @@ impl MetalArgon2Engine {
         let max_hashes_per_launch = (lanes as u32) * hashes_per_launch_per_lane;
 
         // Allocate auxiliary buffers
-        let seed_blocks_buf = device.new_buffer(
-            max_hashes_per_launch as u64 * 256 * 8,
-            resource_opts,
-        );
-        let last_blocks_buf = device.new_buffer(
-            max_hashes_per_launch as u64 * 128 * 8,
-            resource_opts,
-        );
-        let header_base_buf = device.new_buffer(
-            POW_HEADER_BASE_LEN as u64,
-            resource_opts,
-        );
-        let nonce_buf = device.new_buffer(
-            max_hashes_per_launch as u64 * 8,
-            resource_opts,
-        );
-        let target_buf = device.new_buffer(
-            POW_OUTPUT_LEN as u64,
-            resource_opts,
-        );
+        let seed_blocks_buf =
+            device.new_buffer(max_hashes_per_launch as u64 * 256 * 8, resource_opts);
+        let last_blocks_buf =
+            device.new_buffer(max_hashes_per_launch as u64 * 128 * 8, resource_opts);
+        let header_base_buf = device.new_buffer(POW_HEADER_BASE_LEN as u64, resource_opts);
+        let nonce_buf = device.new_buffer(max_hashes_per_launch as u64 * 8, resource_opts);
+        let target_buf = device.new_buffer(POW_OUTPUT_LEN as u64, resource_opts);
         let cancel_flag_buf = device.new_buffer(4, resource_opts);
         let completed_iters_buf = device.new_buffer(4, resource_opts);
         let found_index_buf = device.new_buffer(4, resource_opts);
@@ -356,11 +334,7 @@ impl MetalArgon2Engine {
             );
 
             let nonce_ptr = self.nonce_buf.contents() as *mut u64;
-            std::ptr::copy_nonoverlapping(
-                nonces.as_ptr(),
-                nonce_ptr,
-                nonces.len(),
-            );
+            std::ptr::copy_nonoverlapping(nonces.as_ptr(), nonce_ptr, nonces.len());
 
             if let Some(target) = target {
                 let target_ptr = self.target_buf.contents() as *mut u8;
@@ -406,8 +380,7 @@ impl MetalArgon2Engine {
 
             let threads_per_group = MTLSize::new(SEED_KERNEL_THREADS as u64, 1, 1);
             let total_threads = MTLSize::new(
-                div_ceil(requested_hashes, SEED_KERNEL_THREADS) as u64
-                    * SEED_KERNEL_THREADS as u64,
+                div_ceil(requested_hashes, SEED_KERNEL_THREADS) as u64 * SEED_KERNEL_THREADS as u64,
                 1,
                 1,
             );
@@ -448,8 +421,7 @@ impl MetalArgon2Engine {
 
             let threads_per_group = MTLSize::new(EVAL_KERNEL_THREADS as u64, 1, 1);
             let total_threads = MTLSize::new(
-                div_ceil(requested_hashes, EVAL_KERNEL_THREADS) as u64
-                    * EVAL_KERNEL_THREADS as u64,
+                div_ceil(requested_hashes, EVAL_KERNEL_THREADS) as u64 * EVAL_KERNEL_THREADS as u64,
                 1,
                 1,
             );
@@ -461,12 +433,8 @@ impl MetalArgon2Engine {
         cmd_buf.wait_until_completed();
 
         // Read back results from shared memory
-        let completed_iters = unsafe {
-            *(self.completed_iters_buf.contents() as *const u32)
-        };
-        let found_index_one_based = unsafe {
-            *(self.found_index_buf.contents() as *const u32)
-        };
+        let completed_iters = unsafe { *(self.completed_iters_buf.contents() as *const u32) };
+        let found_index_one_based = unsafe { *(self.found_index_buf.contents() as *const u32) };
 
         let hashes_done = (completed_iters as u64)
             .saturating_mul(active_lanes as u64)
@@ -521,10 +489,7 @@ unsafe impl Send for MetalBackend {}
 unsafe impl Sync for MetalBackend {}
 
 impl MetalBackend {
-    pub fn new(
-        max_lanes: Option<usize>,
-        hashes_per_launch_per_lane: u32,
-    ) -> Self {
+    pub fn new(max_lanes: Option<usize>, hashes_per_launch_per_lane: u32) -> Self {
         Self {
             instance_id: AtomicU64::new(0),
             shared: Arc::new(MetalShared::new()),
@@ -699,10 +664,7 @@ impl PowBackend for MetalBackend {
             active_lanes: self.shared.active_lanes.load(Ordering::Acquire),
             pending_work: self.shared.pending_work.load(Ordering::Acquire),
             dropped_events: self.shared.dropped_events.swap(0, Ordering::AcqRel),
-            completed_assignments: self
-                .shared
-                .completed_assignments
-                .swap(0, Ordering::AcqRel),
+            completed_assignments: self.shared.completed_assignments.swap(0, Ordering::AcqRel),
             completed_assignment_hashes: self
                 .shared
                 .completed_assignment_hashes
@@ -755,10 +717,8 @@ impl PowBackend for MetalBackend {
 
 impl BenchBackend for MetalBackend {
     fn kernel_bench(&self, seconds: u64, shutdown: &AtomicBool) -> Result<u64> {
-        let engine = MetalArgon2Engine::new(
-            self.max_lanes_override,
-            self.hashes_per_launch_per_lane,
-        )?;
+        let engine =
+            MetalArgon2Engine::new(self.max_lanes_override, self.hashes_per_launch_per_lane)?;
 
         let max_hashes = engine.max_hashes_per_launch as usize;
         let mut nonces = vec![0u64; max_hashes];
@@ -824,7 +784,9 @@ fn metal_worker_loop(
                 Ok(WorkerCommand::Cancel(ack)) => {
                     active = None;
                     shared.pending_work.store(0, Ordering::Release);
-                    shared.inflight_assignment_hashes.store(0, Ordering::Release);
+                    shared
+                        .inflight_assignment_hashes
+                        .store(0, Ordering::Release);
                     *shared.inflight_assignment_started_at.lock().unwrap() = None;
                     shared.cancel_requested.store(false, Ordering::Release);
                     let _ = ack.send(());
@@ -869,7 +831,9 @@ fn metal_worker_loop(
             if shared.cancel_requested.swap(false, Ordering::AcqRel) {
                 active = None;
                 shared.pending_work.store(0, Ordering::Release);
-                shared.inflight_assignment_hashes.store(0, Ordering::Release);
+                shared
+                    .inflight_assignment_hashes
+                    .store(0, Ordering::Release);
                 *shared.inflight_assignment_started_at.lock().unwrap() = None;
                 // Drain fence waiters
                 for waiter in fence_waiters.drain(..) {
@@ -882,16 +846,16 @@ fn metal_worker_loop(
             if remaining == 0 || Instant::now() > assignment.work.template.stop_at {
                 // Assignment complete
                 let elapsed = assignment.started_at.elapsed();
-                shared
-                    .completed_assignments
-                    .fetch_add(1, Ordering::Relaxed);
+                shared.completed_assignments.fetch_add(1, Ordering::Relaxed);
                 shared
                     .completed_assignment_hashes
                     .fetch_add(assignment.hashes_done, Ordering::Relaxed);
                 shared
                     .completed_assignment_micros
                     .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
-                shared.inflight_assignment_hashes.store(0, Ordering::Release);
+                shared
+                    .inflight_assignment_hashes
+                    .store(0, Ordering::Release);
                 *shared.inflight_assignment_started_at.lock().unwrap() = None;
                 shared.pending_work.store(0, Ordering::Release);
                 active = None;
@@ -902,23 +866,18 @@ fn metal_worker_loop(
             }
 
             // Dispatch a batch
-            let batch_size = remaining
-                .min(engine.max_hashes_per_launch as u64) as usize;
+            let batch_size = remaining.min(engine.max_hashes_per_launch as u64) as usize;
             let start_nonce = assignment.next_nonce;
-            let nonces: Vec<u64> = (0..batch_size as u64)
-                .map(|i| start_nonce + i)
-                .collect();
+            let nonces: Vec<u64> = (0..batch_size as u64).map(|i| start_nonce + i).collect();
 
             shared
                 .inflight_assignment_hashes
                 .store(batch_size as u64, Ordering::Release);
             *shared.inflight_assignment_started_at.lock().unwrap() = Some(Instant::now());
-            shared
-                .active_hashes_per_launch_per_lane
-                .store(
-                    div_ceil(batch_size as u32, engine.lanes as u32).max(1),
-                    Ordering::Release,
-                );
+            shared.active_hashes_per_launch_per_lane.store(
+                div_ceil(batch_size as u32, engine.lanes as u32).max(1),
+                Ordering::Release,
+            );
 
             match engine.run_fill_batch(
                 &assignment.work.template.header_base,
@@ -940,13 +899,12 @@ fn metal_worker_loop(
                     }
                 }
                 Err(e) => {
-                    shared.emit_error(
-                        instance_id,
-                        format!("Metal fill batch failed: {e:#}"),
-                    );
+                    shared.emit_error(instance_id, format!("Metal fill batch failed: {e:#}"));
                     drop(active);
                     shared.pending_work.store(0, Ordering::Release);
-                    shared.inflight_assignment_hashes.store(0, Ordering::Release);
+                    shared
+                        .inflight_assignment_hashes
+                        .store(0, Ordering::Release);
                     *shared.inflight_assignment_started_at.lock().unwrap() = None;
                     for waiter in fence_waiters.drain(..) {
                         let _ = waiter.send(());

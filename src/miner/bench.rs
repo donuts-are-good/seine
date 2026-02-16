@@ -480,8 +480,13 @@ fn run_worker_benchmark(
     if let Some(hint) = cfg.nvidia_hint {
         info("HINT", hint);
     }
-    let (mut backends, backend_events) =
-        activate_backends(instances, cfg.backend_event_capacity, cfg, shutdown, Vec::new())?;
+    let (mut backends, backend_events) = activate_backends(
+        instances,
+        cfg.backend_event_capacity,
+        cfg,
+        shutdown,
+        Vec::new(),
+    )?;
     super::enforce_deadline_policy(
         &mut backends,
         cfg.allow_best_effort_deadlines,

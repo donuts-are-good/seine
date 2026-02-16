@@ -216,7 +216,6 @@ impl FixedArgon2id {
             }
         }
     }
-
 }
 
 fn precompute_data_independent_ref_indexes(
@@ -1109,11 +1108,11 @@ unsafe fn compress_avx512(rhs: &PowBlock, lhs: &PowBlock) -> PowBlock {
 #[target_feature(enable = "avx512f,avx512vl")]
 unsafe fn compress_avx512_into(rhs: &PowBlock, lhs: &PowBlock, dst: &mut PowBlock) {
     use std::arch::x86_64::{
-        __m128i, __m256i, __m512i, _mm256_loadu_si256, _mm256_storeu_si256,
-        _mm512_castsi128_si512, _mm512_castsi256_si512, _mm512_castsi512_si128,
-        _mm512_castsi512_si256, _mm512_extracti32x4_epi32, _mm512_extracti64x4_epi64,
-        _mm512_inserti32x4, _mm512_inserti64x4, _mm512_loadu_si512, _mm512_storeu_si512,
-        _mm512_xor_si512, _mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128,
+        __m128i, __m256i, __m512i, _mm256_loadu_si256, _mm256_storeu_si256, _mm512_castsi128_si512,
+        _mm512_castsi256_si512, _mm512_castsi512_si128, _mm512_castsi512_si256,
+        _mm512_extracti32x4_epi32, _mm512_extracti64x4_epi64, _mm512_inserti32x4,
+        _mm512_inserti64x4, _mm512_loadu_si512, _mm512_storeu_si512, _mm512_xor_si512,
+        _mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128,
     };
 
     // q lives on the stack as the working buffer for round permutations.
@@ -1161,13 +1160,34 @@ unsafe fn compress_avx512_into(rhs: &PowBlock, lhs: &PowBlock, dst: &mut PowBloc
         avx512_round(&mut a, &mut b, &mut c, &mut d);
 
         _mm256_storeu_si256(q_ptr.add(base0) as *mut __m256i, _mm512_castsi512_si256(a));
-        _mm256_storeu_si256(q_ptr.add(base1) as *mut __m256i, _mm512_extracti64x4_epi64::<1>(a));
-        _mm256_storeu_si256(q_ptr.add(base0 + 4) as *mut __m256i, _mm512_castsi512_si256(b));
-        _mm256_storeu_si256(q_ptr.add(base1 + 4) as *mut __m256i, _mm512_extracti64x4_epi64::<1>(b));
-        _mm256_storeu_si256(q_ptr.add(base0 + 8) as *mut __m256i, _mm512_castsi512_si256(c));
-        _mm256_storeu_si256(q_ptr.add(base1 + 8) as *mut __m256i, _mm512_extracti64x4_epi64::<1>(c));
-        _mm256_storeu_si256(q_ptr.add(base0 + 12) as *mut __m256i, _mm512_castsi512_si256(d));
-        _mm256_storeu_si256(q_ptr.add(base1 + 12) as *mut __m256i, _mm512_extracti64x4_epi64::<1>(d));
+        _mm256_storeu_si256(
+            q_ptr.add(base1) as *mut __m256i,
+            _mm512_extracti64x4_epi64::<1>(a),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base0 + 4) as *mut __m256i,
+            _mm512_castsi512_si256(b),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base1 + 4) as *mut __m256i,
+            _mm512_extracti64x4_epi64::<1>(b),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base0 + 8) as *mut __m256i,
+            _mm512_castsi512_si256(c),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base1 + 8) as *mut __m256i,
+            _mm512_extracti64x4_epi64::<1>(c),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base0 + 12) as *mut __m256i,
+            _mm512_castsi512_si256(d),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base1 + 12) as *mut __m256i,
+            _mm512_extracti64x4_epi64::<1>(d),
+        );
     }
 
     // Phase 3: Column rounds — process 2 columns per iteration via 512-bit registers.
@@ -1216,7 +1236,9 @@ unsafe fn compress_avx512_into(rhs: &PowBlock, lhs: &PowBlock, dst: &mut PowBloc
         let mut b = _mm512_inserti32x4::<3>(
             _mm512_inserti32x4::<2>(
                 _mm512_inserti32x4::<1>(
-                    _mm512_castsi128_si512(_mm_loadu_si128(q_ptr.add(base_i + 32) as *const __m128i)),
+                    _mm512_castsi128_si512(_mm_loadu_si128(
+                        q_ptr.add(base_i + 32) as *const __m128i
+                    )),
                     _mm_loadu_si128(q_ptr.add(base_i + 48) as *const __m128i),
                 ),
                 _mm_loadu_si128(q_ptr.add(base_j + 32) as *const __m128i),
@@ -1226,7 +1248,9 @@ unsafe fn compress_avx512_into(rhs: &PowBlock, lhs: &PowBlock, dst: &mut PowBloc
         let mut c = _mm512_inserti32x4::<3>(
             _mm512_inserti32x4::<2>(
                 _mm512_inserti32x4::<1>(
-                    _mm512_castsi128_si512(_mm_loadu_si128(q_ptr.add(base_i + 64) as *const __m128i)),
+                    _mm512_castsi128_si512(_mm_loadu_si128(
+                        q_ptr.add(base_i + 64) as *const __m128i
+                    )),
                     _mm_loadu_si128(q_ptr.add(base_i + 80) as *const __m128i),
                 ),
                 _mm_loadu_si128(q_ptr.add(base_j + 64) as *const __m128i),
@@ -1236,7 +1260,9 @@ unsafe fn compress_avx512_into(rhs: &PowBlock, lhs: &PowBlock, dst: &mut PowBloc
         let mut d = _mm512_inserti32x4::<3>(
             _mm512_inserti32x4::<2>(
                 _mm512_inserti32x4::<1>(
-                    _mm512_castsi128_si512(_mm_loadu_si128(q_ptr.add(base_i + 96) as *const __m128i)),
+                    _mm512_castsi128_si512(_mm_loadu_si128(
+                        q_ptr.add(base_i + 96) as *const __m128i
+                    )),
                     _mm_loadu_si128(q_ptr.add(base_i + 112) as *const __m128i),
                 ),
                 _mm_loadu_si128(q_ptr.add(base_j + 96) as *const __m128i),
@@ -1274,11 +1300,11 @@ unsafe fn compress_avx512_into_mid_prefetch(
     memory_blocks_base: *const PowBlock,
 ) {
     use std::arch::x86_64::{
-        __m128i, __m256i, __m512i, _mm256_loadu_si256, _mm256_storeu_si256,
-        _mm512_castsi128_si512, _mm512_castsi256_si512, _mm512_castsi512_si128,
-        _mm512_castsi512_si256, _mm512_extracti32x4_epi32, _mm512_extracti64x4_epi64,
-        _mm512_inserti32x4, _mm512_inserti64x4, _mm512_loadu_si512, _mm512_storeu_si512,
-        _mm512_xor_si512, _mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128,
+        __m128i, __m256i, __m512i, _mm256_loadu_si256, _mm256_storeu_si256, _mm512_castsi128_si512,
+        _mm512_castsi256_si512, _mm512_castsi512_si128, _mm512_castsi512_si256,
+        _mm512_extracti32x4_epi32, _mm512_extracti64x4_epi64, _mm512_inserti32x4,
+        _mm512_inserti64x4, _mm512_loadu_si512, _mm512_storeu_si512, _mm512_xor_si512,
+        _mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128,
     };
 
     let mut q = PowBlock::default();
@@ -1323,13 +1349,34 @@ unsafe fn compress_avx512_into_mid_prefetch(
         avx512_round(&mut a, &mut b, &mut c, &mut d);
 
         _mm256_storeu_si256(q_ptr.add(base0) as *mut __m256i, _mm512_castsi512_si256(a));
-        _mm256_storeu_si256(q_ptr.add(base1) as *mut __m256i, _mm512_extracti64x4_epi64::<1>(a));
-        _mm256_storeu_si256(q_ptr.add(base0 + 4) as *mut __m256i, _mm512_castsi512_si256(b));
-        _mm256_storeu_si256(q_ptr.add(base1 + 4) as *mut __m256i, _mm512_extracti64x4_epi64::<1>(b));
-        _mm256_storeu_si256(q_ptr.add(base0 + 8) as *mut __m256i, _mm512_castsi512_si256(c));
-        _mm256_storeu_si256(q_ptr.add(base1 + 8) as *mut __m256i, _mm512_extracti64x4_epi64::<1>(c));
-        _mm256_storeu_si256(q_ptr.add(base0 + 12) as *mut __m256i, _mm512_castsi512_si256(d));
-        _mm256_storeu_si256(q_ptr.add(base1 + 12) as *mut __m256i, _mm512_extracti64x4_epi64::<1>(d));
+        _mm256_storeu_si256(
+            q_ptr.add(base1) as *mut __m256i,
+            _mm512_extracti64x4_epi64::<1>(a),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base0 + 4) as *mut __m256i,
+            _mm512_castsi512_si256(b),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base1 + 4) as *mut __m256i,
+            _mm512_extracti64x4_epi64::<1>(b),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base0 + 8) as *mut __m256i,
+            _mm512_castsi512_si256(c),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base1 + 8) as *mut __m256i,
+            _mm512_extracti64x4_epi64::<1>(c),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base0 + 12) as *mut __m256i,
+            _mm512_castsi512_si256(d),
+        );
+        _mm256_storeu_si256(
+            q_ptr.add(base1 + 12) as *mut __m256i,
+            _mm512_extracti64x4_epi64::<1>(d),
+        );
     }
 
     // Scatter-XOR macro shared by all column rounds.
@@ -1376,7 +1423,9 @@ unsafe fn compress_avx512_into_mid_prefetch(
         let mut b = _mm512_inserti32x4::<3>(
             _mm512_inserti32x4::<2>(
                 _mm512_inserti32x4::<1>(
-                    _mm512_castsi128_si512(_mm_loadu_si128(q_ptr.add(base_i + 32) as *const __m128i)),
+                    _mm512_castsi128_si512(_mm_loadu_si128(
+                        q_ptr.add(base_i + 32) as *const __m128i
+                    )),
                     _mm_loadu_si128(q_ptr.add(base_i + 48) as *const __m128i),
                 ),
                 _mm_loadu_si128(q_ptr.add(base_j + 32) as *const __m128i),
@@ -1386,7 +1435,9 @@ unsafe fn compress_avx512_into_mid_prefetch(
         let mut c = _mm512_inserti32x4::<3>(
             _mm512_inserti32x4::<2>(
                 _mm512_inserti32x4::<1>(
-                    _mm512_castsi128_si512(_mm_loadu_si128(q_ptr.add(base_i + 64) as *const __m128i)),
+                    _mm512_castsi128_si512(_mm_loadu_si128(
+                        q_ptr.add(base_i + 64) as *const __m128i
+                    )),
                     _mm_loadu_si128(q_ptr.add(base_i + 80) as *const __m128i),
                 ),
                 _mm_loadu_si128(q_ptr.add(base_j + 64) as *const __m128i),
@@ -1396,7 +1447,9 @@ unsafe fn compress_avx512_into_mid_prefetch(
         let mut d = _mm512_inserti32x4::<3>(
             _mm512_inserti32x4::<2>(
                 _mm512_inserti32x4::<1>(
-                    _mm512_castsi128_si512(_mm_loadu_si128(q_ptr.add(base_i + 96) as *const __m128i)),
+                    _mm512_castsi128_si512(_mm_loadu_si128(
+                        q_ptr.add(base_i + 96) as *const __m128i
+                    )),
                     _mm_loadu_si128(q_ptr.add(base_i + 112) as *const __m128i),
                 ),
                 _mm_loadu_si128(q_ptr.add(base_j + 96) as *const __m128i),
@@ -1440,7 +1493,9 @@ unsafe fn compress_avx512_into_mid_prefetch(
         let mut b = _mm512_inserti32x4::<3>(
             _mm512_inserti32x4::<2>(
                 _mm512_inserti32x4::<1>(
-                    _mm512_castsi128_si512(_mm_loadu_si128(q_ptr.add(base_i + 32) as *const __m128i)),
+                    _mm512_castsi128_si512(_mm_loadu_si128(
+                        q_ptr.add(base_i + 32) as *const __m128i
+                    )),
                     _mm_loadu_si128(q_ptr.add(base_i + 48) as *const __m128i),
                 ),
                 _mm_loadu_si128(q_ptr.add(base_j + 32) as *const __m128i),
@@ -1450,7 +1505,9 @@ unsafe fn compress_avx512_into_mid_prefetch(
         let mut c = _mm512_inserti32x4::<3>(
             _mm512_inserti32x4::<2>(
                 _mm512_inserti32x4::<1>(
-                    _mm512_castsi128_si512(_mm_loadu_si128(q_ptr.add(base_i + 64) as *const __m128i)),
+                    _mm512_castsi128_si512(_mm_loadu_si128(
+                        q_ptr.add(base_i + 64) as *const __m128i
+                    )),
                     _mm_loadu_si128(q_ptr.add(base_i + 80) as *const __m128i),
                 ),
                 _mm_loadu_si128(q_ptr.add(base_j + 64) as *const __m128i),
@@ -1460,7 +1517,9 @@ unsafe fn compress_avx512_into_mid_prefetch(
         let mut d = _mm512_inserti32x4::<3>(
             _mm512_inserti32x4::<2>(
                 _mm512_inserti32x4::<1>(
-                    _mm512_castsi128_si512(_mm_loadu_si128(q_ptr.add(base_i + 96) as *const __m128i)),
+                    _mm512_castsi128_si512(_mm_loadu_si128(
+                        q_ptr.add(base_i + 96) as *const __m128i
+                    )),
                     _mm_loadu_si128(q_ptr.add(base_i + 112) as *const __m128i),
                 ),
                 _mm_loadu_si128(q_ptr.add(base_j + 96) as *const __m128i),

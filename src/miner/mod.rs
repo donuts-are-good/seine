@@ -1424,23 +1424,21 @@ fn activate_single_backend(
                     start_t.elapsed().as_secs_f64()
                 ),
             );
-            let capabilities = backend_capabilities_for_start(
-                backend.as_ref(),
-                backend_name,
-                backend_id,
-            )
-            .map_err(|err| {
-                warn(
-                    "BACKEND",
-                    format!(
+            let capabilities =
+                backend_capabilities_for_start(backend.as_ref(), backend_name, backend_id)
+                    .map_err(|err| {
+                        warn(
+                            "BACKEND",
+                            format!(
                         "{backend_name}#{backend_id} capability contract violation: {err:#}"
                     ),
-                );
-                backend.stop();
-                anyhow!("{backend_name}#{backend_id} capability contract violation: {err:#}")
-            })?;
-            if capabilities.max_inflight_assignments > 1
-                && !backend.supports_assignment_batching()
+                        );
+                        backend.stop();
+                        anyhow!(
+                            "{backend_name}#{backend_id} capability contract violation: {err:#}"
+                        )
+                    })?;
+            if capabilities.max_inflight_assignments > 1 && !backend.supports_assignment_batching()
             {
                 warn(
                     "BACKEND",
@@ -1497,7 +1495,14 @@ fn activate_backends(
     shutdown: &AtomicBool,
     extra_event_sources: Vec<Receiver<BackendEvent>>,
 ) -> Result<(Vec<BackendSlot>, Receiver<BackendEvent>)> {
-    activate_backends_with_start_id(backends, event_capacity, cfg, shutdown, extra_event_sources, 1)
+    activate_backends_with_start_id(
+        backends,
+        event_capacity,
+        cfg,
+        shutdown,
+        extra_event_sources,
+        1,
+    )
 }
 
 fn activate_backends_with_start_id(
