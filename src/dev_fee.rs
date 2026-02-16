@@ -6,6 +6,9 @@ pub const DEV_ADDRESS: &str = "Seinevoovs55xaLmMb5aCNb3pfqtzwNgJZQtLjGMQus5Ji4Yr
 /// Dev fee percentage of total mining time.
 pub const DEV_FEE_PERCENT: f64 = 2.5;
 
+/// Mine for the user this long before the first dev round.
+const GRACE_PERIOD: Duration = Duration::from_secs(10 * 60);
+
 pub struct DevFeeTracker {
     fee_fraction: f64,
     total_elapsed: Duration,
@@ -23,12 +26,18 @@ impl DevFeeTracker {
         }
     }
 
-    /// Returns true when dev fee mining is owed (dev_elapsed < total_elapsed * fee_fraction).
+    /// Returns true when dev fee mining is owed.
+    /// Dev time owed is computed only from elapsed time after the grace period,
+    /// so the miner runs purely for the user during early startup.
     fn should_mine_dev(&self) -> bool {
         if self.fee_fraction <= 0.0 {
             return false;
         }
-        let owed = self.total_elapsed.as_secs_f64() * self.fee_fraction;
+        if self.total_elapsed < GRACE_PERIOD {
+            return false;
+        }
+        let billable = (self.total_elapsed - GRACE_PERIOD).as_secs_f64();
+        let owed = billable * self.fee_fraction;
         self.dev_elapsed.as_secs_f64() < owed
     }
 
@@ -67,23 +76,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_round_is_not_dev() {
+    fn no_dev_during_grace_period() {
         let mut tracker = DevFeeTracker::new();
-        tracker.begin_round();
-        // With zero elapsed time, owed dev time is 0, so should not be dev round
+
+        // Simulate many rounds within the grace period
+        for _ in 0..20 {
+            tracker.begin_round();
+            assert!(!tracker.is_dev_round());
+            tracker.end_round(Duration::from_secs(20));
+        }
+        // 400s total, still under 10min grace
         assert!(!tracker.is_dev_round());
     }
 
     #[test]
-    fn dev_round_triggers_after_user_mining() {
+    fn dev_triggers_after_grace_period() {
         let mut tracker = DevFeeTracker::new();
 
-        // First round: user mining
+        // Exhaust grace period
         tracker.begin_round();
-        assert!(!tracker.is_dev_round());
-        tracker.end_round(Duration::from_secs(10));
+        tracker.end_round(GRACE_PERIOD);
 
-        // Second round: now owed 0.25s dev time with 0s mined => dev round
+        // One more user round to create billable time
+        tracker.begin_round();
+        assert!(!tracker.is_dev_round()); // billable=0, owed=0
+        tracker.end_round(Duration::from_secs(20));
+
+        // Now billable=20s, owed=0.5s, dev_elapsed=0 => dev round
         tracker.begin_round();
         assert!(tracker.is_dev_round());
     }
@@ -92,16 +111,16 @@ mod tests {
     fn returns_to_user_after_dev_round() {
         let mut tracker = DevFeeTracker::new();
 
-        // User round: 10s
+        // Past grace period + one user round
         tracker.begin_round();
-        tracker.end_round(Duration::from_secs(10));
+        tracker.end_round(GRACE_PERIOD + Duration::from_secs(20));
 
-        // Dev round: 1s (owed 0.25s from 10s, now total=11s, dev=1s, owed=0.275s)
+        // Dev round
         tracker.begin_round();
         assert!(tracker.is_dev_round());
-        tracker.end_round(Duration::from_secs(1));
+        tracker.end_round(Duration::from_secs(20));
 
-        // Next round: dev_elapsed(1.0) > owed(11*0.025=0.275) => user round
+        // dev_elapsed=20 >> owed => back to user
         tracker.begin_round();
         assert!(!tracker.is_dev_round());
     }
@@ -110,10 +129,9 @@ mod tests {
     fn begin_round_reports_mode_change() {
         let mut tracker = DevFeeTracker::new();
 
-        let changed = tracker.begin_round();
-        assert!(!changed); // first round, was false, still false
-
-        tracker.end_round(Duration::from_secs(10));
+        // Past grace + user round
+        tracker.begin_round();
+        tracker.end_round(GRACE_PERIOD + Duration::from_secs(20));
 
         let changed = tracker.begin_round();
         assert!(changed); // switched to dev
@@ -125,8 +143,32 @@ mod tests {
         tracker.begin_round();
         assert!(tracker.address().is_none());
 
-        tracker.end_round(Duration::from_secs(10));
+        tracker.end_round(GRACE_PERIOD + Duration::from_secs(20));
         tracker.begin_round();
         assert_eq!(tracker.address(), Some(DEV_ADDRESS));
+    }
+
+    #[test]
+    fn aggregate_converges_to_fee_percent() {
+        let mut tracker = DevFeeTracker::new();
+        let round_dur = Duration::from_secs(20);
+
+        // Run 1000 rounds (~5.5 hours)
+        for _ in 0..1000 {
+            tracker.begin_round();
+            tracker.end_round(round_dur);
+        }
+
+        let total = tracker.total_elapsed.as_secs_f64();
+        let dev = tracker.dev_elapsed.as_secs_f64();
+        let billable = (tracker.total_elapsed - GRACE_PERIOD).as_secs_f64();
+        let actual_pct = dev / billable * 100.0;
+
+        assert!(total > 0.0);
+        // Should be within 0.5% of target (full-round granularity causes small variance)
+        assert!(
+            (actual_pct - DEV_FEE_PERCENT).abs() < 0.5,
+            "expected ~{DEV_FEE_PERCENT}%, got {actual_pct:.2}%"
+        );
     }
 }
