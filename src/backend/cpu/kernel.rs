@@ -25,18 +25,30 @@ pub(super) fn cpu_worker_loop(
     }
 
     let hasher = fixed_argon::FixedArgon2id::new(POW_MEMORY_KB);
-    let mut memory_blocks = vec![fixed_argon::PowBlock::default(); hasher.block_count()];
+    let block_count = hasher.block_count();
+    let block_bytes = block_count * std::mem::size_of::<fixed_argon::PowBlock>();
 
-    // Hint the kernel to back this 2 GB arena with 2 MB huge pages,
-    // reducing TLB misses on the random ref-block accesses.
-    #[cfg(target_os = "linux")]
-    unsafe {
-        libc::madvise(
-            memory_blocks.as_mut_ptr() as *mut libc::c_void,
-            memory_blocks.len() * std::mem::size_of::<fixed_argon::PowBlock>(),
-            libc::MADV_HUGEPAGE,
-        );
-    }
+    // Allocate the 2 GB arena WITHOUT initialising, then mark it for
+    // huge pages BEFORE faulting.  With THP defrag=[madvise], this lets
+    // the kernel allocate 2 MB pages directly on first touch instead of
+    // faulting 4 KB pages and promoting asynchronously via khugepaged.
+    let mut memory_blocks = {
+        let mut v: Vec<fixed_argon::PowBlock> = Vec::with_capacity(block_count);
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::madvise(
+                v.as_mut_ptr() as *mut libc::c_void,
+                block_bytes,
+                libc::MADV_HUGEPAGE,
+            );
+        }
+        // Zero-initialise — page faults now honour the MADV_HUGEPAGE hint.
+        unsafe {
+            std::ptr::write_bytes(v.as_mut_ptr(), 0, block_count);
+            v.set_len(block_count);
+        }
+        v
+    };
 
     let mut output = [0u8; POW_OUTPUT_LEN];
     mark_worker_ready(&shared);
