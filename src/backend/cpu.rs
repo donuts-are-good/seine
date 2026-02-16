@@ -609,8 +609,24 @@ impl BenchBackend for CpuBackend {
                         let _ = core_affinity::set_for_current(core_id);
                     }
                     let hasher = fixed_argon::FixedArgon2id::new(POW_MEMORY_KB);
-                    let mut memory_blocks =
-                        vec![fixed_argon::PowBlock::default(); hasher.block_count()];
+                    let block_count = hasher.block_count();
+                    let mut _arena_guard: Option<kernel::MmapArena> = None;
+                    let mut _vec_fallback: Option<Vec<fixed_argon::PowBlock>> = None;
+                    let memory_blocks: &mut [fixed_argon::PowBlock];
+                    #[cfg(target_os = "linux")]
+                    {
+                        let block_bytes =
+                            block_count * std::mem::size_of::<fixed_argon::PowBlock>();
+                        let arena = kernel::MmapArena::new(block_count, block_bytes);
+                        _arena_guard = Some(arena);
+                        memory_blocks = _arena_guard.as_mut().unwrap().as_mut_slice();
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        _vec_fallback =
+                            Some(vec![fixed_argon::PowBlock::default(); block_count]);
+                        memory_blocks = _vec_fallback.as_mut().unwrap().as_mut_slice();
+                    }
 
                     let mut header_base = [0u8; blocknet_pow_spec::POW_HEADER_BASE_LEN];
                     for (i, byte) in header_base.iter_mut().enumerate() {
@@ -635,7 +651,7 @@ impl BenchBackend for CpuBackend {
                                 &nonce_bytes,
                                 &header_base,
                                 &mut output,
-                                &mut memory_blocks,
+                                memory_blocks,
                             )
                             .is_err()
                         {
@@ -969,6 +985,10 @@ fn should_flush_hashes(
     hash_batch_size: u64,
 ) -> bool {
     pending_hashes >= hash_batch_size.max(1) || now >= next_flush_at
+}
+
+fn emit_warning(shared: &Shared, message: String) {
+    events::emit_warning(shared, message);
 }
 
 fn emit_error(shared: &Shared, message: String) {

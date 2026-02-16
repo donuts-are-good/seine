@@ -262,6 +262,11 @@ pub struct MiningSolution {
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
     Solution(MiningSolution),
+    Warning {
+        backend_id: BackendInstanceId,
+        backend: &'static str,
+        message: String,
+    },
     Error {
         backend_id: BackendInstanceId,
         backend: &'static str,

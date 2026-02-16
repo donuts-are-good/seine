@@ -6,6 +6,17 @@ use crate::backend::BackendEvent;
 
 use super::{Shared, CRITICAL_EVENT_RETRY_MAX_WAIT, CRITICAL_EVENT_RETRY_WAIT};
 
+pub(super) fn emit_warning(shared: &Shared, message: String) {
+    emit_event(
+        shared,
+        BackendEvent::Warning {
+            backend_id: shared.instance_id.load(Ordering::Acquire),
+            backend: "cpu",
+            message,
+        },
+    );
+}
+
 pub(super) fn emit_error(shared: &Shared, message: String) {
     if shared.error_emitted.swap(true, Ordering::AcqRel) {
         return;
@@ -49,6 +60,9 @@ pub(super) fn forward_event(shared: &Shared, event: BackendEvent) {
     match event {
         BackendEvent::Solution(solution) => {
             send_critical_event(shared, &tx, BackendEvent::Solution(solution));
+        }
+        BackendEvent::Warning { .. } => {
+            send_event_with_backpressure(shared, &tx, event);
         }
         BackendEvent::Error {
             backend_id,

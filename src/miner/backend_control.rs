@@ -77,6 +77,18 @@ pub(super) fn handle_runtime_backend_event(
 
             Ok((RuntimeBackendEventAction::None, None))
         }
+        BackendEvent::Warning {
+            backend_id,
+            backend,
+            message,
+        } => {
+            let tag = match mode {
+                RuntimeMode::Mining => "BACKEND",
+                RuntimeMode::Bench => "BENCH",
+            };
+            warn(tag, format!("{backend}#{backend_id}: {message}"));
+            return Ok((RuntimeBackendEventAction::None, None));
+        }
         BackendEvent::Error {
             backend_id,
             backend,

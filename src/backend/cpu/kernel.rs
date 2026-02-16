@@ -8,9 +8,9 @@ use crate::backend::{BackendEvent, MiningSolution};
 use crate::types::hash_meets_target;
 
 use super::{
-    emit_error, emit_event, fixed_argon, flush_hashes, lane_quota_for_chunk, mark_worker_active,
-    mark_worker_inactive, mark_worker_ready, request_shutdown, request_work_pause,
-    set_thread_high_perf, should_flush_hashes, wait_for_work_update, Shared,
+    emit_error, emit_event, emit_warning, fixed_argon, flush_hashes, lane_quota_for_chunk,
+    mark_worker_active, mark_worker_inactive, mark_worker_ready, request_shutdown,
+    request_work_pause, set_thread_high_perf, should_flush_hashes, wait_for_work_update, Shared,
     MAX_DEADLINE_CHECK_INTERVAL, SOLVED_MASK,
 };
 
@@ -45,6 +45,17 @@ pub(super) fn cpu_worker_loop(
     {
         let block_bytes = block_count * std::mem::size_of::<fixed_argon::PowBlock>();
         let arena = MmapArena::new(block_count, block_bytes);
+        if !arena.is_huge() && thread_idx == 0 {
+            let pages_needed = (block_bytes + (2 << 20) - 1) / (2 << 20);
+            emit_warning(
+                &shared,
+                format!(
+                    "MAP_HUGETLB unavailable — falling back to regular pages (~20% slower). \
+                     Fix: sudo sysctl -w vm.nr_hugepages={} (per worker thread)",
+                    pages_needed,
+                ),
+            );
+        }
         _arena_guard = Some(arena);
         memory_blocks = _arena_guard.as_mut().unwrap().as_mut_slice();
     }
@@ -229,7 +240,7 @@ pub(super) fn cpu_worker_loop(
 /// anonymous mmap with MADV_HUGEPAGE (THP).  MAP_POPULATE pre-faults all
 /// pages so the hash loop never takes a soft fault.
 #[cfg(target_os = "linux")]
-struct MmapArena {
+pub(super) struct MmapArena {
     ptr: *mut u8,
     byte_len: usize,
     block_count: usize,
@@ -238,7 +249,7 @@ struct MmapArena {
 
 #[cfg(target_os = "linux")]
 impl MmapArena {
-    fn new(block_count: usize, byte_len: usize) -> Self {
+    pub(super) fn new(block_count: usize, byte_len: usize) -> Self {
         // Attempt 1: MAP_HUGETLB for guaranteed 2 MB pages.
         let ptr = unsafe {
             libc::mmap(
@@ -288,12 +299,11 @@ impl MmapArena {
         }
     }
 
-    fn as_mut_slice(&mut self) -> &mut [fixed_argon::PowBlock] {
+    pub(super) fn as_mut_slice(&mut self) -> &mut [fixed_argon::PowBlock] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut fixed_argon::PowBlock, self.block_count) }
     }
 
-    #[allow(dead_code)]
-    fn is_huge(&self) -> bool {
+    pub(super) fn is_huge(&self) -> bool {
         self._huge
     }
 }
