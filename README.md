@@ -10,17 +10,23 @@ External miner for Blocknet with pluggable CPU and NVIDIA GPU backends.
 
 ```bash
 # Download the binary for your platform, then:
-./seine --api-url http://127.0.0.1:8332
+./seine
 ```
 
 **Option B — Build from source:**
 
 ```bash
 cargo build --release
-./target/release/seine --api-url http://127.0.0.1:8332
+./target/release/seine
 ```
 
-Seine auto-discovers `api.cookie` from a running Blocknet daemon. If that fails, point to it explicitly:
+Zero-argument mode is the default path. Seine auto-resolves:
+- API URL from running daemon args when available (`--api`), else `http://127.0.0.1:8332`
+- auth token from `api.cookie` (auto-discovered from daemon data dir)
+- backends (CPU + NVIDIA when available)
+- CPU threads from available cores and RAM
+
+If your daemon is not running yet, or you want to override detection, set these explicitly:
 
 ```bash
 ./seine --api-url http://127.0.0.1:8332 --cookie /path/to/data/api.cookie
@@ -41,18 +47,18 @@ Each CPU thread needs ~2 GB RAM (Argon2id parameters). Seine auto-sizes thread c
 
 ```bash
 # Set CPU thread count explicitly
-./seine --api-url http://127.0.0.1:8332 --threads 4
+./seine --threads 4
 
 # Force a specific backend (auto-detects by default)
-./seine --api-url http://127.0.0.1:8332 --backend cpu
-./seine --api-url http://127.0.0.1:8332 --backend nvidia
-./seine --api-url http://127.0.0.1:8332 --backend cpu,nvidia
+./seine --backend cpu
+./seine --backend nvidia
+./seine --backend cpu,nvidia
 
 # Wallet password (if wallet is encrypted)
-./seine --api-url http://127.0.0.1:8332 --wallet-password-file /path/to/wallet.pass
+./seine --wallet-password-file /path/to/wallet.pass
 
 # Plain log output instead of TUI
-./seine --api-url http://127.0.0.1:8332 --ui plain
+./seine --ui plain
 ```
 
 Password sources (checked in order): `--wallet-password`, `--wallet-password-file`, `SEINE_WALLET_PASSWORD` env var, interactive prompt.
@@ -65,10 +71,10 @@ Requires CUDA driver and NVRTC libraries on the host. Seine compiles kernels at 
 
 ```bash
 # Auto-detect all GPUs
-./seine --api-url http://127.0.0.1:8332 --backend nvidia
+./seine --backend nvidia
 
 # Select specific devices
-./seine --api-url http://127.0.0.1:8332 --backend nvidia --nvidia-devices 0,1
+./seine --backend nvidia --nvidia-devices 0,1
 ```
 
 If CUDA initialization fails, NVIDIA backends are quarantined and CPU mining continues.

@@ -202,6 +202,18 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
     info(
         "MINER",
         format!(
+            "effective | api={} auth={} backends={} cpu_threads={} ui={}",
+            cfg.api_url,
+            auth_source_label(cfg),
+            backend_names(&backends),
+            cpu_threads_summary(&backends),
+            if tui_state.is_some() { "tui" } else { "plain" }
+        ),
+    );
+
+    info(
+        "MINER",
+        format!(
             "starting | {} | {} lanes | ~{:.1} GiB RAM",
             backend_names(&backends),
             total_lanes,
@@ -1663,6 +1675,27 @@ fn backend_name_list(backends: &[BackendSlot]) -> Vec<String> {
         .iter()
         .map(|slot| format!("{}#{}", slot.backend.name(), slot.id))
         .collect()
+}
+
+fn auth_source_label(cfg: &Config) -> String {
+    if let Some(path) = &cfg.token_cookie_path {
+        format!("cookie:{}", path.display())
+    } else {
+        "token:static".to_string()
+    }
+}
+
+fn cpu_threads_summary(backends: &[BackendSlot]) -> String {
+    let cpu_threads: Vec<String> = backends
+        .iter()
+        .filter(|slot| slot.backend.name() == "cpu")
+        .map(|slot| format!("cpu#{}={}", slot.id, slot.lanes))
+        .collect();
+    if cpu_threads.is_empty() {
+        "none".to_string()
+    } else {
+        cpu_threads.join(",")
+    }
 }
 
 fn backend_names(backends: &[BackendSlot]) -> String {

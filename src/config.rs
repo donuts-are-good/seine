@@ -75,6 +75,13 @@ const DEFAULT_NVIDIA_AUTOTUNE_SAMPLES: u32 = 2;
 const DEFAULT_NVIDIA_HASHES_PER_LAUNCH_PER_LANE: u32 = 2;
 const DEFAULT_NVIDIA_AUTOTUNE_CONFIG_FILE: &str = "seine.nvidia-autotune.json";
 const DEFAULT_METAL_HASHES_PER_LAUNCH_PER_LANE: u32 = 2;
+const DEFAULT_API_URL: &str = "http://127.0.0.1:8332";
+
+#[derive(Debug, Clone)]
+struct DaemonContext {
+    data_dir: PathBuf,
+    api_addr: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct CpuProfileDefaults {
@@ -134,8 +141,9 @@ pub struct BackendSpec {
 #[command(name = "seine", version, about = "Seine net miner for Blocknet")]
 struct Cli {
     /// API base URL for the blocknet daemon.
-    #[arg(long = "api-url", default_value = "http://127.0.0.1:8332")]
-    api_url: String,
+    /// When omitted, Seine auto-detects from a running daemon and falls back to 127.0.0.1:8332.
+    #[arg(long = "api-url")]
+    api_url: Option<String>,
 
     /// Bearer token for authenticated API access.
     #[arg(long)]
@@ -721,15 +729,26 @@ impl Config {
             },
         )?;
 
-        validate_cpu_memory(&backend_specs, resolved_threads, cli.allow_oversubscribe, gpu_memory_reservation)?;
+        validate_cpu_memory(
+            &backend_specs,
+            resolved_threads,
+            cli.allow_oversubscribe,
+            gpu_memory_reservation,
+        )?;
+
+        let daemon_context = if cli.bench {
+            None
+        } else {
+            detect_daemon_context()
+        };
 
         let (token, token_cookie_path) = if cli.bench {
             (None, None)
         } else {
-            let (token, cookie_path) = resolve_token_with_source(&cli)?;
+            let (token, cookie_path) = resolve_token_with_source(&cli, daemon_context.as_ref())?;
             (Some(token), cookie_path)
         };
-        let api_url = normalize_api_url(&cli.api_url);
+        let api_url = resolve_api_url(cli.api_url.as_deref(), daemon_context.as_ref());
         let strict_round_accounting = cli.strict_round_accounting && !cli.relaxed_accounting;
         let nvidia_enforce_template_stop = match cli.nvidia_template_stop_policy {
             NvidiaTemplateStopPolicy::Auto => strict_round_accounting,
@@ -900,7 +919,10 @@ fn estimate_metal_memory_bytes(_metal_max_lanes: Option<usize>) -> u64 {
     0
 }
 
-fn resolve_token_with_source(cli: &Cli) -> Result<(String, Option<PathBuf>)> {
+fn resolve_token_with_source(
+    cli: &Cli,
+    daemon_context: Option<&DaemonContext>,
+) -> Result<(String, Option<PathBuf>)> {
     if let Some(token) = &cli.token {
         let trimmed = token.trim();
         if trimmed.is_empty() {
@@ -919,9 +941,8 @@ fn resolve_token_with_source(cli: &Cli) -> Result<(String, Option<PathBuf>)> {
     let mut candidates: Vec<PathBuf> = vec![cli.data_dir.join("api.cookie")];
 
     // Try to discover the daemon's data directory from a running process.
-    let daemon_detected = detect_daemon_data_dir();
-    if let Some(ref daemon_data_dir) = daemon_detected {
-        let daemon_cookie = daemon_data_dir.join("api.cookie");
+    if let Some(context) = daemon_context {
+        let daemon_cookie = context.data_dir.join("api.cookie");
         if !candidates.contains(&daemon_cookie) {
             candidates.push(daemon_cookie);
         }
@@ -939,7 +960,7 @@ fn resolve_token_with_source(cli: &Cli) -> Result<(String, Option<PathBuf>)> {
         .collect::<Vec<_>>()
         .join("\n");
 
-    if daemon_detected.is_some() {
+    if daemon_context.is_some() {
         bail!(
             "found a running blocknet daemon but could not read its api.cookie\n\n\
              searched:\n{searched}\n\n\
@@ -959,8 +980,8 @@ fn resolve_token_with_source(cli: &Cli) -> Result<(String, Option<PathBuf>)> {
     );
 }
 
-/// Inspect running processes to find a `blocknet` daemon and resolve its data directory.
-fn detect_daemon_data_dir() -> Option<PathBuf> {
+/// Inspect running processes to find a `blocknet` daemon and resolve runtime context.
+fn detect_daemon_context() -> Option<DaemonContext> {
     use std::ffi::OsStr;
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
@@ -971,26 +992,59 @@ fn detect_daemon_data_dir() -> Option<PathBuf> {
     );
 
     for process in sys.processes_by_name(OsStr::new("blocknet")) {
-        let cmd: Vec<String> = process.cmd().iter().filter_map(|s| s.to_str().map(String::from)).collect();
+        let cmd: Vec<String> = process
+            .cmd()
+            .iter()
+            .filter_map(|s| s.to_str().map(String::from))
+            .collect();
 
-        // Look for --data <path> in the daemon's arguments.
-        let data_dir = cmd
-            .windows(2)
-            .find(|pair| pair[0] == "--data")
-            .map(|pair| PathBuf::from(&pair[1]));
-
-        let data_dir = data_dir.unwrap_or_else(|| PathBuf::from("blocknet-data-mainnet"));
+        let data_dir = daemon_data_dir_from_cmdline(&cmd)
+            .unwrap_or_else(|| PathBuf::from("blocknet-data-mainnet"));
 
         // If the data dir is relative, resolve it against the daemon's cwd.
         if data_dir.is_relative() {
             if let Some(cwd) = process.cwd() {
-                return Some(cwd.join(&data_dir));
+                return Some(DaemonContext {
+                    data_dir: cwd.join(&data_dir),
+                    api_addr: daemon_api_addr_from_cmdline(&cmd),
+                });
             }
         }
 
-        return Some(data_dir);
+        return Some(DaemonContext {
+            data_dir,
+            api_addr: daemon_api_addr_from_cmdline(&cmd),
+        });
     }
 
+    None
+}
+
+fn daemon_data_dir_from_cmdline(cmd: &[String]) -> Option<PathBuf> {
+    cmd_arg_value(cmd, &["--data", "--data-dir", "-datadir"]).map(PathBuf::from)
+}
+
+fn daemon_api_addr_from_cmdline(cmd: &[String]) -> Option<String> {
+    cmd_arg_value(cmd, &["--api", "-api"])
+}
+
+fn cmd_arg_value(cmd: &[String], flags: &[&str]) -> Option<String> {
+    for (idx, arg) in cmd.iter().enumerate() {
+        for flag in flags {
+            if arg == flag {
+                if let Some(value) = cmd.get(idx + 1) {
+                    if !value.trim().is_empty() && !value.starts_with('-') {
+                        return Some(value.clone());
+                    }
+                }
+            }
+            if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
+                if !value.trim().is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
     None
 }
 
@@ -1012,6 +1066,82 @@ fn optional_duration_from_millis(value: u64) -> Option<Duration> {
     } else {
         Some(Duration::from_millis(value))
     }
+}
+
+fn resolve_api_url(cli_api_url: Option<&str>, daemon_context: Option<&DaemonContext>) -> String {
+    if let Some(input) = cli_api_url {
+        return normalize_api_url(input);
+    }
+    if let Some(context) = daemon_context {
+        if let Some(api_addr) = context.api_addr.as_deref() {
+            if let Some(url) = api_url_from_daemon_api_addr(api_addr) {
+                return url;
+            }
+        }
+    }
+    DEFAULT_API_URL.to_string()
+}
+
+fn api_url_from_daemon_api_addr(input: &str) -> Option<String> {
+    let authority = input.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    if authority.starts_with("http://") || authority.starts_with("https://") {
+        return Some(normalize_api_url(authority));
+    }
+
+    let authority = authority
+        .trim_start_matches("tcp://")
+        .split('/')
+        .next()
+        .unwrap_or(authority)
+        .trim();
+    if authority.is_empty() {
+        return None;
+    }
+
+    let (host, port) = parse_host_port(authority)?;
+    let host = match host.as_str() {
+        "" | "0.0.0.0" | "::" | "*" => "127.0.0.1".to_string(),
+        _ => host,
+    };
+    let host_for_url = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Some(format!("http://{host_for_url}:{port}"))
+}
+
+fn parse_host_port(authority: &str) -> Option<(String, u16)> {
+    let authority = authority.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    if authority.chars().all(|c| c.is_ascii_digit()) {
+        let port = authority.parse::<u16>().ok()?;
+        return Some(("127.0.0.1".to_string(), port));
+    }
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        let closing = rest.find(']')?;
+        let host = rest[..closing].to_string();
+        let port_part = rest.get(closing + 1..)?.strip_prefix(':')?;
+        let port = port_part.parse::<u16>().ok()?;
+        return Some((host, port));
+    }
+
+    if authority.matches(':').count() == 1 {
+        let (host, port) = authority.split_once(':')?;
+        let port = port.parse::<u16>().ok()?;
+        return Some((host.to_string(), port));
+    }
+
+    // IPv6 addresses without brackets (for example ::1:8332)
+    let (host, port) = authority.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    Some((host.to_string(), port))
 }
 
 fn normalize_api_url(input: &str) -> String {
@@ -1245,16 +1375,14 @@ fn pcore_count() -> Option<usize> {
 
 fn auto_cpu_threads(cpu_backend_instances: usize, gpu_memory_reservation: u64) -> usize {
     let cpu_parallelism = pcore_count()
-        .or_else(|| {
-            std::thread::available_parallelism()
-                .map(|p| p.get())
-                .ok()
-        })
+        .or_else(|| std::thread::available_parallelism().map(|p| p.get()).ok())
         .unwrap_or(1)
         .max(1);
     let memory_cap_total = detect_memory_budget_bytes()
         .map(|budget| {
-            let available = budget.effective_available.saturating_sub(gpu_memory_reservation);
+            let available = budget
+                .effective_available
+                .saturating_sub(gpu_memory_reservation);
             (available / CPU_LANE_MEMORY_BYTES) as usize
         })
         .unwrap_or(cpu_parallelism)
@@ -1294,7 +1422,10 @@ fn validate_cpu_memory(
     };
 
     let gpu_note = if gpu_memory_reservation > 0 {
-        format!(" + ~{} GPU/Metal reservation", human_bytes(gpu_memory_reservation))
+        format!(
+            " + ~{} GPU/Metal reservation",
+            human_bytes(gpu_memory_reservation)
+        )
     } else {
         String::new()
     };
@@ -1388,7 +1519,7 @@ mod tests {
 
     fn sample_cli() -> Cli {
         Cli {
-            api_url: "http://127.0.0.1:8332".to_string(),
+            api_url: None,
             token: None,
             wallet_password: None,
             wallet_password_file: None,
@@ -1476,11 +1607,77 @@ mod tests {
     }
 
     #[test]
+    fn resolve_api_url_prefers_explicit_cli_value() {
+        let daemon = DaemonContext {
+            data_dir: PathBuf::from("/tmp/blocknet"),
+            api_addr: Some("127.0.0.1:9000".to_string()),
+        };
+        assert_eq!(
+            resolve_api_url(Some("http://10.0.0.2:8332"), Some(&daemon)),
+            "http://10.0.0.2:8332"
+        );
+    }
+
+    #[test]
+    fn resolve_api_url_uses_daemon_api_when_cli_omitted() {
+        let daemon = DaemonContext {
+            data_dir: PathBuf::from("/tmp/blocknet"),
+            api_addr: Some("192.168.1.5:9100".to_string()),
+        };
+        assert_eq!(
+            resolve_api_url(None, Some(&daemon)),
+            "http://192.168.1.5:9100"
+        );
+    }
+
+    #[test]
+    fn resolve_api_url_falls_back_when_daemon_api_is_unparseable() {
+        let daemon = DaemonContext {
+            data_dir: PathBuf::from("/tmp/blocknet"),
+            api_addr: Some("not-an-endpoint".to_string()),
+        };
+        assert_eq!(resolve_api_url(None, Some(&daemon)), DEFAULT_API_URL);
+    }
+
+    #[test]
+    fn api_url_from_daemon_api_addr_maps_wildcards_to_loopback() {
+        assert_eq!(
+            api_url_from_daemon_api_addr("0.0.0.0:8332"),
+            Some("http://127.0.0.1:8332".to_string())
+        );
+        assert_eq!(
+            api_url_from_daemon_api_addr("[::]:8332"),
+            Some("http://127.0.0.1:8332".to_string())
+        );
+    }
+
+    #[test]
+    fn api_url_from_daemon_api_addr_supports_port_only_and_equals_form() {
+        assert_eq!(
+            api_url_from_daemon_api_addr("8332"),
+            Some("http://127.0.0.1:8332".to_string())
+        );
+        let cmd = vec![
+            "blocknet".to_string(),
+            "--api=127.0.0.1:7777".to_string(),
+            "--data=./node-data".to_string(),
+        ];
+        assert_eq!(
+            daemon_api_addr_from_cmdline(&cmd),
+            Some("127.0.0.1:7777".to_string())
+        );
+        assert_eq!(
+            daemon_data_dir_from_cmdline(&cmd),
+            Some(PathBuf::from("./node-data"))
+        );
+    }
+
+    #[test]
     fn resolve_token_prefers_explicit_token() {
         let mut cli = sample_cli();
         cli.token = Some("  abc123  ".to_string());
 
-        let (token, source) = resolve_token_with_source(&cli).expect("token should parse");
+        let (token, source) = resolve_token_with_source(&cli, None).expect("token should parse");
         assert_eq!(token, "abc123");
         assert!(source.is_none());
     }
@@ -1496,7 +1693,7 @@ mod tests {
         cli.cookie = Some(cookie.clone());
         cli.data_dir = dir.clone();
 
-        let (token, source) = resolve_token_with_source(&cli).expect("cookie should be read");
+        let (token, source) = resolve_token_with_source(&cli, None).expect("cookie should be read");
         assert_eq!(token, "deadbeef");
         assert_eq!(source.as_deref(), Some(cookie.as_path()));
         let _ = fs::remove_file(cookie);
