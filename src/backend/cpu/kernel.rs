@@ -27,28 +27,33 @@ pub(super) fn cpu_worker_loop(
     let hasher = fixed_argon::FixedArgon2id::new(POW_MEMORY_KB);
     let block_count = hasher.block_count();
 
-    // Allocate the 2 GB arena WITHOUT initialising, then mark it for
-    // huge pages BEFORE faulting.  With THP defrag=[madvise], this lets
-    // the kernel allocate 2 MB pages directly on first touch instead of
-    // faulting 4 KB pages and promoting asynchronously via khugepaged.
-    let mut memory_blocks = {
-        let mut v: Vec<fixed_argon::PowBlock> = Vec::with_capacity(block_count);
-        #[cfg(target_os = "linux")]
-        unsafe {
-            let block_bytes = block_count * std::mem::size_of::<fixed_argon::PowBlock>();
-            libc::madvise(
-                v.as_mut_ptr() as *mut libc::c_void,
-                block_bytes,
-                libc::MADV_HUGEPAGE,
-            );
-        }
-        // Zero-initialise — page faults now honour the MADV_HUGEPAGE hint.
-        unsafe {
-            std::ptr::write_bytes(v.as_mut_ptr(), 0, block_count);
-            v.set_len(block_count);
-        }
-        v
-    };
+    // Allocate the 2 GiB arena with explicit huge pages (2 MB) to avoid
+    // the catastrophic TLB miss overhead of 524 K × 4 KB pages.
+    //
+    // Strategy:
+    //   1. Try mmap MAP_HUGETLB — guaranteed 2 MB pages from the hugetlbfs
+    //      pool (requires /proc/sys/vm/nr_hugepages >= arena_size/2MB).
+    //   2. Fall back to regular mmap + MADV_HUGEPAGE (THP).
+    //   3. Fall back to Vec (non-Linux, or mmap failure).
+    //
+    // MAP_POPULATE pre-faults all pages so the hash loop never page-faults.
+    let mut _arena_guard: Option<MmapArena> = None;
+    let mut _vec_fallback: Option<Vec<fixed_argon::PowBlock>> = None;
+    let memory_blocks: &mut [fixed_argon::PowBlock];
+
+    #[cfg(target_os = "linux")]
+    {
+        let block_bytes = block_count * std::mem::size_of::<fixed_argon::PowBlock>();
+        let arena = MmapArena::new(block_count, block_bytes);
+        _arena_guard = Some(arena);
+        memory_blocks = _arena_guard.as_mut().unwrap().as_mut_slice();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut v: Vec<fixed_argon::PowBlock> = vec![fixed_argon::PowBlock::default(); block_count];
+        _vec_fallback = Some(v);
+        memory_blocks = _vec_fallback.as_mut().unwrap().as_mut_slice();
+    }
 
     let mut output = [0u8; POW_OUTPUT_LEN];
     mark_worker_ready(&shared);
@@ -151,7 +156,7 @@ pub(super) fn cpu_worker_loop(
                 &nonce_bytes,
                 &template.header_base,
                 &mut output,
-                &mut memory_blocks,
+                memory_blocks,
             )
             .is_err()
         {
@@ -218,3 +223,93 @@ pub(super) fn cpu_worker_loop(
     flush_hashes(&shared, thread_idx, &mut pending_hashes);
     mark_worker_inactive(&shared, &mut worker_active);
 }
+
+/// RAII wrapper around a `mmap`-backed arena.  Tries MAP_HUGETLB (explicit
+/// 2 MB pages from the hugetlbfs pool) first, then falls back to regular
+/// anonymous mmap with MADV_HUGEPAGE (THP).  MAP_POPULATE pre-faults all
+/// pages so the hash loop never takes a soft fault.
+#[cfg(target_os = "linux")]
+struct MmapArena {
+    ptr: *mut u8,
+    byte_len: usize,
+    block_count: usize,
+    _huge: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl MmapArena {
+    fn new(block_count: usize, byte_len: usize) -> Self {
+        // Attempt 1: MAP_HUGETLB for guaranteed 2 MB pages.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                byte_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB | libc::MAP_POPULATE,
+                -1,
+                0,
+            )
+        };
+        if ptr != libc::MAP_FAILED {
+            return Self {
+                ptr: ptr as *mut u8,
+                byte_len,
+                block_count,
+                _huge: true,
+            };
+        }
+
+        // Attempt 2: regular anonymous mmap + MADV_HUGEPAGE (THP).
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                byte_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            panic!(
+                "mmap failed for {} byte arena: {}",
+                byte_len,
+                std::io::Error::last_os_error()
+            );
+        }
+        unsafe {
+            libc::madvise(ptr, byte_len, libc::MADV_HUGEPAGE);
+        }
+        Self {
+            ptr: ptr as *mut u8,
+            byte_len,
+            block_count,
+            _huge: false,
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [fixed_argon::PowBlock] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut fixed_argon::PowBlock, self.block_count) }
+    }
+
+    #[allow(dead_code)]
+    fn is_huge(&self) -> bool {
+        self._huge
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MmapArena {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.byte_len);
+        }
+    }
+}
+
+// Safety: The mmap region is private to the thread that created it.
+// The arena is only accessed by a single worker thread.
+#[cfg(target_os = "linux")]
+unsafe impl Send for MmapArena {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for MmapArena {}
