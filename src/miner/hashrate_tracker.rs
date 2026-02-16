@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use crate::backend::BackendInstanceId;
 
-const CURRENT_WINDOW_SECS: f64 = 30.0;
+const CURRENT_WINDOW_SECS: f64 = 5.0;
 const MAX_SAMPLES: usize = 600;
 const MIN_WINDOW_SECS: f64 = 2.0;
 

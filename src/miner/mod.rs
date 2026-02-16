@@ -57,7 +57,7 @@ const CPU_AUTOTUNE_LINEAR_SCAN_MAX_CANDIDATES: usize = 8;
 const CPU_AUTOTUNE_FINAL_SWEEP_RADIUS: usize = 2;
 const CPU_AUTOTUNE_TARGET_HASHES_PER_CANDIDATE: u64 = 30;
 const CPU_AUTOTUNE_MAX_SAMPLE_SECS_PER_CANDIDATE: u64 = 60;
-const CPU_AUTOTUNE_BALANCED_PEAK_FLOOR_FRAC: f64 = 0.90;
+const CPU_AUTOTUNE_BALANCED_PEAK_FLOOR_FRAC: f64 = 0.95;
 const CPU_AUTOTUNE_EFFICIENCY_PEAK_FLOOR_FRAC: f64 = 0.75;
 
 #[derive(Debug, Clone, Copy)]
@@ -2299,6 +2299,7 @@ mod tests {
 
     #[test]
     fn autotune_selection_balanced_biases_lower_when_near_peak() {
+        // 95% of peak (3.3) is 3.135, so 4 threads (3.2) is the first candidate that qualifies.
         let selection = select_cpu_autotune_candidate(
             CpuPerformanceProfile::Balanced,
             &autotune_measurements(&[(3, 3.0), (4, 3.2), (22, 3.3)]),
@@ -2306,7 +2307,7 @@ mod tests {
         .expect("selection should exist");
 
         assert_eq!(selection.peak_threads, 22);
-        assert_eq!(selection.selected_threads, 3);
+        assert_eq!(selection.selected_threads, 4);
         assert!((selection.peak_floor_frac - CPU_AUTOTUNE_BALANCED_PEAK_FLOOR_FRAC).abs() < 1e-9);
     }
 
