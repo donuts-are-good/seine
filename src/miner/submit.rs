@@ -289,6 +289,16 @@ pub(super) fn process_submit_request(
 
                 let unauthorized = is_unauthorized_error(&err);
                 let mut error_context = format!("{err:#}");
+                if let Some(outcome) = stale_submit_outcome(attempts, &error_context) {
+                    return SubmitResult {
+                        request_id,
+                        solution,
+                        template_height,
+                        outcome,
+                        attempts,
+                        is_dev_fee,
+                    };
+                }
                 let mut retryable = is_retryable_api_error(&err);
                 if unauthorized {
                     match refresh_api_token_from_cookie(
@@ -321,6 +331,17 @@ pub(super) fn process_submit_request(
                     }
                 }
 
+                if let Some(outcome) = stale_submit_outcome(attempts, &error_context) {
+                    return SubmitResult {
+                        request_id,
+                        solution,
+                        template_height,
+                        outcome,
+                        attempts,
+                        is_dev_fee,
+                    };
+                }
+
                 if retryable && attempts < max_attempts {
                     if !sleep_with_shutdown(shutdown, submit_retry_delay(attempts)) {
                         return SubmitResult {
@@ -346,20 +367,11 @@ pub(super) fn process_submit_request(
                             "submit failed after {attempts} attempt(s): {error_context}"
                         ))
                     } else {
-                        let message =
-                            format!("submit failed after {attempts} attempt(s): {error_context}");
-                        if let Some((expected_height, got_height)) =
-                            parse_stale_height_error(&message)
-                        {
-                            SubmitOutcome::StaleHeightError {
-                                message,
-                                expected_height,
-                                got_height,
-                            }
-                        } else if let Some(reason) = parse_stale_tip_reject_reason(&message) {
-                            SubmitOutcome::StaleTipError { message, reason }
-                        } else {
-                            SubmitOutcome::TerminalError(message)
+                        match stale_submit_outcome(attempts, &error_context) {
+                            Some(outcome) => outcome,
+                            None => SubmitOutcome::TerminalError(format!(
+                                "submit failed after {attempts} attempt(s): {error_context}"
+                            )),
                         }
                     },
                     attempts,
@@ -393,6 +405,19 @@ fn submit_retry_delay(attempt: u32) -> Duration {
     SUBMIT_RETRY_BASE_DELAY
         .saturating_mul(multiplier)
         .min(SUBMIT_RETRY_MAX_DELAY)
+}
+
+fn stale_submit_outcome(attempts: u32, error_context: &str) -> Option<SubmitOutcome> {
+    let message = format!("submit failed after {attempts} attempt(s): {error_context}");
+    if let Some((expected_height, got_height)) = parse_stale_height_error(&message) {
+        return Some(SubmitOutcome::StaleHeightError {
+            message,
+            expected_height,
+            got_height,
+        });
+    }
+    parse_stale_tip_reject_reason(&message)
+        .map(|reason| SubmitOutcome::StaleTipError { message, reason })
 }
 
 fn parse_stale_height_error(message: &str) -> Option<(u64, u64)> {
@@ -503,37 +528,22 @@ fn handle_submit_result(result: &SubmitResult, stats: &Stats, tui: &mut Option<T
             }
         }
         SubmitOutcome::StaleHeightError {
-            message,
+            message: _,
             expected_height,
             got_height,
         } => {
             warn(
                 "SUBMIT",
                 format!(
-                    "request_id={request_id} stale solution rejected epoch={} nonce={} backend={}#{} submitted_height={}: daemon advanced tip (expected {}, submitted {}) [{}]",
-                    result.solution.epoch,
-                    result.solution.nonce,
-                    result.solution.backend,
-                    result.solution.backend_id,
-                    template_height,
-                    expected_height,
-                    got_height,
-                    message
+                    "stale solution: chain tip advanced before submit (expected height {}, solution was for height {})",
+                    expected_height, got_height
                 ),
             );
         }
-        SubmitOutcome::StaleTipError { message, reason } => {
+        SubmitOutcome::StaleTipError { message: _, reason } => {
             warn(
                 "SUBMIT",
-                format!(
-                    "request_id={request_id} stale solution rejected epoch={} nonce={} backend={}#{} submitted_height={}: {reason} [{}]",
-                    result.solution.epoch,
-                    result.solution.nonce,
-                    result.solution.backend,
-                    result.solution.backend_id,
-                    template_height,
-                    message
-                ),
+                format!("stale solution: template no longer matches current tip ({reason})"),
             );
         }
         SubmitOutcome::RetryableError(message) => {
@@ -605,7 +615,10 @@ fn sleep_with_shutdown(shutdown: &AtomicBool, duration: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_stale_height_error, parse_stale_tip_reject_reason};
+    use super::{
+        parse_stale_height_error, parse_stale_tip_reject_reason, stale_submit_outcome,
+        SubmitOutcome,
+    };
 
     #[test]
     fn parse_stale_height_reject_extracts_expected_and_got() {
@@ -636,5 +649,38 @@ mod tests {
             parse_stale_tip_reject_reason(message),
             Some("duplicate-or-stale")
         );
+    }
+
+    #[test]
+    fn stale_submit_outcome_detects_stale_height() {
+        let outcome = stale_submit_outcome(
+            1,
+            "submitblock failed (500 Internal Server Error): invalid block: invalid height: expected 60, got 59",
+        );
+        match outcome {
+            Some(SubmitOutcome::StaleHeightError {
+                expected_height,
+                got_height,
+                ..
+            }) => {
+                assert_eq!(expected_height, 60);
+                assert_eq!(got_height, 59);
+            }
+            _ => panic!("expected stale height outcome"),
+        }
+    }
+
+    #[test]
+    fn stale_submit_outcome_detects_stale_tip() {
+        let outcome = stale_submit_outcome(
+            1,
+            "submitblock failed (400 Bad Request): block not accepted (duplicate or stale)",
+        );
+        match outcome {
+            Some(SubmitOutcome::StaleTipError { reason, .. }) => {
+                assert_eq!(reason, "duplicate-or-stale");
+            }
+            _ => panic!("expected stale tip outcome"),
+        }
     }
 }
