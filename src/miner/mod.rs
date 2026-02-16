@@ -159,6 +159,9 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
         return bench::run_benchmark(cfg, shutdown.as_ref());
     }
     let runtime_cfg = prepare_runtime_config(cfg, shutdown.as_ref(), RuntimeMode::Mining)?;
+    if shutdown.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     let cfg = &runtime_cfg;
 
     let backend_executor = backend_executor::BackendExecutor::new();

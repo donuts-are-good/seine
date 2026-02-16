@@ -6,7 +6,6 @@ use super::tui::{LogEntry, LogLevel, TuiState};
 
 const FRAME_INNER_WIDTH: usize = 92;
 const KEY_WIDTH: usize = 18;
-const MAX_LOG_LINE_WIDTH: usize = 104;
 const LOGO: &[&str] = &[
     "                     ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~",
     "               ~ ~ ~    ╱╲╱╲╱╲╱╲╱╲╱╲╱╲╱╲╱╲╱╲╱╲╱╲    ~ ~ ~",
@@ -148,7 +147,6 @@ fn log(level: Level, tag: &str, message: &str) {
     );
     let max_body = if output_is_terminal() {
         terminal_columns()
-            .min(MAX_LOG_LINE_WIDTH)
             .saturating_sub(prefix_plain.chars().count() + 1)
             .max(16)
     } else {
