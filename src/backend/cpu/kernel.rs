@@ -8,11 +8,13 @@ use crate::backend::{BackendEvent, MiningSolution};
 use crate::types::hash_meets_target;
 
 use super::{
-    emit_error, emit_event, emit_warning, fixed_argon, flush_hashes, lane_quota_for_chunk,
+    emit_error, emit_event, fixed_argon, flush_hashes, lane_quota_for_chunk,
     mark_worker_active, mark_worker_inactive, mark_worker_ready, request_shutdown,
     request_work_pause, set_thread_high_perf, should_flush_hashes, wait_for_work_update, Shared,
     MAX_DEADLINE_CHECK_INTERVAL, SOLVED_MASK,
 };
+#[cfg(target_os = "linux")]
+use super::emit_warning;
 
 pub(super) fn cpu_worker_loop(
     shared: Arc<Shared>,
@@ -26,6 +28,7 @@ pub(super) fn cpu_worker_loop(
 
     let hasher = fixed_argon::FixedArgon2id::new(POW_MEMORY_KB);
     let block_count = hasher.block_count();
+    #[cfg(target_os = "linux")]
     let block_bytes = block_count * std::mem::size_of::<fixed_argon::PowBlock>();
 
     let mut arena = PowArena::new(block_count);
@@ -202,6 +205,7 @@ pub(super) fn cpu_worker_loop(
     mark_worker_inactive(&shared, &mut worker_active);
 }
 
+#[cfg(target_os = "linux")]
 const HUGEPAGE_BYTES: usize = 2 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const MADV_COLLAPSE: libc::c_int = 25;
@@ -311,6 +315,7 @@ pub(super) struct MmapArena {
     ptr: *mut u8,
     byte_len: usize,
     block_count: usize,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     backing: MmapBacking,
 }
 

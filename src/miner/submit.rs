@@ -98,6 +98,7 @@ pub(super) enum SubmitOutcome {
     Response(SubmitBlockResponse),
     RetryableError(String),
     StaleHeightError {
+        #[allow(dead_code)]
         message: String,
         expected_height: u64,
         got_height: u64,

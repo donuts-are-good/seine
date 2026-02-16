@@ -972,6 +972,7 @@ fn should_flush_hashes(
     pending_hashes >= hash_batch_size.max(1) || now >= next_flush_at
 }
 
+#[cfg(target_os = "linux")]
 fn emit_warning(shared: &Shared, message: String) {
     events::emit_warning(shared, message);
 }

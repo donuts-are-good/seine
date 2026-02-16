@@ -6,6 +6,7 @@ use crate::backend::BackendEvent;
 
 use super::{Shared, CRITICAL_EVENT_RETRY_MAX_WAIT, CRITICAL_EVENT_RETRY_WAIT};
 
+#[cfg(target_os = "linux")]
 pub(super) fn emit_warning(shared: &Shared, message: String) {
     emit_event(
         shared,

@@ -122,6 +122,7 @@ pub mod nvidia {
     };
 
     #[derive(Debug, Clone, Copy, Default)]
+    #[allow(dead_code)]
     pub struct NvidiaBackendTuningOptions {
         pub max_rregcount_override: Option<u32>,
         pub max_lanes_override: Option<usize>,
@@ -262,6 +263,7 @@ pub struct MiningSolution {
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
     Solution(MiningSolution),
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Warning {
         backend_id: BackendInstanceId,
         backend: &'static str,
