@@ -814,6 +814,20 @@ __global__ void argon2id_fill_kernel(
                         input_block[5] = 2ULL; // Argon2id
                     }
                     coop_sync();
+
+                    // Argon2id slice 0 starts at block index 2. Prime the first address block
+                    // so indices 2..127 read initialized address words (matches CPU/reference flow).
+                    if (pass == 0U && slice == 0U) {
+                        update_address_block_coop(
+                            address_block,
+                            input_block,
+                            zero_block,
+                            scratch_r,
+                            scratch_q,
+                            tid
+                        );
+                        coop_sync();
+                    }
                 }
 
                 const unsigned int first_block =

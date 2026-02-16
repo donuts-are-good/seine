@@ -355,7 +355,15 @@ impl<'a> MiningControlPlane<'a> {
         tui: &mut Option<TuiDisplay>,
     ) -> bool {
         let is_dev_fee = self.dev_fee_address.is_some();
-        if !self.enqueue_submit_request(SubmitRequest { template, solution, is_dev_fee }, stats, tui) {
+        if !self.enqueue_submit_request(
+            SubmitRequest {
+                template,
+                solution,
+                is_dev_fee,
+            },
+            stats,
+            tui,
+        ) {
             return false;
         }
         stats.bump_submitted();
@@ -877,10 +885,7 @@ pub(super) fn run_mining_loop(
     let mut dev_fee_tracker = DevFeeTracker::new();
     info(
         "MINER",
-        format!(
-            "dev fee: {:.1}%",
-            crate::dev_fee::DEV_FEE_PERCENT
-        ),
+        format!("dev fee: {:.1}%", crate::dev_fee::DEV_FEE_PERCENT),
     );
     let recent_template_retention = recent_template_retention_for_backends(cfg, backends);
     let recent_template_cache_size = recent_template_cache_size_for_backends(cfg, backends);
@@ -1821,7 +1826,9 @@ fn process_submit_results(
                     Some(&result.solution),
                 );
             }
-            SubmitOutcome::StaleHeightError { .. } | SubmitOutcome::TerminalError(_) => {
+            SubmitOutcome::StaleHeightError { .. }
+            | SubmitOutcome::StaleTipError { .. }
+            | SubmitOutcome::TerminalError(_) => {
                 remember_submitted_solution(
                     submitted_solution_order,
                     submitted_solution_keys,
@@ -2118,6 +2125,7 @@ mod tests {
         let request = SubmitRequest {
             template: SubmitTemplate::Compact {
                 template_id: "tmpl-unauth".to_string(),
+                template_height: Some(1),
             },
             solution: MiningSolution {
                 epoch: 1,
@@ -2145,6 +2153,11 @@ mod tests {
             }
             SubmitOutcome::RetryableError(message) => {
                 panic!("expected terminal submit failure, got retryable error: {message}");
+            }
+            SubmitOutcome::StaleTipError { message, reason } => {
+                panic!(
+                    "expected terminal submit failure, got stale-tip error ({reason}): {message}"
+                );
             }
             SubmitOutcome::Response(_) => panic!("unauthorized submit should fail"),
         }
@@ -2573,6 +2586,7 @@ mod tests {
                 backend_id: 1,
                 backend: "cpu",
             },
+            template_height: Some(7),
             outcome: SubmitOutcome::Response(crate::types::SubmitBlockResponse {
                 accepted: true,
                 hash: None,
@@ -2682,6 +2696,7 @@ mod tests {
             1,
             SubmitTemplate::Compact {
                 template_id: "x".repeat(80),
+                template_height: Some(1),
             },
             Duration::from_secs(60),
             64,
@@ -2693,6 +2708,7 @@ mod tests {
             2,
             SubmitTemplate::Compact {
                 template_id: "y".repeat(80),
+                template_height: Some(2),
             },
             Duration::from_secs(60),
             64,

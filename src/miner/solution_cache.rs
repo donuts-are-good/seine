@@ -211,8 +211,8 @@ pub(super) fn remember_recent_template(
 
 fn submit_template_estimated_bytes(template: &SubmitTemplate) -> usize {
     match template {
-        SubmitTemplate::Compact { template_id } => template_id.len().saturating_add(32),
-        SubmitTemplate::FullBlock { block } => estimate_template_block_bytes(block.as_ref()),
+        SubmitTemplate::Compact { template_id, .. } => template_id.len().saturating_add(32),
+        SubmitTemplate::FullBlock { block, .. } => estimate_template_block_bytes(block.as_ref()),
     }
 }
 
