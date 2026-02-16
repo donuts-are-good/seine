@@ -12,7 +12,7 @@ use super::hashrate_tracker::HashrateTracker;
 use super::stats::{format_hashrate, Stats};
 use super::tui::{DeviceHashrate, TuiRenderer, TuiState};
 use super::ui::{set_tui_state, warn};
-use super::{backend_names_by_id, BackendSlot};
+use super::{backend_display_names, BackendSlot};
 
 const TUI_RENDER_INTERVAL: Duration = Duration::from_secs(1);
 const TUI_QUIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -94,13 +94,13 @@ impl TuiDisplay {
         let rates = self.hashrate_tracker.rates();
 
         // Build per-device hashrate display data
-        let names = backend_names_by_id(view.backends);
+        let display_names = backend_display_names(view.backends);
         let mut device_hashrates = Vec::new();
         for (&id, &current_rate) in &rates.current_per_device {
             let avg_rate = rates.average_per_device.get(&id).copied().unwrap_or(0.0);
-            let name = names
+            let name = display_names
                 .get(&id)
-                .map(|n| format!("{n}#{id}"))
+                .cloned()
                 .unwrap_or_else(|| format!("?#{id}"));
             device_hashrates.push(DeviceHashrate {
                 name,
@@ -208,6 +208,14 @@ pub(super) fn render_tui_now(tui: &mut Option<TuiDisplay>) {
 pub(super) fn set_tui_state_label(tui: &mut Option<TuiDisplay>, state_label: &str) {
     if let Some(display) = tui.as_mut() {
         display.set_state_and_render(state_label);
+    }
+}
+
+pub(super) fn set_tui_pending_nvidia(tui: &mut Option<TuiDisplay>, count: u64) {
+    if let Some(display) = tui.as_mut() {
+        if let Ok(mut s) = display.state.lock() {
+            s.pending_nvidia = count;
+        }
     }
 }
 

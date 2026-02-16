@@ -18,7 +18,8 @@ use crate::types::{
 
 use super::hash_poll::build_backend_poll_state;
 use super::mining_tui::{
-    init_tui_display, render_tui_now, set_tui_state_label, update_tui, RoundUiView, TuiDisplay,
+    init_tui_display, render_tui_now, set_tui_pending_nvidia, set_tui_state_label, update_tui,
+    RoundUiView, TuiDisplay,
 };
 use super::round_control::{redistribute_for_topology_change, TopologyRedistributionOptions};
 use super::runtime::{
@@ -868,12 +869,17 @@ pub(super) fn run_mining_loop(
     runtime_backends: MiningRuntimeBackends<'_>,
     tui_state: Option<TuiState>,
     tip_signal: Option<&TipSignal>,
+    deferred_backends: Option<(Receiver<super::BackendSlot>, u64)>,
 ) -> Result<()> {
     let MiningRuntimeBackends {
         backends,
         backend_events,
         backend_executor,
     } = runtime_backends;
+    let (deferred_rx, mut deferred_remaining) = match deferred_backends {
+        Some((rx, count)) => (Some(rx), count),
+        None => (None, 0),
+    };
     let stats = Stats::new();
     let mut nonce_scheduler = NonceScheduler::new(cfg.start_nonce, cfg.nonce_iters_per_lane);
     let mut work_id_cursor = 1u64;
@@ -920,6 +926,47 @@ pub(super) fn run_mining_loop(
     while !shutdown.load(Ordering::Relaxed) {
         if backends.is_empty() {
             bail!("all mining backends are unavailable");
+        }
+
+        // Hot-add deferred backends (e.g. NVIDIA that compiled in the background).
+        if let Some(ref deferred) = deferred_rx {
+            loop {
+                match deferred.try_recv() {
+                    Ok(slot) => {
+                        deferred_remaining = deferred_remaining.saturating_sub(1);
+                        let slot_name = format!("{}#{}", slot.backend.name(), slot.id);
+                        let slot_lanes = slot.lanes;
+                        if !cfg.allow_best_effort_deadlines
+                            && slot.capabilities.deadline_support
+                                == crate::backend::DeadlineSupport::BestEffort
+                        {
+                            warn(
+                                "BACKEND",
+                                format!(
+                                    "{slot_name}: compiled in background but skipped (best-effort deadlines disabled)"
+                                ),
+                            );
+                            slot.backend.stop();
+                            continue;
+                        }
+                        info(
+                            "BACKEND",
+                            format!(
+                                "{slot_name}: online (compiled in background, {slot_lanes} lanes)"
+                            ),
+                        );
+                        backend_weights.insert(slot.id, slot.lanes.max(1) as f64);
+                        backends.push(slot);
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        // All sender threads finished (succeeded or failed).
+                        deferred_remaining = 0;
+                        break;
+                    }
+                }
+            }
+            set_tui_pending_nvidia(&mut tui, deferred_remaining);
         }
 
         let mode_changed = dev_fee_tracker.begin_round();

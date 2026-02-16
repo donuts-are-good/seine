@@ -98,6 +98,7 @@ pub struct TuiStateInner {
     pub submitted: u64,
     pub accepted: u64,
     pub device_hashrates: Vec<DeviceHashrate>,
+    pub pending_nvidia: u64,
 
     // Config (set once at startup)
     pub api_url: String,
@@ -133,6 +134,7 @@ impl TuiStateInner {
             submitted: 0,
             accepted: 0,
             device_hashrates: Vec::new(),
+            pending_nvidia: 0,
 
             api_url: String::new(),
             threads: 0,
@@ -244,13 +246,16 @@ fn draw_dashboard(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner)
     let wide = area.width >= 80;
 
     let stats_height: u16 = if wide { 6 } else { 14 };
-    let device_count = state.device_hashrates.len() as u16;
-    let device_rows = if wide {
-        (device_count + 1) / 2 // 2 per row in wide mode
+    let active_device_count = state.device_hashrates.len() as u16;
+    let pending_count = state.pending_nvidia as u16;
+    let active_rows = if wide {
+        (active_device_count + 1) / 2 // 2 per row in wide mode
     } else {
-        device_count
+        active_device_count
     };
-    let devices_height: u16 = if device_count > 0 { 2 + device_rows } else { 0 };
+    // Pending devices are always 1-per-line (not paired in wide mode)
+    let device_rows = active_rows + pending_count;
+    let devices_height: u16 = if device_rows > 0 { 2 + device_rows } else { 0 };
     let config_height: u16 = 4;
     let header_height: u16 = 4;
 
@@ -267,7 +272,7 @@ fn draw_dashboard(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner)
 
     draw_header(frame, chunks[0], state);
     draw_stats(frame, chunks[1], state, wide);
-    if device_count > 0 {
+    if device_rows > 0 {
         draw_devices(frame, chunks[2], state, wide);
     }
     draw_config(frame, chunks[3], state);
@@ -502,7 +507,7 @@ fn draw_stats_narrow(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInn
 }
 
 fn draw_devices(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner, wide: bool) {
-    let lines: Vec<Line<'static>> = if wide {
+    let mut lines: Vec<Line<'static>> = if wide {
         // Wide: lay out devices side by side, 2 per row
         state
             .device_hashrates
@@ -534,6 +539,24 @@ fn draw_devices(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner, w
             .map(|dev| device_line(&dev.name, &dev.current, &dev.average))
             .collect()
     };
+
+    // Show pending NVIDIA backends that are still compiling
+    if state.pending_nvidia > 0 {
+        let online_nvidia = state
+            .device_hashrates
+            .iter()
+            .filter(|d| d.name.starts_with("nvidia#"))
+            .count() as u64;
+        for i in 0..state.pending_nvidia {
+            let name = format!("nvidia#{}", online_nvidia + i + 1);
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled("▸ ", Style::default().fg(Color::Rgb(70, 100, 130))),
+                Span::styled(format!("{:<10}", name), DEVICE_NAME_STYLE),
+                Span::styled("compiling CUDA kernel...", DIM_STYLE),
+            ]));
+        }
+    }
 
     let block = Block::default()
         .title(Span::styled(" DEVICES ", TITLE_STYLE))
