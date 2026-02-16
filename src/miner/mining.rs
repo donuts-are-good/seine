@@ -11,6 +11,7 @@ use crossbeam_channel::Receiver;
 use crate::api::ApiClient;
 use crate::backend::{BackendEvent, MiningSolution};
 use crate::config::{Config, WorkAllocation};
+use crate::dev_fee::DevFeeTracker;
 use crate::types::{
     decode_hex, parse_target, template_difficulty, template_height, BlockTemplateResponse,
 };
@@ -114,6 +115,7 @@ struct MiningControlPlane<'a> {
     pending_submit_results: Vec<SubmitResult>,
     submit_backlog_high_watermark_logged: bool,
     submit_backlog_last_saturation_log: Option<Instant>,
+    dev_fee_address: Option<&'static str>,
 }
 
 struct RoundLoopState {
@@ -161,6 +163,7 @@ impl<'a> MiningControlPlane<'a> {
             submit_backlog_last_saturation_log: None,
             shutdown,
             tip_signal,
+            dev_fee_address: None,
         }
     }
 
@@ -321,7 +324,7 @@ impl<'a> MiningControlPlane<'a> {
 
     fn spawn_prefetch_if_needed(&mut self) {
         if let Some(prefetch) = self.prefetch.as_mut() {
-            prefetch.request_if_idle(current_tip_sequence(self.tip_signal));
+            prefetch.request_if_idle(current_tip_sequence(self.tip_signal), self.dev_fee_address);
         }
     }
 
@@ -336,7 +339,12 @@ impl<'a> MiningControlPlane<'a> {
             &self.shutdown,
             self.tip_signal,
             tui,
+            self.dev_fee_address,
         )
+    }
+
+    fn set_dev_fee_address(&mut self, address: Option<&'static str>) {
+        self.dev_fee_address = address;
     }
 
     fn submit_template(
@@ -865,6 +873,14 @@ pub(super) fn run_mining_loop(
     let mut tui = init_tui_display(tui_state, Arc::clone(&shutdown));
     let mut backend_weights = seed_backend_weights(backends);
     let mut control_plane = MiningControlPlane::new(client, cfg, Arc::clone(&shutdown), tip_signal);
+    let mut dev_fee_tracker = DevFeeTracker::new();
+    info(
+        "MINER",
+        format!(
+            "dev fee: {:.1}%",
+            crate::dev_fee::DEV_FEE_PERCENT
+        ),
+    );
     let recent_template_retention = recent_template_retention_for_backends(cfg, backends);
     let recent_template_cache_size = recent_template_cache_size_for_backends(cfg, backends);
     let recent_template_cache_max_bytes = recent_template_cache_max_bytes();
@@ -898,6 +914,21 @@ pub(super) fn run_mining_loop(
     while !shutdown.load(Ordering::Relaxed) {
         if backends.is_empty() {
             bail!("all mining backends are unavailable");
+        }
+
+        let mode_changed = dev_fee_tracker.begin_round();
+        control_plane.set_dev_fee_address(dev_fee_tracker.address());
+        if mode_changed {
+            if dev_fee_tracker.is_dev_round() {
+                info("DEV FEE", "mining for dev");
+            } else {
+                info("DEV FEE", "mining for user");
+            }
+            // Discard any prefetched template (fetched with wrong address) and get fresh one
+            let Some(fresh) = control_plane.resolve_next_template(&mut tui) else {
+                break;
+            };
+            template = fresh;
         }
 
         process_submit_results(
@@ -980,6 +1011,8 @@ pub(super) fn run_mining_loop(
             submitted_solution_keys: &mut submitted_solution_keys,
             inflight_solution_keys: &mut inflight_solution_keys,
         })?;
+
+        dev_fee_tracker.end_round(round_start.elapsed());
 
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -1541,6 +1574,7 @@ fn resolve_next_template(
     shutdown: &Arc<AtomicBool>,
     tip_signal: Option<&TipSignal>,
     tui: &mut Option<TuiDisplay>,
+    address: Option<&str>,
 ) -> Option<BlockTemplateResponse> {
     if shutdown.load(Ordering::Relaxed) {
         if let Some(task) = prefetch.take() {
@@ -1573,7 +1607,7 @@ fn resolve_next_template(
         let wait = cfg.prefetch_wait.max(Duration::from_millis(1));
         let (prefetch_result, prefetch_closed) = {
             let task = prefetch.as_mut()?;
-            task.request_if_idle(latest_tip_sequence);
+            task.request_if_idle(latest_tip_sequence, address);
             let result = task.wait_for_result(wait);
             let closed = task.is_closed();
             (result, closed)
@@ -1582,7 +1616,7 @@ fn resolve_next_template(
             let latest_after_wait = current_tip_sequence(tip_signal);
             if tip_sequence < latest_after_wait {
                 if let Some(task) = prefetch.as_mut() {
-                    task.request_if_idle(latest_after_wait);
+                    task.request_if_idle(latest_after_wait, address);
                 }
                 continue;
             }
@@ -1598,7 +1632,7 @@ fn resolve_next_template(
                 continue;
             }
             render_tui_now(tui);
-            fetch_template_once(client, cfg, shutdown.as_ref())
+            fetch_template_once(client, cfg, shutdown.as_ref(), address)
         };
 
         match outcome {

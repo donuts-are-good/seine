@@ -19,11 +19,13 @@ pub(super) struct TemplatePrefetch {
     done_rx: Receiver<()>,
     inflight_tip_sequence: Option<u64>,
     desired_tip_sequence: Option<u64>,
+    desired_address: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PrefetchRequest {
     tip_sequence: u64,
+    address: Option<String>,
 }
 
 #[derive(Debug)]
@@ -54,10 +56,17 @@ impl TemplatePrefetch {
                     Err(RecvTimeoutError::Disconnected) => break,
                 };
                 while let Ok(next) = request_rx.try_recv() {
-                    request.tip_sequence = request.tip_sequence.max(next.tip_sequence);
+                    if next.tip_sequence >= request.tip_sequence {
+                        request = next;
+                    }
                 }
 
-                let outcome = fetch_template_once(&client, &cfg, shutdown.as_ref());
+                let outcome = fetch_template_once(
+                    &client,
+                    &cfg,
+                    shutdown.as_ref(),
+                    request.address.as_deref(),
+                );
                 if result_tx
                     .send(PrefetchResult {
                         tip_sequence: request.tip_sequence,
@@ -78,6 +87,7 @@ impl TemplatePrefetch {
             done_rx,
             inflight_tip_sequence: None,
             desired_tip_sequence: None,
+            desired_address: None,
         }
     }
 
@@ -88,7 +98,10 @@ impl TemplatePrefetch {
         let Some(tip_sequence) = self.desired_tip_sequence else {
             return false;
         };
-        match request_tx.try_send(PrefetchRequest { tip_sequence }) {
+        match request_tx.try_send(PrefetchRequest {
+            tip_sequence,
+            address: self.desired_address.clone(),
+        }) {
             Ok(()) => {
                 self.inflight_tip_sequence = Some(tip_sequence);
                 true
@@ -107,11 +120,12 @@ impl TemplatePrefetch {
         }
     }
 
-    pub(super) fn request_if_idle(&mut self, tip_sequence: u64) {
+    pub(super) fn request_if_idle(&mut self, tip_sequence: u64, address: Option<&str>) {
         let desired = self
             .desired_tip_sequence
             .map_or(tip_sequence, |current| current.max(tip_sequence));
         self.desired_tip_sequence = Some(desired);
+        self.desired_address = address.map(str::to_string);
         if self.inflight_tip_sequence.is_some() {
             return;
         }
@@ -194,13 +208,14 @@ pub(super) fn fetch_template_once(
     client: &ApiClient,
     cfg: &Config,
     shutdown: &AtomicBool,
+    address: Option<&str>,
 ) -> PrefetchOutcome {
     if shutdown.load(Ordering::Relaxed) {
         return PrefetchOutcome::Unavailable;
     }
 
     let timeout = prefetch_request_timeout(cfg);
-    match client.get_block_template_with_timeout(timeout) {
+    match client.get_block_template_with_timeout(timeout, address) {
         Ok(template) => PrefetchOutcome::Template(Box::new(template)),
         Err(err) if is_no_wallet_loaded_error(&err) => PrefetchOutcome::NoWalletLoaded,
         Err(err) if is_unauthorized_error(&err) => {
@@ -208,7 +223,7 @@ pub(super) fn fetch_template_once(
                 refresh_api_token_from_cookie(client, cfg.token_cookie_path.as_deref()),
                 TokenRefreshOutcome::Refreshed
             ) {
-                match client.get_block_template_with_timeout(timeout) {
+                match client.get_block_template_with_timeout(timeout, address) {
                     Ok(template) => PrefetchOutcome::Template(Box::new(template)),
                     Err(err) if is_no_wallet_loaded_error(&err) => PrefetchOutcome::NoWalletLoaded,
                     Err(err) if is_unauthorized_error(&err) => PrefetchOutcome::Unauthorized,
@@ -237,6 +252,7 @@ mod tests {
             done_rx,
             inflight_tip_sequence: Some(7),
             desired_tip_sequence: Some(7),
+            desired_address: None,
         };
 
         assert!(prefetch.wait_for_result(Duration::from_millis(1)).is_none());
@@ -256,6 +272,7 @@ mod tests {
             done_rx,
             inflight_tip_sequence: Some(7),
             desired_tip_sequence: Some(7),
+            desired_address: None,
         };
 
         assert!(prefetch.wait_for_result(Duration::from_millis(1)).is_none());
@@ -266,7 +283,7 @@ mod tests {
     fn prefetch_full_queue_does_not_overstate_inflight_tip() {
         let (request_tx, _request_rx) = bounded::<PrefetchRequest>(1);
         request_tx
-            .try_send(PrefetchRequest { tip_sequence: 1 })
+            .try_send(PrefetchRequest { tip_sequence: 1, address: None })
             .expect("prefill request channel should succeed");
         let (_result_tx, result_rx) = unbounded::<PrefetchResult>();
         let (_done_tx, done_rx) = bounded::<()>(1);
@@ -277,9 +294,10 @@ mod tests {
             done_rx,
             inflight_tip_sequence: None,
             desired_tip_sequence: None,
+            desired_address: None,
         };
 
-        prefetch.request_if_idle(2);
+        prefetch.request_if_idle(2, None);
         assert_eq!(prefetch.inflight_tip_sequence, None);
     }
 
@@ -287,7 +305,7 @@ mod tests {
     fn prefetch_full_queue_preserves_existing_inflight_marker() {
         let (request_tx, _request_rx) = bounded::<PrefetchRequest>(1);
         request_tx
-            .try_send(PrefetchRequest { tip_sequence: 1 })
+            .try_send(PrefetchRequest { tip_sequence: 1, address: None })
             .expect("prefill request channel should succeed");
         let (_result_tx, result_rx) = unbounded::<PrefetchResult>();
         let (_done_tx, done_rx) = bounded::<()>(1);
@@ -298,9 +316,10 @@ mod tests {
             done_rx,
             inflight_tip_sequence: Some(1),
             desired_tip_sequence: Some(1),
+            desired_address: None,
         };
 
-        prefetch.request_if_idle(2);
+        prefetch.request_if_idle(2, None);
         assert_eq!(prefetch.inflight_tip_sequence, Some(1));
     }
 
@@ -316,6 +335,7 @@ mod tests {
             done_rx,
             inflight_tip_sequence: Some(7),
             desired_tip_sequence: Some(7),
+            desired_address: None,
         };
 
         result_tx

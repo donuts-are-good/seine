@@ -113,8 +113,8 @@ impl ApiClient {
     }
 
     #[allow(dead_code)]
-    pub fn get_block_template(&self) -> Result<BlockTemplateResponse> {
-        let url = format!("{}/api/mining/blocktemplate", self.base_url);
+    pub fn get_block_template(&self, address: Option<&str>) -> Result<BlockTemplateResponse> {
+        let url = blocktemplate_url(&self.base_url, address);
         let resp = self
             .with_auth(self.json_client.get(url))?
             .send()
@@ -126,9 +126,10 @@ impl ApiClient {
     pub fn get_block_template_with_timeout(
         &self,
         timeout: Duration,
+        address: Option<&str>,
     ) -> Result<BlockTemplateResponse> {
         let timeout = timeout.max(Duration::from_millis(1));
-        let url = format!("{}/api/mining/blocktemplate", self.base_url);
+        let url = blocktemplate_url(&self.base_url, address);
         let resp = self
             .with_auth(self.json_client.get(url).timeout(timeout))?
             .send()
@@ -191,6 +192,13 @@ impl ApiClient {
             .map_err(|_| anyhow!("API token lock poisoned"))?
             .clone();
         Ok(request.bearer_auth(token))
+    }
+}
+
+fn blocktemplate_url(base_url: &str, address: Option<&str>) -> String {
+    match address {
+        Some(addr) => format!("{base_url}/api/mining/blocktemplate?address={addr}"),
+        None => format!("{base_url}/api/mining/blocktemplate"),
     }
 }
 
@@ -310,7 +318,7 @@ mod tests {
 
         let client = test_client(&server);
         let resp = client
-            .get_block_template()
+            .get_block_template(None)
             .expect("block template request should succeed");
         assert_eq!(resp.target.len(), 64);
         assert_eq!(resp.header_base.len(), 184);
@@ -373,7 +381,7 @@ mod tests {
 
         let client = test_client(&server);
         let err = client
-            .get_block_template()
+            .get_block_template(None)
             .expect_err("blocktemplate request should fail");
         assert!(is_no_wallet_loaded_error(&err));
         mock.assert();

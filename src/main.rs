@@ -1,6 +1,7 @@
 mod api;
 mod backend;
 mod config;
+mod dev_fee;
 mod miner;
 mod types;
 
