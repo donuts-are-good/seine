@@ -2,7 +2,7 @@
 
 External miner for Blocknet with pluggable CPU and NVIDIA GPU backends.
 
-![seine TUI](1.png)
+![seine TUI](screenshot.png)
 
 ## Quick Start
 
