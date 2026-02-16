@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use blocknet_pow_spec::CPU_LANE_MEMORY_BYTES;
@@ -930,10 +930,9 @@ fn normalize_api_url(input: &str) -> String {
 }
 
 fn default_nonce_seed() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+    let mut buf = [0u8; 8];
+    getrandom::getrandom(&mut buf).expect("OS randomness should be available");
+    u64::from_le_bytes(buf)
 }
 
 fn dedupe_device_indexes(device_indexes: &[u32]) -> Vec<u32> {
