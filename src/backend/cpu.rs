@@ -610,23 +610,8 @@ impl BenchBackend for CpuBackend {
                     }
                     let hasher = fixed_argon::FixedArgon2id::new(POW_MEMORY_KB);
                     let block_count = hasher.block_count();
-                    let mut _arena_guard: Option<kernel::MmapArena> = None;
-                    let mut _vec_fallback: Option<Vec<fixed_argon::PowBlock>> = None;
-                    let memory_blocks: &mut [fixed_argon::PowBlock];
-                    #[cfg(target_os = "linux")]
-                    {
-                        let block_bytes =
-                            block_count * std::mem::size_of::<fixed_argon::PowBlock>();
-                        let arena = kernel::MmapArena::new(block_count, block_bytes);
-                        _arena_guard = Some(arena);
-                        memory_blocks = _arena_guard.as_mut().unwrap().as_mut_slice();
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        _vec_fallback =
-                            Some(vec![fixed_argon::PowBlock::default(); block_count]);
-                        memory_blocks = _vec_fallback.as_mut().unwrap().as_mut_slice();
-                    }
+                    let mut arena = kernel::PowArena::new(block_count);
+                    let memory_blocks = arena.as_mut_slice();
 
                     let mut header_base = [0u8; blocknet_pow_spec::POW_HEADER_BASE_LEN];
                     for (i, byte) in header_base.iter_mut().enumerate() {

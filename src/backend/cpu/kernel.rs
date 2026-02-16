@@ -26,45 +26,12 @@ pub(super) fn cpu_worker_loop(
 
     let hasher = fixed_argon::FixedArgon2id::new(POW_MEMORY_KB);
     let block_count = hasher.block_count();
+    let block_bytes = block_count * std::mem::size_of::<fixed_argon::PowBlock>();
 
-    // Allocate the 2 GiB arena with explicit huge pages (2 MB) to avoid
-    // the catastrophic TLB miss overhead of 524 K × 4 KB pages.
-    //
-    // Strategy:
-    //   1. Try mmap MAP_HUGETLB — guaranteed 2 MB pages from the hugetlbfs
-    //      pool (requires /proc/sys/vm/nr_hugepages >= arena_size/2MB).
-    //   2. Fall back to regular mmap + MADV_HUGEPAGE (THP).
-    //   3. Fall back to Vec (non-Linux, or mmap failure).
-    //
-    // MAP_POPULATE pre-faults all pages so the hash loop never page-faults.
-    let mut _arena_guard: Option<MmapArena> = None;
-    let mut _vec_fallback: Option<Vec<fixed_argon::PowBlock>> = None;
-    let memory_blocks: &mut [fixed_argon::PowBlock];
-
+    let mut arena = PowArena::new(block_count);
     #[cfg(target_os = "linux")]
-    {
-        let block_bytes = block_count * std::mem::size_of::<fixed_argon::PowBlock>();
-        let arena = MmapArena::new(block_count, block_bytes);
-        if !arena.is_huge() && thread_idx == 0 {
-            let pages_needed = (block_bytes + (2 << 20) - 1) / (2 << 20);
-            emit_warning(
-                &shared,
-                format!(
-                    "MAP_HUGETLB unavailable — falling back to regular pages (~20% slower). \
-                     Fix: sudo sysctl -w vm.nr_hugepages={} (per worker thread)",
-                    pages_needed,
-                ),
-            );
-        }
-        _arena_guard = Some(arena);
-        memory_blocks = _arena_guard.as_mut().unwrap().as_mut_slice();
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let mut v: Vec<fixed_argon::PowBlock> = vec![fixed_argon::PowBlock::default(); block_count];
-        _vec_fallback = Some(v);
-        memory_blocks = _vec_fallback.as_mut().unwrap().as_mut_slice();
-    }
+    emit_linux_hugepage_diagnostics(&shared, thread_idx, &arena, block_bytes);
+    let memory_blocks = arena.as_mut_slice();
 
     let mut output = [0u8; POW_OUTPUT_LEN];
     mark_worker_ready(&shared);
@@ -235,80 +202,242 @@ pub(super) fn cpu_worker_loop(
     mark_worker_inactive(&shared, &mut worker_active);
 }
 
-/// RAII wrapper around a `mmap`-backed arena.  Tries MAP_HUGETLB (explicit
-/// 2 MB pages from the hugetlbfs pool) first, then falls back to regular
-/// anonymous mmap with MADV_HUGEPAGE (THP).  MAP_POPULATE pre-faults all
-/// pages so the hash loop never takes a soft fault.
+const HUGEPAGE_BYTES: usize = 2 * 1024 * 1024;
 #[cfg(target_os = "linux")]
+const MADV_COLLAPSE: libc::c_int = 25;
+
+/// Arena used by CPU hashing workers.
+///
+/// On Unix we prefer an mmap-backed arena to avoid eagerly touching every page
+/// in user space. Linux further tries explicit hugetlb pages first.
+pub(super) enum PowArena {
+    #[cfg(unix)]
+    Mmap(MmapArena),
+    Heap(Vec<fixed_argon::PowBlock>),
+}
+
+impl PowArena {
+    pub(super) fn new(block_count: usize) -> Self {
+        let byte_len = block_count.saturating_mul(std::mem::size_of::<fixed_argon::PowBlock>());
+        #[cfg(unix)]
+        if let Some(arena) = MmapArena::new(block_count, byte_len) {
+            return Self::Mmap(arena);
+        }
+        Self::Heap(vec![fixed_argon::PowBlock::default(); block_count])
+    }
+
+    pub(super) fn as_mut_slice(&mut self) -> &mut [fixed_argon::PowBlock] {
+        match self {
+            #[cfg(unix)]
+            Self::Mmap(arena) => arena.as_mut_slice(),
+            Self::Heap(blocks) => blocks.as_mut_slice(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn mmap_ref(&self) -> Option<&MmapArena> {
+        match self {
+            Self::Mmap(arena) => Some(arena),
+            Self::Heap(_) => None,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn emit_linux_hugepage_diagnostics(
+    shared: &Shared,
+    thread_idx: usize,
+    arena: &PowArena,
+    block_bytes: usize,
+) {
+    if thread_idx != 0 {
+        return;
+    }
+
+    let pages_needed = (block_bytes + HUGEPAGE_BYTES - 1) / HUGEPAGE_BYTES;
+    let total_kib = ((block_bytes as u64) + 1023) / 1024;
+
+    let Some(mmap_arena) = arena.mmap_ref() else {
+        emit_warning(
+            shared,
+            format!(
+                "mmap allocation unavailable — falling back to heap pages (significant TLB pressure likely, per-worker hugepages needed: {pages_needed})"
+            ),
+        );
+        return;
+    };
+
+    if mmap_arena.is_explicit_huge() {
+        return;
+    }
+
+    let huge_kib = mmap_arena.anon_huge_kib().unwrap_or(0);
+    if huge_kib >= total_kib {
+        return;
+    }
+
+    let pct = if total_kib == 0 {
+        0.0
+    } else {
+        (huge_kib as f64 * 100.0) / total_kib as f64
+    };
+    emit_warning(
+        shared,
+        format!(
+            "MAP_HUGETLB unavailable; hugepage coverage after MADV_HUGEPAGE+MADV_COLLAPSE is {:.1}% ({} / {} MiB). \
+             Throughput may be lower. Fix: reserve hugetlb pages (e.g. sudo sysctl -w vm.nr_hugepages={} per worker) or reduce worker count.",
+            pct,
+            huge_kib / 1024,
+            total_kib / 1024,
+            pages_needed,
+        ),
+    );
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MmapBacking {
+    #[cfg(target_os = "linux")]
+    ExplicitHugeTLB,
+    #[cfg(target_os = "linux")]
+    TransparentHuge,
+    #[cfg(not(target_os = "linux"))]
+    Regular,
+}
+
+/// RAII wrapper around an mmap-backed arena.
+#[cfg(unix)]
 pub(super) struct MmapArena {
     ptr: *mut u8,
     byte_len: usize,
     block_count: usize,
-    _huge: bool,
+    backing: MmapBacking,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl MmapArena {
-    pub(super) fn new(block_count: usize, byte_len: usize) -> Self {
-        // Attempt 1: MAP_HUGETLB for guaranteed 2 MB pages.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                byte_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB | libc::MAP_POPULATE,
-                -1,
-                0,
-            )
-        };
-        if ptr != libc::MAP_FAILED {
-            return Self {
+    pub(super) fn new(block_count: usize, byte_len: usize) -> Option<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            // Attempt 1: MAP_HUGETLB for guaranteed 2 MB pages.
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    byte_len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_HUGETLB | libc::MAP_POPULATE,
+                    -1,
+                    0,
+                )
+            };
+            if ptr != libc::MAP_FAILED {
+                return Some(Self {
+                    ptr: ptr as *mut u8,
+                    byte_len,
+                    block_count,
+                    backing: MmapBacking::ExplicitHugeTLB,
+                });
+            }
+
+            // Attempt 2: regular mmap + THP hints.
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    byte_len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_POPULATE,
+                    -1,
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                return None;
+            }
+            unsafe {
+                let _ = libc::madvise(ptr, byte_len, libc::MADV_HUGEPAGE);
+                let _ = libc::madvise(ptr, byte_len, MADV_COLLAPSE);
+            }
+            return Some(Self {
                 ptr: ptr as *mut u8,
                 byte_len,
                 block_count,
-                _huge: true,
-            };
+                backing: MmapBacking::TransparentHuge,
+            });
         }
 
-        // Attempt 2: regular anonymous mmap + MADV_HUGEPAGE (THP).
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
+        #[cfg(not(target_os = "linux"))]
+        {
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    byte_len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                return None;
+            }
+            Some(Self {
+                ptr: ptr as *mut u8,
                 byte_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE,
-                -1,
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            panic!(
-                "mmap failed for {} byte arena: {}",
-                byte_len,
-                std::io::Error::last_os_error()
-            );
-        }
-        unsafe {
-            libc::madvise(ptr, byte_len, libc::MADV_HUGEPAGE);
-        }
-        Self {
-            ptr: ptr as *mut u8,
-            byte_len,
-            block_count,
-            _huge: false,
+                block_count,
+                backing: MmapBacking::Regular,
+            })
         }
     }
 
     pub(super) fn as_mut_slice(&mut self) -> &mut [fixed_argon::PowBlock] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut fixed_argon::PowBlock, self.block_count) }
+        unsafe {
+            std::slice::from_raw_parts_mut(self.ptr as *mut fixed_argon::PowBlock, self.block_count)
+        }
     }
 
-    pub(super) fn is_huge(&self) -> bool {
-        self._huge
+    #[cfg(target_os = "linux")]
+    fn is_explicit_huge(&self) -> bool {
+        matches!(self.backing, MmapBacking::ExplicitHugeTLB)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn anon_huge_kib(&self) -> Option<u64> {
+        read_smaps_anon_huge_kib(self.ptr as usize)
     }
 }
 
 #[cfg(target_os = "linux")]
+fn read_smaps_anon_huge_kib(addr: usize) -> Option<u64> {
+    let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
+    let mut in_target_mapping = false;
+    for line in smaps.lines() {
+        if let Some((start, end)) = parse_smaps_region_header(line) {
+            in_target_mapping = addr >= start && addr < end;
+            continue;
+        }
+        if in_target_mapping {
+            if let Some(rest) = line.strip_prefix("AnonHugePages:") {
+                return rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_smaps_region_header(line: &str) -> Option<(usize, usize)> {
+    let range = line.split_whitespace().next()?;
+    let (start, end) = range.split_once('-')?;
+    Some((
+        usize::from_str_radix(start, 16).ok()?,
+        usize::from_str_radix(end, 16).ok()?,
+    ))
+}
+
+#[cfg(unix)]
 impl Drop for MmapArena {
     fn drop(&mut self) {
         unsafe {
@@ -317,9 +446,8 @@ impl Drop for MmapArena {
     }
 }
 
-// Safety: The mmap region is private to the thread that created it.
-// The arena is only accessed by a single worker thread.
-#[cfg(target_os = "linux")]
+// Safety: mmap-backed arenas are thread-confined in this backend.
+#[cfg(unix)]
 unsafe impl Send for MmapArena {}
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 unsafe impl Sync for MmapArena {}

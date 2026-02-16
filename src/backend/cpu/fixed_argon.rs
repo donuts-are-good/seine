@@ -114,16 +114,23 @@ impl FixedArgon2id {
         initialize_lane_blocks(memory_blocks, initial_hash)?;
 
         match self.isa {
-            ISA_AVX512 => self.fill_blocks::<ISA_AVX512>(memory_blocks),
-            ISA_AVX2 => self.fill_blocks::<ISA_AVX2>(memory_blocks),
-            ISA_NEON => self.fill_blocks::<ISA_NEON>(memory_blocks),
-            _ => self.fill_blocks::<ISA_SCALAR>(memory_blocks),
+            ISA_AVX512 => self.fill_blocks::<ISA_AVX512, true, false>(memory_blocks),
+            ISA_AVX2 => self.fill_blocks::<ISA_AVX2, true, false>(memory_blocks),
+            ISA_NEON => self.fill_blocks::<ISA_NEON, false, true>(memory_blocks),
+            _ => self.fill_blocks::<ISA_SCALAR, false, false>(memory_blocks),
         }
 
         finalize(memory_blocks, out)
     }
 
-    fn fill_blocks<const ISA: u8>(&self, memory_blocks: &mut [PowBlock]) {
+    fn fill_blocks<
+        const ISA: u8,
+        const USE_X86_MID_PREFETCH: bool,
+        const USE_AARCH64_MID_PREFETCH: bool,
+    >(
+        &self,
+        memory_blocks: &mut [PowBlock],
+    ) {
         debug_assert_eq!(ARGON2_LANES, 1);
         debug_assert_eq!(memory_blocks.len(), self.block_count);
         for slice in 0..SYNC_POINTS {
@@ -162,39 +169,37 @@ impl FixedArgon2id {
                     let ref_index = reference_index(reference_area_size, rand);
                     debug_assert!(ref_index < self.block_count);
 
-                    // Mid-compress prefetch: fire the prefetch for the NEXT
-                    // ref block INSIDE the compress function, after column
-                    // round 0 writes dst[0] to its final value.  Remaining
-                    // column rounds overlap with the DRAM fetch.
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        if ISA == ISA_NEON && block + 1 < self.segment_length {
+                    if block + 1 < self.segment_length {
+                        // Mid-compress prefetch: fire the prefetch for the NEXT
+                        // ref block INSIDE the compress function, after column
+                        // round 0 writes dst[0] to its final value. Remaining
+                        // column rounds overlap with the DRAM fetch.
+                        #[cfg(target_arch = "aarch64")]
+                        if USE_AARCH64_MID_PREFETCH {
                             let next_ref_area = slice_prefix + block + 1;
                             fill_block_from_refs_mid_prefetch(
                                 memory_blocks, prev_index, ref_index, cur_index,
                                 next_ref_area,
                             );
-                        } else {
-                            fill_block_from_refs::<ISA>(memory_blocks, prev_index, ref_index, cur_index);
+                            prev_index = cur_index;
+                            cur_index += 1;
+                            continue;
                         }
-                    }
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        if (ISA == ISA_AVX2 || ISA == ISA_AVX512) && block + 1 < self.segment_length {
+
+                        #[cfg(target_arch = "x86_64")]
+                        if USE_X86_MID_PREFETCH {
                             let next_ref_area = slice_prefix + block + 1;
                             fill_block_from_refs_mid_prefetch::<ISA>(
                                 memory_blocks, prev_index, ref_index, cur_index,
                                 next_ref_area,
                             );
-                        } else {
-                            fill_block_from_refs::<ISA>(memory_blocks, prev_index, ref_index, cur_index);
+                            prev_index = cur_index;
+                            cur_index += 1;
+                            continue;
                         }
                     }
-                    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-                    {
-                        fill_block_from_refs::<ISA>(memory_blocks, prev_index, ref_index, cur_index);
-                    }
 
+                    fill_block_from_refs::<ISA>(memory_blocks, prev_index, ref_index, cur_index);
                     prev_index = cur_index;
                     cur_index += 1;
                 }
