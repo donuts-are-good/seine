@@ -919,7 +919,8 @@ fn resolve_token_with_source(cli: &Cli) -> Result<(String, Option<PathBuf>)> {
     let mut candidates: Vec<PathBuf> = vec![cli.data_dir.join("api.cookie")];
 
     // Try to discover the daemon's data directory from a running process.
-    if let Some(daemon_data_dir) = detect_daemon_data_dir() {
+    let daemon_detected = detect_daemon_data_dir();
+    if let Some(ref daemon_data_dir) = daemon_detected {
         let daemon_cookie = daemon_data_dir.join("api.cookie");
         if !candidates.contains(&daemon_cookie) {
             candidates.push(daemon_cookie);
@@ -937,13 +938,24 @@ fn resolve_token_with_source(cli: &Cli) -> Result<(String, Option<PathBuf>)> {
         .map(|p| format!("  - {}", p.display()))
         .collect::<Vec<_>>()
         .join("\n");
+
+    if daemon_detected.is_some() {
+        bail!(
+            "found a running blocknet daemon but could not read its api.cookie\n\n\
+             searched:\n{searched}\n\n\
+             Make sure the daemon was started with the --api flag, e.g.:\n  \
+             blocknet --daemon --api 127.0.0.1:8332"
+        );
+    }
+
     bail!(
-        "could not find api.cookie in any of these locations:\n\
-         {searched}\n\n\
-         Make sure the Blocknet daemon is running, then either:\n  \
-         (a) run seine from the same directory as the daemon, or\n  \
-         (b) pass --cookie /path/to/api.cookie, or\n  \
-         (c) pass --data-dir /path/to/blocknet-data-mainnet"
+        "the blocknet daemon does not appear to be running\n\n\
+         Start it with the API enabled, then run seine:\n  \
+         blocknet --daemon --api 127.0.0.1:8332\n\n\
+         If the daemon is already running, seine could not find its api.cookie.\n\
+         Searched:\n{searched}\n\n\
+         You can point to it manually with:\n  \
+         seine --cookie /path/to/api.cookie"
     );
 }
 
