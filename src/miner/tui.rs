@@ -317,11 +317,16 @@ fn wave_lines(width: usize, tick: u64, block_ticks: &VecDeque<u64>) -> Vec<Line<
     let lower: Vec<char> = "~ ≈ ~ ≈ ~ ~ ≈ ~ ~ ≈ ~ ^ ≈ ~ ≈ ~ ≈ ~ ".chars().collect();
 
     // Block indicators scroll left from right edge on the crest row.
+    // Snap marker columns to visible crest glyphs so markers replace waves
+    // instead of appearing in the inter-glyph spacing.
     let mut block_mask = vec![false; width];
+    let crest_offset = tick as usize % upper.len();
     for &block_tick in block_ticks {
         let age = tick.saturating_sub(block_tick) as usize;
         if age < width {
-            block_mask[width - 1 - age] = true;
+            let raw_col = width - 1 - age;
+            let snapped_col = snap_wave_column_to_glyph(raw_col, width, &upper, crest_offset);
+            block_mask[snapped_col] = true;
         }
     }
 
@@ -336,6 +341,38 @@ fn wave_lines(width: usize, tick: u64, block_ticks: &VecDeque<u64>) -> Vec<Line<
         ),
         wave_row(width, tick as usize, &lower, WAVE_COLOR, None, BLOCK_COLOR),
     ]
+}
+
+fn snap_wave_column_to_glyph(
+    target: usize,
+    width: usize,
+    pattern: &[char],
+    offset: usize,
+) -> usize {
+    if width == 0 || pattern.is_empty() {
+        return 0;
+    }
+    let bounded_target = target.min(width - 1);
+    let is_glyph_col = |idx: usize| pattern[(offset + idx) % pattern.len()] != ' ';
+
+    if is_glyph_col(bounded_target) {
+        return bounded_target;
+    }
+
+    for delta in 1..width {
+        if let Some(left) = bounded_target.checked_sub(delta) {
+            if is_glyph_col(left) {
+                return left;
+            }
+        }
+        if let Some(right) = bounded_target.checked_add(delta) {
+            if right < width && is_glyph_col(right) {
+                return right;
+            }
+        }
+    }
+
+    bounded_target
 }
 
 fn wave_row(
@@ -727,5 +764,27 @@ mod tests {
         let state = TuiStateInner::new();
         // Just verify it doesn't panic - actual value depends on timing
         let _uptime = state.uptime();
+    }
+
+    #[test]
+    fn block_markers_snap_to_crest_glyphs() {
+        let mut block_ticks = VecDeque::new();
+        let tick = 120u64;
+        let width = 80usize;
+        for age in 0..24u64 {
+            block_ticks.push_back(tick - age);
+        }
+
+        let lines = wave_lines(width, tick, &block_ticks);
+        let crest = lines.first().expect("crest row should exist");
+        let pattern: Vec<char> = "≈ ~ ≈ ~ ≈ ~ ~ ≈ ~ ≈ ^ ≈ ~ ≈ ~ ~ ≈ ".chars().collect();
+        let offset = tick as usize % pattern.len();
+
+        for (idx, span) in crest.spans.iter().enumerate() {
+            if span.content.as_ref() == "◆" {
+                let ch = pattern[(offset + idx) % pattern.len()];
+                assert_ne!(ch, ' ', "marker landed in a spacing column at {idx}");
+            }
+        }
     }
 }
