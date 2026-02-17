@@ -12,6 +12,7 @@ This log tracks CPU backend/hash-kernel tuning attempts and measured outcomes.
 ## Newest-first index
 
 - `Updated summary of cumulative adopted optimizations`
+- `2026-02-17 Apple Silicon long-window confirmations + perflevel affinity cap trial`
 - `2026-02-17 Apple Silicon cache-line alignment + DI L2 prefetch revisit`
 - `First-principles performance analysis (x86_64, Zen 3)`
 - `2026-02-16 x86_64 mid-compress prefetch, TLB analysis, and huge page allocation`
@@ -64,7 +65,7 @@ Cumulative x86_64: from ~1.19 H/s (original) to ~2.34 H/s, **~97% total improvem
 | 28 | Mid-compress prefetch for data-dep slices | +8.1% | +8.0% | Adopted |
 | 35 | Interleaved lo/hi BLAMKA half-rounds | +0.95% | — | Adopted |
 | 37 | 2-column Phase 3+4 interleave | +1.56% | — | Adopted |
-| 38 | AArch64 `PowBlock` 128-byte alignment | ~0% (1T) | +0.44% (12T backend) | Adopted |
+| 38 | AArch64 `PowBlock` 128-byte alignment | ~0% (1T) | +0.44% short, +0.10% long (12T backend) | Adopted |
 
 Cumulative AArch64: from ~1.37 H/s (scalar) to ~2.73 H/s, **~99% total improvement**.
 
@@ -148,6 +149,45 @@ Closing the gap requires hardware changes:
 1. **Wider OOO window** — Zen 5 (448-entry ROB) could overlap ~5-6 iterations
 2. **AVX-512** — halves instruction count, better throughput utilization
 3. **Algorithmic changes** — not possible (Argon2id spec is fixed)
+
+## 2026-02-17 Apple Silicon long-window confirmations + perflevel affinity cap trial
+
+Host: Apple M4 Max, 16 cores (12P + 4E), 48 GB unified memory.
+
+### Attempt 38 follow-up (Apple): long-window thermal-stable confirmation (kept)
+
+- **Goal**: Re-check the kept 128-byte `PowBlock` alignment change under longer,
+  thermal-stable windows before treating short-run gains as real.
+- **Long interleaved A/B results**:
+  - Single-thread (`60s`, `pairs=4`):
+    - `data/bench_cpu_ab_aarch64_align128_long_t1/summary.txt`
+    - Baseline `2.956368 H/s` vs candidate `2.948562 H/s` (**-0.2640%**)
+  - 12-thread (`60s`, `pairs=3`):
+    - `data/bench_cpu_ab_aarch64_align128_long_t12/summary.txt`
+    - Baseline `27.248794 H/s` vs candidate `27.275803 H/s` (**+0.0991%**)
+- **Conclusion**: short-window +0.44% at 12T compresses to a smaller but still
+  positive long-window gain on 12T; 1T remains near-noise/slightly negative.
+- **Status**: kept (already integrated in commit `806b294`).
+
+### Attempt 40 (Apple): macOS perflevel0 affinity cap for `--cpu-affinity auto` (not adopted)
+
+- **Hypothesis**: On Apple Silicon, cap auto-affinity core IDs to
+  `hw.perflevel0.logicalcpu` (P-core count) so explicit high thread-count runs
+  do not drift into weaker affinity behavior.
+- **Implementation tested**:
+  - `src/backend/cpu.rs`: added a macOS-only `sysctlbyname("hw.perflevel0.logicalcpu")`
+    lookup and truncated auto-affinity core IDs to that count.
+  - Applied in both backend worker startup and kernel benchmark path.
+- **Interleaved A/B results (vs commit `806b294`)**:
+  - Short 30s windows:
+    - `data/bench_cpu_ab_macos_pcore_affinity_t12/summary.txt`: **+1.1825%**
+    - `data/bench_cpu_ab_macos_pcore_affinity_t16/summary.txt`: **+6.2639%** (contained an outlier baseline leg)
+  - Long 60s confirmation:
+    - `data/bench_cpu_ab_macos_pcore_affinity_t12_long/summary.txt`: **-0.1475%**
+    - `data/bench_cpu_ab_macos_pcore_affinity_t16_long/summary.txt`: **+0.0537%**
+- **Conclusion**: effect is non-repeatable and collapses to noise/neutral in long
+  runs, with slight regression at 12T.
+- **Status**: reverted, not adopted.
 
 ## 2026-02-17 Apple Silicon cache-line alignment + DI L2 prefetch revisit
 
