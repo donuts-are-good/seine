@@ -54,6 +54,8 @@ const NVIDIA_AUTOTUNE_MEMORY_BUCKET_MIB: u64 = 512;
 const DEFAULT_DISPATCH_ITERS_PER_LANE: u64 = 1 << 21;
 const DEFAULT_ALLOCATION_ITERS_PER_LANE: u64 = 1 << 21;
 const DEFAULT_HASHES_PER_LAUNCH_PER_LANE: u32 = 2;
+const DEFAULT_CANCEL_CHECK_BLOCK_INTERVAL: u32 = 64;
+const AMPERE_PLUS_CANCEL_CHECK_BLOCK_INTERVAL: u32 = 128;
 const ADAPTIVE_DEPTH_PRESSURE_CONTROL_BONUS: u32 = 2;
 const ADAPTIVE_DEPTH_PRESSURE_REPLACE_BONUS: u32 = 1;
 const ADAPTIVE_DEPTH_PRESSURE_DECAY_PER_BATCH: u32 = 1;
@@ -63,6 +65,14 @@ const ADAPTIVE_DEPTH_HASH_EMA_ALPHA: f64 = 0.25;
 
 fn default_hashes_per_launch_per_lane() -> u32 {
     DEFAULT_HASHES_PER_LAUNCH_PER_LANE
+}
+
+fn select_cancel_check_block_interval(cc_major: u32) -> u32 {
+    if cc_major >= 8 {
+        AMPERE_PLUS_CANCEL_CHECK_BLOCK_INTERVAL
+    } else {
+        DEFAULT_CANCEL_CHECK_BLOCK_INTERVAL
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -329,6 +339,7 @@ impl CudaArgon2Engine {
         let (cc_major, cc_minor) = ctx
             .compute_capability()
             .map_err(|err| anyhow!("failed to query compute capability: {err:?}"))?;
+        let cc_major_u32 = u32::try_from(cc_major.max(0)).unwrap_or(0);
 
         let params = pow_params()
             .map_err(|err| anyhow!("invalid Argon2 parameters for CUDA backend: {err}"))?;
@@ -344,6 +355,10 @@ impl CudaArgon2Engine {
             "--fmad=true".to_string(),
             format!("-DSEINE_FIXED_M_BLOCKS={}U", m_blocks),
             format!("-DSEINE_FIXED_T_COST={}U", t_cost),
+            format!(
+                "-DSEINE_CANCEL_CHECK_BLOCK_INTERVAL={}U",
+                select_cancel_check_block_interval(cc_major_u32)
+            ),
             format!("--maxrregcount={}", tuning.max_rregcount.max(1)),
             format!("--gpu-architecture=sm_{}{}", cc_major, cc_minor),
         ];

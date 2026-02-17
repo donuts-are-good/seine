@@ -7,7 +7,6 @@ constexpr unsigned int ARGON2_COOP_THREADS = 32U;
 constexpr unsigned int ARGON2_COOP_WARP_MASK = 0xFFFFFFFFU;
 constexpr unsigned int SEED_KERNEL_THREADS = 64U;
 constexpr unsigned int EVAL_KERNEL_THREADS = 64U;
-constexpr unsigned int CANCEL_CHECK_BLOCK_INTERVAL = 64U;
 constexpr unsigned int BLAKE2B_BLOCK_BYTES = 128U;
 constexpr unsigned int BLAKE2B_OUT_BYTES = 64U;
 constexpr unsigned int POW_OUTPUT_BYTES = 32U;
@@ -19,6 +18,10 @@ constexpr unsigned int ARGON2_ALGORITHM_ID = 2U;
 #ifndef SEINE_FIXED_T_COST
 #define SEINE_FIXED_T_COST 0U
 #endif
+#ifndef SEINE_CANCEL_CHECK_BLOCK_INTERVAL
+#define SEINE_CANCEL_CHECK_BLOCK_INTERVAL 64U
+#endif
+constexpr unsigned int CANCEL_CHECK_BLOCK_INTERVAL = SEINE_CANCEL_CHECK_BLOCK_INTERVAL;
 
 __device__ __forceinline__ void coop_sync() {
     __syncwarp(ARGON2_COOP_WARP_MASK);
