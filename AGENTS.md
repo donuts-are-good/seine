@@ -170,3 +170,28 @@ Output goes to `data/bench_cpu_ab_<kind>_<timestamp>/` and includes:
 - `results.tsv` with per-run metrics.
 - `summary.txt` with baseline/candidate means and percent delta.
 - Optional: use `--baseline-profile` / `--candidate-profile` and `--baseline-native` / `--candidate-native` to A/B build profiles or ISA flags in one interleaved run.
+
+### Thermal-stable NVIDIA A/B harness
+
+Run interleaved baseline/candidate NVIDIA benchmarks with cooldown gaps to reduce thermal drift bias:
+
+```bash
+./scripts/bench_nvidia_ab.sh \
+  --baseline-dir ../seine-baseline \
+  --candidate-dir . \
+  --bench-kind backend \
+  --pairs 4 \
+  --bench-secs 20 \
+  --bench-rounds 3 \
+  --bench-warmup-rounds 1 \
+  --cooldown-secs 20 \
+  --nvidia-devices 0 \
+  --nvidia-max-rregcount 208 \
+  --nvidia-hashes-per-launch-per-lane 2 \
+  --profile release
+```
+
+Output goes to `data/bench_nvidia_ab_<kind>_<timestamp>/` and includes:
+- `results.tsv` with per-run benchmark metrics plus GPU start/end snapshots (`temp/sm_clock/mem_clock/power/util`).
+- `summary.txt` with baseline/candidate means, percent delta, and averaged late-hash percentage.
+- Optional: use `--nvidia-fused-target-check`, `--nvidia-no-adaptive-launch-depth`, and trailing `-- <extra miner args>` for controlled A/B sweeps.
