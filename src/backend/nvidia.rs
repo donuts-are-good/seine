@@ -39,9 +39,12 @@ const KERNEL_THREADS: u32 = 32;
 const SEED_KERNEL_THREADS: u32 = 64;
 const EVAL_KERNEL_THREADS: u32 = 64;
 const DEFAULT_NVIDIA_MAX_RREGCOUNT: u32 = 240;
-const NVIDIA_AUTOTUNE_SCHEMA_VERSION: u32 = 7;
+const NVIDIA_AUTOTUNE_SCHEMA_VERSION: u32 = 8;
 const NVIDIA_CUBIN_CACHE_SCHEMA_VERSION: u32 = 1;
-const NVIDIA_AUTOTUNE_REGCAP_CANDIDATES: &[u32] = &[240, 224, 208, 192, 160];
+const NVIDIA_AUTOTUNE_REGCAP_CANDIDATES_AMPERE_PLUS: &[u32] =
+    &[240, 224, 208, 192, 176, 160, 144, 128];
+const NVIDIA_AUTOTUNE_REGCAP_CANDIDATES_LEGACY: &[u32] =
+    &[224, 208, 192, 176, 160, 144, 128, 112, 96];
 const NVIDIA_AUTOTUNE_LOOP_UNROLL_CANDIDATES: &[bool] = &[false];
 const DEFAULT_NVIDIA_AUTOTUNE_SAMPLES: u32 = 2;
 const NVIDIA_MEMORY_RESERVE_MIB_FLOOR: u64 = 64;
@@ -282,7 +285,8 @@ struct FillBatchResult {
 struct CudaArgon2Engine {
     stream: Arc<CudaStream>,
     interrupt_stream: Arc<CudaStream>,
-    kernel: CudaFunction,
+    kernel_nonfused: CudaFunction,
+    kernel_fused_target: CudaFunction,
     seed_kernel: CudaFunction,
     evaluate_kernel: CudaFunction,
     m_blocks: u32,
@@ -371,9 +375,12 @@ impl CudaArgon2Engine {
             }
             Err(err) => return Err(anyhow!("failed to load CUDA module: {err:?}")),
         };
-        let kernel = module
+        let kernel_nonfused = module
             .load_function("argon2id_fill_kernel")
             .map_err(|err| anyhow!("failed to load CUDA kernel function: {err:?}"))?;
+        let kernel_fused_target = module
+            .load_function("argon2id_fill_kernel_fused_target")
+            .map_err(|err| anyhow!("failed to load CUDA fused kernel function: {err:?}"))?;
         let seed_kernel = module
             .load_function("build_seed_blocks_kernel")
             .map_err(|err| anyhow!("failed to load CUDA seed kernel function: {err:?}"))?;
@@ -481,7 +488,8 @@ impl CudaArgon2Engine {
         Ok(Self {
             stream,
             interrupt_stream,
-            kernel,
+            kernel_nonfused,
+            kernel_fused_target,
             seed_kernel,
             evaluate_kernel,
             m_blocks,
@@ -602,7 +610,6 @@ impl CudaArgon2Engine {
                 .map_err(cuda_driver_err)?;
         }
         let use_fused_target_check = target.is_some() && self.fused_target_check;
-        let mut evaluate_target_u32 = 0u32;
         if let Some(target_hash) = target {
             {
                 let mut target_view = self
@@ -624,7 +631,6 @@ impl CudaArgon2Engine {
                         .memcpy_htod(&self.host_found_index, &mut found_view)
                         .map_err(cuda_driver_err)?;
                 }
-                evaluate_target_u32 = 1;
             }
         }
 
@@ -675,22 +681,37 @@ impl CudaArgon2Engine {
                 .lock()
                 .map_err(|_| anyhow!("nvidia cancel flag lock poisoned"))?;
             unsafe {
-                let mut launch = self.stream.launch_builder(&self.kernel);
-                launch
-                    .arg(&self.seed_blocks)
-                    .arg(&lanes_u32)
-                    .arg(&requested_hashes_u32)
-                    .arg(&lane_launch_iters_u32)
-                    .arg(&self.m_blocks)
-                    .arg(&self.t_cost)
-                    .arg(&mut self.lane_memory)
-                    .arg(&mut self.last_blocks)
-                    .arg(&*cancel_flag)
-                    .arg(&mut self.completed_iters)
-                    .arg(&self.target_input)
-                    .arg(&mut self.found_index)
-                    .arg(&evaluate_target_u32);
-                launch.launch(cfg).map_err(cuda_driver_err)?;
+                if use_fused_target_check {
+                    let mut launch = self.stream.launch_builder(&self.kernel_fused_target);
+                    launch
+                        .arg(&self.seed_blocks)
+                        .arg(&lanes_u32)
+                        .arg(&requested_hashes_u32)
+                        .arg(&lane_launch_iters_u32)
+                        .arg(&self.m_blocks)
+                        .arg(&self.t_cost)
+                        .arg(&mut self.lane_memory)
+                        .arg(&mut self.last_blocks)
+                        .arg(&*cancel_flag)
+                        .arg(&mut self.completed_iters)
+                        .arg(&self.target_input)
+                        .arg(&mut self.found_index);
+                    launch.launch(cfg).map_err(cuda_driver_err)?;
+                } else {
+                    let mut launch = self.stream.launch_builder(&self.kernel_nonfused);
+                    launch
+                        .arg(&self.seed_blocks)
+                        .arg(&lanes_u32)
+                        .arg(&requested_hashes_u32)
+                        .arg(&lane_launch_iters_u32)
+                        .arg(&self.m_blocks)
+                        .arg(&self.t_cost)
+                        .arg(&mut self.lane_memory)
+                        .arg(&mut self.last_blocks)
+                        .arg(&*cancel_flag)
+                        .arg(&mut self.completed_iters);
+                    launch.launch(cfg).map_err(cuda_driver_err)?;
+                }
             }
         }
         {
@@ -2759,6 +2780,16 @@ fn build_autotune_hash_depth_candidates(max_hashes_per_launch_per_lane: u32) -> 
     candidates
 }
 
+fn nvidia_autotune_regcap_candidates(compute_cap_major: u32) -> &'static [u32] {
+    if compute_cap_major == 0 {
+        NVIDIA_AUTOTUNE_REGCAP_CANDIDATES_LEGACY
+    } else if compute_cap_major >= 8 {
+        NVIDIA_AUTOTUNE_REGCAP_CANDIDATES_AMPERE_PLUS
+    } else {
+        NVIDIA_AUTOTUNE_REGCAP_CANDIDATES_LEGACY
+    }
+}
+
 fn build_autotune_lane_candidates(
     selected: &NvidiaDeviceInfo,
     forced_max_lanes: Option<usize>,
@@ -2796,6 +2827,8 @@ fn autotune_nvidia_kernel_tuning(
     let mut best: Option<(NvidiaKernelTuning, f64, f64, f64, f64)> = None;
     let cubin_cache_dir = derive_nvidia_cubin_cache_dir(cache_path);
     let sample_count = autotune_samples.max(1);
+    let (compute_cap_major, _) = query_cuda_compute_capability(selected.index).unwrap_or((0, 0));
+    let regcap_candidates = nvidia_autotune_regcap_candidates(compute_cap_major);
     let (m_cost_kib, _) = pow_params()
         .map(|params| (params.m_cost(), params.t_cost()))
         .unwrap_or((0, 0));
@@ -2803,7 +2836,7 @@ fn autotune_nvidia_kernel_tuning(
     let hash_depth_candidates =
         build_autotune_hash_depth_candidates(hashes_per_launch_per_lane.max(1));
 
-    for &max_rregcount in NVIDIA_AUTOTUNE_REGCAP_CANDIDATES {
+    for &max_rregcount in regcap_candidates {
         for &block_loop_unroll in NVIDIA_AUTOTUNE_LOOP_UNROLL_CANDIDATES {
             for hashes_per_launch_per_lane in hash_depth_candidates.iter().copied() {
                 for max_lanes_hint in lane_candidates.iter().copied() {

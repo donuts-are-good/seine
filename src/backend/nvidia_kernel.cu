@@ -232,10 +232,10 @@ __device__ __forceinline__ void blake2b_hash(
     blake2b_final(state, out, out_len);
 }
 
-__device__ __forceinline__ void blake2b_long_1024(
+__device__ __forceinline__ void blake2b_long_1024_words(
     const unsigned char *input,
     unsigned int input_len,
-    unsigned char *out
+    unsigned long long *out_words
 ) {
     unsigned char out_len_le[4];
     store_u32_le(out_len_le, 1024U);
@@ -247,11 +247,11 @@ __device__ __forceinline__ void blake2b_long_1024(
     blake2b_update(state, input, input_len);
     blake2b_final(state, last_output, 64U);
 
-    unsigned int counter = 0U;
-    for (unsigned int i = 0U; i < 32U; ++i) {
-        out[counter + i] = last_output[i];
+    unsigned int out_word_idx = 0U;
+    for (unsigned int i = 0U; i < 4U; ++i) {
+        out_words[out_word_idx++] = load_u64_le(last_output + i * 8U);
     }
-    counter += 32U;
+    unsigned int counter = 32U;
 
     while ((1024U - counter) > 64U) {
         unsigned char next_output[64];
@@ -259,14 +259,17 @@ __device__ __forceinline__ void blake2b_long_1024(
         for (unsigned int i = 0U; i < 64U; ++i) {
             last_output[i] = next_output[i];
         }
-        for (unsigned int i = 0U; i < 32U; ++i) {
-            out[counter + i] = last_output[i];
+        for (unsigned int i = 0U; i < 4U; ++i) {
+            out_words[out_word_idx++] = load_u64_le(last_output + i * 8U);
         }
         counter += 32U;
     }
 
-    const unsigned int tail_len = 1024U - counter;
-    blake2b_hash(last_output, 64U, out + counter, tail_len);
+    unsigned char tail_output[64];
+    blake2b_hash(last_output, 64U, tail_output, 64U);
+    for (unsigned int i = 0U; i < 8U; ++i) {
+        out_words[out_word_idx++] = load_u64_le(tail_output + i * 8U);
+    }
 }
 
 __device__ __forceinline__ void blake2b_long_32_from_block(
@@ -386,16 +389,12 @@ __global__ void build_seed_blocks_kernel(
     seed_input[70] = 0U;
     seed_input[71] = 0U;
 
-    unsigned char seed_bytes[1024];
     for (unsigned int seed_idx = 0U; seed_idx < 2U; ++seed_idx) {
-        store_u32_le(seed_input + 64U, seed_idx);
-        blake2b_long_1024(seed_input, 72U, seed_bytes);
-        unsigned long long *out_words =
+        unsigned long long *seed_out_words =
             seed_blocks + static_cast<unsigned long long>(hash_idx) * 256ULL +
             static_cast<unsigned long long>(seed_idx) * 128ULL;
-        for (unsigned int word = 0U; word < 128U; ++word) {
-            out_words[word] = load_u64_le(seed_bytes + word * 8U);
-        }
+        store_u32_le(seed_input + 64U, seed_idx);
+        blake2b_long_1024_words(seed_input, 72U, seed_out_words);
     }
 }
 
@@ -728,7 +727,7 @@ __global__ void touch_lane_memory_kernel(
     lane_ptr[tail] = tail_v;
 }
 
-__global__ void argon2id_fill_kernel(
+__device__ __forceinline__ void argon2id_fill_kernel_impl(
     const unsigned long long *__restrict__ seed_blocks,
     unsigned int lanes_active,
     unsigned int active_hashes,
@@ -741,7 +740,7 @@ __global__ void argon2id_fill_kernel(
     unsigned int *__restrict__ completed_iters,
     const unsigned char *__restrict__ target,
     unsigned int *__restrict__ found_index_one_based,
-    unsigned int evaluate_target
+    bool fused_target_check
 ) {
     const unsigned int lane = blockIdx.x;
     const unsigned int tid = threadIdx.x;
@@ -946,7 +945,7 @@ __global__ void argon2id_fill_kernel(
             out[i] = last[i];
         }
         coop_sync();
-        if (evaluate_target != 0U && tid == 0U) {
+        if (fused_target_check && tid == 0U) {
             unsigned char hash[POW_OUTPUT_BYTES];
             blake2b_long_32_from_words(last, hash);
             if (hash_meets_target_be(hash, target)) {
@@ -962,6 +961,66 @@ __global__ void argon2id_fill_kernel(
         }
         coop_sync();
     }
+}
+
+__global__ void argon2id_fill_kernel(
+    const unsigned long long *__restrict__ seed_blocks,
+    unsigned int lanes_active,
+    unsigned int active_hashes,
+    unsigned int lane_launch_iters,
+    unsigned int m_blocks,
+    unsigned int t_cost,
+    unsigned long long *__restrict__ lane_memory,
+    unsigned long long *__restrict__ out_last_blocks,
+    const volatile unsigned int *__restrict__ cancel_flag,
+    unsigned int *__restrict__ completed_iters
+) {
+    argon2id_fill_kernel_impl(
+        seed_blocks,
+        lanes_active,
+        active_hashes,
+        lane_launch_iters,
+        m_blocks,
+        t_cost,
+        lane_memory,
+        out_last_blocks,
+        cancel_flag,
+        completed_iters,
+        nullptr,
+        nullptr,
+        false
+    );
+}
+
+__global__ void argon2id_fill_kernel_fused_target(
+    const unsigned long long *__restrict__ seed_blocks,
+    unsigned int lanes_active,
+    unsigned int active_hashes,
+    unsigned int lane_launch_iters,
+    unsigned int m_blocks,
+    unsigned int t_cost,
+    unsigned long long *__restrict__ lane_memory,
+    unsigned long long *__restrict__ out_last_blocks,
+    const volatile unsigned int *__restrict__ cancel_flag,
+    unsigned int *__restrict__ completed_iters,
+    const unsigned char *__restrict__ target,
+    unsigned int *__restrict__ found_index_one_based
+) {
+    argon2id_fill_kernel_impl(
+        seed_blocks,
+        lanes_active,
+        active_hashes,
+        lane_launch_iters,
+        m_blocks,
+        t_cost,
+        lane_memory,
+        out_last_blocks,
+        cancel_flag,
+        completed_iters,
+        target,
+        found_index_one_based,
+        true
+    );
 }
 
 __global__ void evaluate_hashes_kernel(
