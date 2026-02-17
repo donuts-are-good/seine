@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -137,6 +137,7 @@ impl SubmitWorker {
         client: ApiClient,
         shutdown: Arc<AtomicBool>,
         token_cookie_path: Option<PathBuf>,
+        current_tip_height: Arc<AtomicU64>,
     ) -> Self {
         let (request_tx, request_rx) = bounded::<SubmitRequest>(SUBMIT_REQUEST_CAPACITY);
         let (result_tx, result_rx) = bounded::<SubmitResult>(SUBMIT_RESULT_CAPACITY);
@@ -152,6 +153,7 @@ impl SubmitWorker {
                                 request,
                                 shutdown.as_ref(),
                                 token_cookie_path.as_ref(),
+                                &current_tip_height,
                             ))
                             .is_err()
                         {
@@ -171,6 +173,7 @@ impl SubmitWorker {
                         request,
                         shutdown.as_ref(),
                         token_cookie_path.as_ref(),
+                        &current_tip_height,
                     ))
                     .is_err()
                 {
@@ -249,6 +252,7 @@ pub(super) fn process_submit_request(
     request: SubmitRequest,
     shutdown: &AtomicBool,
     token_cookie_path: Option<&PathBuf>,
+    current_tip_height: &AtomicU64,
 ) -> SubmitResult {
     let max_attempts = SUBMIT_RETRY_MAX_ATTEMPTS.max(1);
     let request_id = request.request_id;
@@ -362,9 +366,15 @@ pub(super) fn process_submit_request(
                     } else {
                         match stale_submit_outcome(attempts, &error_context) {
                             Some(outcome) => outcome,
-                            None => SubmitOutcome::TerminalError(format!(
-                                "submit failed after {attempts} attempt(s): {error_context}"
-                            )),
+                            None => infer_stale_from_tip(
+                                template_height,
+                                current_tip_height,
+                            )
+                            .unwrap_or_else(|| {
+                                SubmitOutcome::TerminalError(format!(
+                                    "submit failed after {attempts} attempt(s): {error_context}"
+                                ))
+                            }),
                         }
                     },
                     attempts,
@@ -411,6 +421,29 @@ fn stale_submit_outcome(attempts: u32, error_context: &str) -> Option<SubmitOutc
     }
     parse_stale_tip_reject_reason(&message)
         .map(|reason| SubmitOutcome::StaleTipError { message, reason })
+}
+
+/// Infer staleness when the daemon returns a generic rejection (e.g. "block rejected")
+/// without detailed height info. If the solution's template height is behind the current
+/// tip, we know the block is stale even though the daemon didn't say so explicitly.
+fn infer_stale_from_tip(
+    template_height: Option<u64>,
+    current_tip_height: &AtomicU64,
+) -> Option<SubmitOutcome> {
+    let solution_height = template_height?;
+    let tip_height = current_tip_height.load(Ordering::Acquire);
+    if tip_height > 0 && solution_height < tip_height {
+        Some(SubmitOutcome::StaleHeightError {
+            message: format!(
+                "inferred stale: solution was for height {} but tip is now at height {}",
+                solution_height, tip_height
+            ),
+            expected_height: tip_height,
+            got_height: solution_height,
+        })
+    } else {
+        None
+    }
 }
 
 fn stale_submit_summary(message: &str) -> Option<String> {
@@ -595,9 +628,11 @@ fn sleep_with_shutdown(shutdown: &AtomicBool, duration: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+
     use super::{
-        parse_stale_height_error, parse_stale_tip_reject_reason, stale_submit_outcome,
-        stale_submit_summary, SubmitOutcome,
+        infer_stale_from_tip, parse_stale_height_error, parse_stale_tip_reject_reason,
+        stale_submit_outcome, stale_submit_summary, SubmitOutcome,
     };
 
     #[test]
@@ -676,5 +711,40 @@ mod tests {
             "submit failed after 1 attempt(s): submitblock failed (500): invalid block: invalid height expected 77 got 76",
         );
         assert!(summary.is_some());
+    }
+
+    #[test]
+    fn infer_stale_when_solution_behind_tip() {
+        let tip = AtomicU64::new(61);
+        let result = infer_stale_from_tip(Some(60), &tip);
+        match result {
+            Some(SubmitOutcome::StaleHeightError {
+                expected_height,
+                got_height,
+                ..
+            }) => {
+                assert_eq!(expected_height, 61);
+                assert_eq!(got_height, 60);
+            }
+            _ => panic!("expected inferred stale height outcome"),
+        }
+    }
+
+    #[test]
+    fn no_infer_stale_when_height_matches_tip() {
+        let tip = AtomicU64::new(60);
+        assert!(infer_stale_from_tip(Some(60), &tip).is_none());
+    }
+
+    #[test]
+    fn no_infer_stale_when_tip_unknown() {
+        let tip = AtomicU64::new(0);
+        assert!(infer_stale_from_tip(Some(60), &tip).is_none());
+    }
+
+    #[test]
+    fn no_infer_stale_when_template_height_unknown() {
+        let tip = AtomicU64::new(61);
+        assert!(infer_stale_from_tip(None, &tip).is_none());
     }
 }

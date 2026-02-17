@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -114,6 +114,7 @@ struct MiningControlPlane<'a> {
     cfg: &'a Config,
     shutdown: Arc<AtomicBool>,
     tip_signal: Option<&'a TipSignal>,
+    current_tip_height: Arc<AtomicU64>,
     prefetch: Option<TemplatePrefetch>,
     submit_worker: Option<SubmitWorker>,
     submit_backlog: VecDeque<SubmitRequest>,
@@ -150,6 +151,9 @@ impl<'a> MiningControlPlane<'a> {
         shutdown: Arc<AtomicBool>,
         tip_signal: Option<&'a TipSignal>,
     ) -> Self {
+        let current_tip_height = tip_signal
+            .map(|s| s.current_tip_height_shared())
+            .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
         Self {
             client,
             cfg,
@@ -162,6 +166,7 @@ impl<'a> MiningControlPlane<'a> {
                 client.clone(),
                 Arc::clone(&shutdown),
                 cfg.token_cookie_path.clone(),
+                Arc::clone(&current_tip_height),
             )),
             submit_backlog: VecDeque::with_capacity(SUBMIT_BACKLOG_CAPACITY),
             pending_submit_results: Vec::new(),
@@ -170,6 +175,7 @@ impl<'a> MiningControlPlane<'a> {
             next_submit_request_id: 1,
             shutdown,
             tip_signal,
+            current_tip_height,
             dev_fee_address: None,
         }
     }
@@ -188,6 +194,7 @@ impl<'a> MiningControlPlane<'a> {
             self.client.clone(),
             Arc::clone(&self.shutdown),
             self.cfg.token_cookie_path.clone(),
+            Arc::clone(&self.current_tip_height),
         ));
     }
 
@@ -2250,7 +2257,8 @@ mod tests {
         };
         let shutdown = AtomicBool::new(false);
 
-        let result = process_submit_request(&client, request, &shutdown, None);
+        let no_tip = AtomicU64::new(0);
+        let result = process_submit_request(&client, request, &shutdown, None, &no_tip);
 
         assert_eq!(result.attempts, 1);
         match result.outcome {

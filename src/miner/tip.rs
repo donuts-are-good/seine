@@ -41,6 +41,10 @@ impl TipSignal {
         }
     }
 
+    pub(super) fn current_tip_height_shared(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.current_template_height)
+    }
+
     pub(super) fn take_stale(&self) -> bool {
         self.stale.swap(false, Ordering::AcqRel)
     }
