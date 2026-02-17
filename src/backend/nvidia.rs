@@ -9,6 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+use blake2::{Blake2b512, Digest};
 use blocknet_pow_spec::{pow_params, CPU_LANE_MEMORY_BYTES, POW_HEADER_BASE_LEN, POW_OUTPUT_LEN};
 use crossbeam_channel::{
     bounded, Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError, TrySendError,
@@ -39,6 +40,7 @@ const SEED_KERNEL_THREADS: u32 = 64;
 const EVAL_KERNEL_THREADS: u32 = 64;
 const DEFAULT_NVIDIA_MAX_RREGCOUNT: u32 = 240;
 const NVIDIA_AUTOTUNE_SCHEMA_VERSION: u32 = 7;
+const NVIDIA_CUBIN_CACHE_SCHEMA_VERSION: u32 = 1;
 const NVIDIA_AUTOTUNE_REGCAP_CANDIDATES: &[u32] = &[240, 224, 208, 192, 160];
 const NVIDIA_AUTOTUNE_LOOP_UNROLL_CANDIDATES: &[bool] = &[false];
 const DEFAULT_NVIDIA_AUTOTUNE_SAMPLES: u32 = 2;
@@ -311,6 +313,7 @@ impl CudaArgon2Engine {
         max_lanes_override: Option<usize>,
         hashes_per_launch_per_lane: u32,
         fused_target_check: bool,
+        cubin_cache_dir: &Path,
     ) -> Result<Self> {
         let ctx = CudaContext::new(device_index as usize).map_err(|err| {
             anyhow!("failed to open CUDA context on device {device_index}: {err:?}")
@@ -339,12 +342,35 @@ impl CudaArgon2Engine {
             format!("--maxrregcount={}", tuning.max_rregcount.max(1)),
             format!("--gpu-architecture=sm_{}{}", cc_major, cc_minor),
         ];
-        let cubin =
-            compile_cubin_with_nvrtc(CUDA_KERNEL_SRC, "seine_argon2id_fill.cu", &nvrtc_options)
+        let program_name = "seine_argon2id_fill.cu";
+        let cache_key = build_cubin_cache_key(CUDA_KERNEL_SRC, program_name, &nvrtc_options);
+        let cache_path = cubin_cache_file_path(cubin_cache_dir, &cache_key);
+        let mut cubin_loaded_from_cache = false;
+        let cubin = if let Some(cached) = load_cached_cubin(&cache_path) {
+            cubin_loaded_from_cache = true;
+            cached
+        } else {
+            let compiled = compile_cubin_with_nvrtc(CUDA_KERNEL_SRC, program_name, &nvrtc_options)
                 .map_err(|err| anyhow!("failed to compile CUDA CUBIN with NVRTC: {err:#}"))?;
-        let module = ctx
-            .load_module(Ptx::from_binary(cubin))
-            .map_err(|err| anyhow!("failed to load CUDA module: {err:?}"))?;
+            let _ = persist_cached_cubin(&cache_path, &compiled);
+            compiled
+        };
+        let module = match ctx.load_module(Ptx::from_binary(cubin)) {
+            Ok(module) => module,
+            Err(err) if cubin_loaded_from_cache => {
+                let _ = fs::remove_file(&cache_path);
+                let compiled = compile_cubin_with_nvrtc(CUDA_KERNEL_SRC, program_name, &nvrtc_options)
+                    .map_err(|compile_err| {
+                        anyhow!(
+                            "failed to compile CUDA CUBIN with NVRTC after cache load failure ({err:?}): {compile_err:#}"
+                        )
+                    })?;
+                let _ = persist_cached_cubin(&cache_path, &compiled);
+                ctx.load_module(Ptx::from_binary(compiled))
+                    .map_err(|load_err| anyhow!("failed to load CUDA module: {load_err:?}"))?
+            }
+            Err(err) => return Err(anyhow!("failed to load CUDA module: {err:?}")),
+        };
         let kernel = module
             .load_function("argon2id_fill_kernel")
             .map_err(|err| anyhow!("failed to load CUDA kernel function: {err:?}"))?;
@@ -760,6 +786,7 @@ pub struct NvidiaBackend {
     instance_id: Arc<AtomicU64>,
     requested_device_index: Option<u32>,
     autotune_config_path: PathBuf,
+    cubin_cache_dir: PathBuf,
     autotune_secs: u64,
     tuning_options: NvidiaBackendTuningOptions,
     resolved_device: RwLock<Option<NvidiaDeviceInfo>>,
@@ -783,6 +810,7 @@ impl NvidiaBackend {
         Self {
             instance_id: Arc::new(AtomicU64::new(0)),
             requested_device_index: device_index,
+            cubin_cache_dir: derive_nvidia_cubin_cache_dir(&autotune_config_path),
             autotune_config_path,
             autotune_secs: autotune_secs.max(1),
             tuning_options: NvidiaBackendTuningOptions {
@@ -1096,6 +1124,7 @@ impl PowBackend for NvidiaBackend {
             tuning.max_lanes_hint,
             tuning.hashes_per_launch_per_lane,
             self.tuning_options.fused_target_check,
+            &self.cubin_cache_dir,
         )
         .with_context(|| {
             format!(
@@ -1428,6 +1457,7 @@ impl BenchBackend for NvidiaBackend {
             tuning.max_lanes_hint,
             tuning.hashes_per_launch_per_lane,
             self.tuning_options.fused_target_check,
+            &self.cubin_cache_dir,
         )
         .with_context(|| {
             format!(
@@ -2109,6 +2139,59 @@ fn compile_cubin_with_nvrtc(
     Ok(cubin)
 }
 
+fn build_cubin_cache_key(source: &str, program_name: &str, options: &[String]) -> String {
+    let mut hasher = Blake2b512::new();
+    hasher.update(NVIDIA_CUBIN_CACHE_SCHEMA_VERSION.to_le_bytes());
+    hasher.update(program_name.as_bytes());
+    hasher.update([0u8]);
+    for option in options {
+        hasher.update(option.as_bytes());
+        hasher.update([0u8]);
+    }
+    hasher.update(source.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn cubin_cache_file_path(cache_dir: &Path, cache_key: &str) -> PathBuf {
+    cache_dir.join(format!("{cache_key}.cubin"))
+}
+
+fn load_cached_cubin(path: &Path) -> Option<Vec<u8>> {
+    let cubin = fs::read(path).ok()?;
+    if cubin.is_empty() {
+        None
+    } else {
+        Some(cubin)
+    }
+}
+
+fn persist_cached_cubin(path: &Path, cubin: &[u8]) -> Result<()> {
+    if cubin.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create NVIDIA CUBIN cache directory '{}'",
+                parent.display()
+            )
+        })?;
+    }
+    fs::write(path, cubin)
+        .with_context(|| format!("failed to write NVIDIA CUBIN cache '{}'", path.display()))?;
+    Ok(())
+}
+
+fn derive_nvidia_cubin_cache_dir(autotune_config_path: &Path) -> PathBuf {
+    let cache_parent = autotune_config_path.parent().unwrap_or(Path::new("."));
+    let stem = autotune_config_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("seine.nvidia-autotune");
+    cache_parent.join(format!("{stem}.cubin-cache"))
+}
+
 fn nvrtc_log_to_string(raw: &[c_char]) -> String {
     if raw.is_empty() {
         return String::new();
@@ -2532,6 +2615,7 @@ fn measure_nvidia_kernel_tuning_hps(
     selected: &NvidiaDeviceInfo,
     tuning: NvidiaKernelTuning,
     secs: u64,
+    cubin_cache_dir: &Path,
 ) -> Result<NvidiaAutotuneSampleScore> {
     let mut engine = CudaArgon2Engine::new(
         selected.index,
@@ -2541,6 +2625,7 @@ fn measure_nvidia_kernel_tuning_hps(
         tuning.max_lanes_hint,
         tuning.hashes_per_launch_per_lane,
         false,
+        cubin_cache_dir,
     )?;
     let header = [0u8; POW_HEADER_BASE_LEN];
     let start = Instant::now();
@@ -2662,6 +2747,7 @@ fn autotune_nvidia_kernel_tuning(
     hashes_per_launch_per_lane: u32,
 ) -> Result<NvidiaKernelTuning> {
     let mut best: Option<(NvidiaKernelTuning, f64, f64, f64, f64)> = None;
+    let cubin_cache_dir = derive_nvidia_cubin_cache_dir(cache_path);
     let sample_count = autotune_samples.max(1);
     let (m_cost_kib, _) = pow_params()
         .map(|params| (params.m_cost(), params.t_cost()))
@@ -2687,6 +2773,7 @@ fn autotune_nvidia_kernel_tuning(
                             selected,
                             candidate,
                             autotune_secs,
+                            &cubin_cache_dir,
                         ) {
                             Ok(score)
                                 if score.counted_hps.is_finite()
@@ -2880,6 +2967,36 @@ mod tests {
         assert_eq!(loaded.max_rregcount, 224);
         assert!(loaded.block_loop_unroll);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn cubin_cache_key_changes_with_compile_options() {
+        let source = "__global__ void k() {}";
+        let key_a =
+            build_cubin_cache_key(source, "k.cu", &["--gpu-architecture=sm_86".to_string()]);
+        let key_b =
+            build_cubin_cache_key(source, "k.cu", &["--gpu-architecture=sm_89".to_string()]);
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn cubin_cache_round_trip_reads_written_bytes() {
+        let path = unique_temp_file("cubin-cache");
+        let payload = vec![1u8, 2, 3, 4, 5];
+        persist_cached_cubin(&path, &payload).expect("cubin cache should persist");
+        let loaded = load_cached_cubin(&path).expect("cubin cache should load");
+        assert_eq!(loaded, payload);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn derive_cubin_cache_dir_follows_autotune_parent_and_stem() {
+        let autotune_path = PathBuf::from("/tmp/seine.nvidia-autotune.json");
+        let cache_dir = derive_nvidia_cubin_cache_dir(&autotune_path);
+        assert_eq!(
+            cache_dir,
+            PathBuf::from("/tmp/seine.nvidia-autotune.cubin-cache")
+        );
     }
 
     #[test]

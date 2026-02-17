@@ -202,6 +202,7 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
                     continue;
                 }
                 nvidia_index += 1;
+                let nvidia_display_id = nvidia_index;
                 let backend_id = non_nvidia_index + nvidia_index; // NVIDIA IDs start after non-NVIDIA
                 let backend = Arc::new(NvidiaBackend::new(
                     spec.device_index,
@@ -238,7 +239,7 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
                         info(
                             "BACKEND",
                             format!(
-                                "{backend_name}: compiling CUDA kernel and allocating device memory (one-time, may take ~2 min)...",
+                                "{backend_name}: initializing CUDA engine (loads cached kernel if available; first run may take ~2 min)...",
                             ),
                         );
                         let start_t = Instant::now();
@@ -273,8 +274,8 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
                                 info(
                                     "BACKEND",
                                     format!(
-                                        "{backend_name}: ready in {:.1}s",
-                                        start_t.elapsed().as_secs_f64()
+                                        "{backend_name}#{nvidia_display_id}: initialized in {:.1}s (awaiting activation)",
+                                        start_t.elapsed().as_secs_f64(),
                                     ),
                                 );
                                 let capabilities = match backend_capabilities_for_start(
@@ -287,7 +288,7 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
                                         warn(
                                             "BACKEND",
                                             format!(
-                                                "{backend_name}#{backend_id} capability contract violation: {err:#}"
+                                                "{backend_name}#{nvidia_display_id} capability contract violation: {err:#}"
                                             ),
                                         );
                                         backend.stop();
@@ -302,7 +303,7 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
                                         format!(
                                             "{}#{} reports inflight={} but does not support batched assignment dispatch; clamping runtime inflight to 1",
                                             backend_name,
-                                            backend_id,
+                                            nvidia_display_id,
                                             capabilities.max_inflight_assignments
                                         ),
                                     );
@@ -313,7 +314,7 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
                                         "BACKEND",
                                         format!(
                                             "skipping {}#{}: reported zero lanes",
-                                            backend_name, backend_id
+                                            backend_name, nvidia_display_id
                                         ),
                                     );
                                     backend.stop();
@@ -333,7 +334,9 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
                             Err(err) => {
                                 warn(
                                     "BACKEND",
-                                    format!("{backend_name}#{backend_id} unavailable: {err:#}"),
+                                    format!(
+                                        "{backend_name}#{nvidia_display_id} unavailable: {err:#}"
+                                    ),
                                 );
                                 warn(
                                     "BACKEND",
@@ -1383,7 +1386,7 @@ fn activate_single_backend(
             )
         }
         "nvidia" => format!(
-            "{backend_name}: compiling CUDA kernel and allocating device memory (one-time, may take ~2 min)...",
+            "{backend_name}: initializing CUDA engine (loads cached kernel if available; first run may take ~2 min)...",
         ),
         _ => format!("{backend_name}: initializing..."),
     };
@@ -1420,8 +1423,8 @@ fn activate_single_backend(
             info(
                 "BACKEND",
                 format!(
-                    "{backend_name}: ready in {:.1}s",
-                    start_t.elapsed().as_secs_f64()
+                    "{backend_name}#{backend_id}: ready in {:.1}s",
+                    start_t.elapsed().as_secs_f64(),
                 ),
             );
             let capabilities =
@@ -2252,7 +2255,7 @@ fn backend_names_by_id(backends: &[BackendSlot]) -> BTreeMap<BackendInstanceId, 
         .collect()
 }
 
-/// Build a display-name map with per-type sequential numbering (e.g. "cpu#1", "nvidia#1").
+/// Build a display-name map with per-type numbering (e.g. "cpu#1", "nvidia#1").
 fn backend_display_names(backends: &[BackendSlot]) -> BTreeMap<BackendInstanceId, String> {
     let mut type_counters: BTreeMap<&str, u64> = BTreeMap::new();
     backends

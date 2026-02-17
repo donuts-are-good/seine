@@ -12,7 +12,7 @@ use super::hashrate_tracker::HashrateTracker;
 use super::stats::{format_hashrate, Stats};
 use super::tui::{DeviceHashrate, TuiRenderer, TuiState};
 use super::ui::{set_tui_state, warn};
-use super::{backend_display_names, BackendSlot};
+use super::{backend_descriptions, backend_display_names, BackendSlot};
 
 const TUI_RENDER_INTERVAL: Duration = Duration::from_secs(1);
 const TUI_QUIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -95,13 +95,15 @@ impl TuiDisplay {
 
         // Build per-device hashrate display data
         let display_names = backend_display_names(view.backends);
-        let mut device_hashrates = Vec::new();
-        for (&id, &current_rate) in &rates.current_per_device {
+        let mut device_hashrates = Vec::with_capacity(view.backends.len());
+        for slot in view.backends {
+            let id = slot.id;
+            let current_rate = rates.current_per_device.get(&id).copied().unwrap_or(0.0);
             let avg_rate = rates.average_per_device.get(&id).copied().unwrap_or(0.0);
             let name = display_names
                 .get(&id)
                 .cloned()
-                .unwrap_or_else(|| format!("?#{id}"));
+                .unwrap_or_else(|| slot.backend.name().to_string());
             device_hashrates.push(DeviceHashrate {
                 name,
                 current: format_hashrate(current_rate),
@@ -121,6 +123,7 @@ impl TuiDisplay {
             s.submitted = snapshot.submitted;
             s.accepted = snapshot.accepted;
             s.device_hashrates = device_hashrates;
+            s.backends_desc = backend_descriptions(view.backends);
         }
 
         self.request_render();

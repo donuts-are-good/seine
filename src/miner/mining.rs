@@ -930,7 +930,12 @@ pub(super) fn run_mining_loop(
                 match deferred.try_recv() {
                     Ok(slot) => {
                         deferred_remaining = deferred_remaining.saturating_sub(1);
-                        let slot_name = format!("{}#{}", slot.backend.name(), slot.id);
+                        let slot_display_id = backends
+                            .iter()
+                            .filter(|existing| existing.backend.name() == slot.backend.name())
+                            .count() as u64
+                            + 1;
+                        let slot_name = format!("{}#{}", slot.backend.name(), slot_display_id);
                         let slot_lanes = slot.lanes;
                         if !cfg.allow_best_effort_deadlines
                             && slot.capabilities.deadline_support
