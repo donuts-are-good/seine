@@ -12,6 +12,7 @@ This log tracks CPU backend/hash-kernel tuning attempts and measured outcomes.
 ## Newest-first index
 
 - `Updated summary of cumulative adopted optimizations`
+- `2026-02-17 Apple Silicon cache-line alignment + DI L2 prefetch revisit`
 - `First-principles performance analysis (x86_64, Zen 3)`
 - `2026-02-16 x86_64 mid-compress prefetch, TLB analysis, and huge page allocation`
 - `Metal + CPU combined mode (Apple M3 Max, 48 GB unified memory)`
@@ -63,8 +64,9 @@ Cumulative x86_64: from ~1.19 H/s (original) to ~2.34 H/s, **~97% total improvem
 | 28 | Mid-compress prefetch for data-dep slices | +8.1% | +8.0% | Adopted |
 | 35 | Interleaved lo/hi BLAMKA half-rounds | +0.95% | — | Adopted |
 | 37 | 2-column Phase 3+4 interleave | +1.56% | — | Adopted |
+| 38 | AArch64 `PowBlock` 128-byte alignment | ~0% (1T) | +0.44% (12T backend) | Adopted |
 
-Cumulative AArch64: from ~1.37 H/s (scalar) to ~2.72 H/s, **~98% total improvement**.
+Cumulative AArch64: from ~1.37 H/s (scalar) to ~2.73 H/s, **~99% total improvement**.
 
 ### Cross-platform insights
 
@@ -146,6 +148,61 @@ Closing the gap requires hardware changes:
 1. **Wider OOO window** — Zen 5 (448-entry ROB) could overlap ~5-6 iterations
 2. **AVX-512** — halves instruction count, better throughput utilization
 3. **Algorithmic changes** — not possible (Argon2id spec is fixed)
+
+## 2026-02-17 Apple Silicon cache-line alignment + DI L2 prefetch revisit
+
+Host: Apple M4 Max, 16 cores (12P + 4E), 48 GB unified memory.
+Baseline worktree: `../seine-baseline-e004732` at commit `e004732`.
+
+### Attempt 38 (Apple): AArch64 `PowBlock` 128-byte alignment (adopted)
+
+- **Hypothesis**: Apple Silicon L1D cache lines are 128 bytes. `PowBlock` was
+  64-byte aligned, which also meant stack-local `PowBlock` temporaries (notably
+  the hot `q` working buffer inside NEON compress) only had 64-byte alignment.
+  Aligning `PowBlock` to 128 bytes on AArch64 should improve cache-line
+  alignment for these hot temporary buffers and reduce split-line pressure.
+- **Change**:
+  - `src/backend/cpu/fixed_argon.rs`: `PowBlock` now uses
+    `#[cfg_attr(target_arch = "aarch64", repr(align(128)))]` and retains
+    `repr(align(64))` on non-AArch64 targets.
+- **Assembly verification**:
+  - `hash_password_into_with_memory` prologue stack alignment changed from
+    `and sp, ..., #...ffc0` (64-byte) to `and sp, ..., #...ff80` (128-byte),
+    confirming stronger stack alignment for local buffers.
+  - Instruction mix in the hot function remains effectively unchanged
+    (`umlal.2d`, `xar.2d`, `prfm` counts unchanged), indicating the gain comes
+    from memory layout/alignment rather than altered arithmetic scheduling.
+- **Interleaved A/B benchmark results**:
+  - Single-thread (directional non-regression):
+    - `data/bench_cpu_ab_aarch64_align128_t1/summary.txt`
+    - Baseline `2.907667 H/s` vs candidate `2.908460 H/s` (**+0.0273%**, noise)
+  - 12-thread (P-core scale):
+    - `data/bench_cpu_ab_aarch64_align128_t12/summary.txt`
+    - Baseline `27.305216 H/s` vs candidate `27.425387 H/s` (**+0.4401%**)
+  - Final sanity run on kept code:
+    - `data/bench_cpu_backend_align128_finalcheck_t12.json`
+    - `avg=27.478 H/s`
+- **Status**: adopted (small but repeatable multi-thread uplift, no single-thread regression).
+
+### Attempt 39 (Apple): data-independent L2 prefetch hint (`pldl2keep`) (not adopted)
+
+- **Hypothesis**: DI (slices 0/1) prefetches are farther-ahead, so prefetched
+  blocks could live in L2 (`pldl2keep`) instead of L1 (`pldl1keep`) to reduce
+  L1 pressure under high lane counts.
+- **Change**:
+  - Routed DI prefetch call-sites to an AArch64 `pldl2keep` helper, while DD
+    prefetches stayed `pldl1keep`.
+- **Interleaved A/B benchmark results**:
+  - Single-thread:
+    - `data/bench_cpu_ab_aarch64_align128_l2di_t1/summary.txt`
+    - Baseline `2.897697 H/s` vs candidate `2.880682 H/s` (**-0.5872%**)
+  - 12-thread quick confirmation:
+    - `data/bench_cpu_ab_aarch64_align128_l2di_t12_quick/summary.txt`
+    - Baseline `26.970669 H/s` vs candidate `25.940109 H/s` (**-3.8210%**)
+- **Conclusion**: DI L2-hint prefetch under-serves the near-term working set;
+  the baseline L1 hint remains superior on this workload/host.
+- **Status**: reverted.
+
 ## First-principles performance analysis (x86_64, Zen 3)
 
 ### Instruction profile (compress_avx2_into, 1,437 dynamic instructions)

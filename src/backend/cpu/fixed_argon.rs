@@ -2454,7 +2454,8 @@ macro_rules! permute {
 }
 
 #[derive(Copy, Clone, Debug)]
-#[repr(align(64))]
+#[cfg_attr(target_arch = "aarch64", repr(align(128)))]
+#[cfg_attr(not(target_arch = "aarch64"), repr(align(64)))]
 pub(super) struct PowBlock([u64; Self::SIZE / 8]);
 
 impl PowBlock {
