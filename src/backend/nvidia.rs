@@ -1509,6 +1509,54 @@ impl BenchBackend for NvidiaBackend {
 
         Ok(total)
     }
+
+    fn kernel_bench_effective(&self, seconds: u64, shutdown: &AtomicBool) -> Result<u64> {
+        let selected = self.validate_or_select_device()?;
+        let tuning = self.resolve_kernel_tuning(&selected);
+        let mut engine = CudaArgon2Engine::new(
+            selected.index,
+            selected.memory_total_mib,
+            selected.memory_free_mib,
+            tuning,
+            tuning.max_lanes_hint,
+            tuning.hashes_per_launch_per_lane,
+            self.tuning_options.fused_target_check,
+            &self.cubin_cache_dir,
+        )
+        .with_context(|| {
+            format!(
+                "failed to initialize CUDA engine for benchmark on device {} ({})",
+                selected.index, selected.name
+            )
+        })?;
+
+        let header = [0u8; POW_HEADER_BASE_LEN];
+        let impossible_target = [0u8; POW_OUTPUT_LEN];
+        let deadline = Instant::now() + Duration::from_secs(seconds.max(1));
+        let mut nonce_cursor = 0u64;
+        let mut total = 0u64;
+        let mut nonces = vec![0u64; engine.max_hashes_per_launch()];
+
+        while Instant::now() < deadline && !shutdown.load(Ordering::Acquire) {
+            let batch_hashes = engine.max_hashes_per_launch().max(1);
+            if nonces.len() < batch_hashes {
+                nonces.resize(batch_hashes, 0);
+            }
+            for nonce in nonces.iter_mut().take(batch_hashes) {
+                *nonce = nonce_cursor;
+                nonce_cursor = nonce_cursor.wrapping_add(1);
+            }
+
+            let done = engine.run_fill_batch(
+                &header,
+                &nonces[..batch_hashes],
+                Some(&impossible_target),
+            )?;
+            total = total.saturating_add(done.hashes_done as u64);
+        }
+
+        Ok(total)
+    }
 }
 
 fn worker_loop(

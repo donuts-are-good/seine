@@ -546,6 +546,10 @@ mod tests {
 
 pub trait BenchBackend: Send {
     fn kernel_bench(&self, seconds: u64, shutdown: &AtomicBool) -> Result<u64>;
+
+    fn kernel_bench_effective(&self, seconds: u64, shutdown: &AtomicBool) -> Result<u64> {
+        self.kernel_bench(seconds, shutdown)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

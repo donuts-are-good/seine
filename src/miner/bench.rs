@@ -238,6 +238,35 @@ type BackendEventAction = RuntimeBackendEventAction;
 const BENCH_REPORT_SCHEMA_VERSION: u32 = 10;
 const BENCH_REPORT_COMPAT_MIN_SCHEMA_VERSION: u32 = 2;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum KernelBenchMode {
+    Steady,
+    Effective,
+}
+
+impl KernelBenchMode {
+    fn kind_label(self) -> &'static str {
+        match self {
+            Self::Steady => "kernel",
+            Self::Effective => "kernel-effective",
+        }
+    }
+
+    fn report_kind_label(self) -> &'static str {
+        match self {
+            Self::Steady => "kernel",
+            Self::Effective => "kernel_effective",
+        }
+    }
+
+    fn measurement_label(self) -> &'static str {
+        match self {
+            Self::Steady => "steady window (bench-secs)",
+            Self::Effective => "wall-time window + target/eval path",
+        }
+    }
+}
+
 pub(super) fn run_benchmark(cfg: &Config, shutdown: &AtomicBool) -> Result<()> {
     let runtime_cfg = super::prepare_runtime_config(cfg, shutdown, RuntimeMode::Bench)?;
     let cfg = &runtime_cfg;
@@ -249,6 +278,13 @@ pub(super) fn run_benchmark(cfg: &Config, shutdown: &AtomicBool) -> Result<()> {
             cfg,
             shutdown,
             instances.into_iter().map(|(_, backend)| backend).collect(),
+            KernelBenchMode::Steady,
+        ),
+        BenchKind::KernelEffective => run_kernel_benchmark(
+            cfg,
+            shutdown,
+            instances.into_iter().map(|(_, backend)| backend).collect(),
+            KernelBenchMode::Effective,
         ),
         BenchKind::Backend => {
             run_worker_benchmark(cfg, shutdown, instances, false, &backend_executor)
@@ -263,6 +299,7 @@ fn run_kernel_benchmark(
     cfg: &Config,
     shutdown: &AtomicBool,
     backends: Vec<Arc<dyn PowBackend>>,
+    mode: KernelBenchMode,
 ) -> Result<()> {
     let mut iter = backends.into_iter();
     let backend = iter
@@ -284,7 +321,8 @@ fn run_kernel_benchmark(
 
     let lines = vec![
         ("Mode", "benchmark".to_string()),
-        ("Kind", "kernel".to_string()),
+        ("Kind", mode.kind_label().to_string()),
+        ("Measurement", mode.measurement_label().to_string()),
         ("Backend", backend.name().to_string()),
         ("Preemption", backend.preemption_granularity().describe()),
         ("Rounds", cfg.bench_rounds.to_string()),
@@ -320,12 +358,22 @@ fn run_kernel_benchmark(
 
         let is_warmup = round < cfg.bench_warmup_rounds;
         let round_start = Instant::now();
-        let hashes = bench_backend.kernel_bench(cfg.bench_secs, shutdown)?;
+        let hashes = match mode {
+            KernelBenchMode::Steady => bench_backend.kernel_bench(cfg.bench_secs, shutdown)?,
+            KernelBenchMode::Effective => {
+                bench_backend.kernel_bench_effective(cfg.bench_secs, shutdown)?
+            }
+        };
         let wall_elapsed = round_start.elapsed().as_secs_f64().max(0.001);
-        // Kernel benchmark backend hooks are expected to run for bench_secs.
-        // Use that steady-state window for H/s so backend init/setup overhead does not
-        // skew per-round throughput when the backend internally rebuilds engines.
-        let elapsed = cfg.bench_secs.max(1) as f64;
+        let elapsed = match mode {
+            // Kernel benchmark backend hooks are expected to run for bench_secs.
+            // Use that steady-state window for H/s so backend init/setup overhead does not
+            // skew per-round throughput when the backend internally rebuilds engines.
+            KernelBenchMode::Steady => cfg.bench_secs.max(1) as f64,
+            // Effective mode uses wall time to expose real per-round overhead from the
+            // target/eval path and host/device launch/copy synchronization.
+            KernelBenchMode::Effective => wall_elapsed,
+        };
         let hps = hashes as f64 / elapsed.max(0.001);
 
         if is_warmup {
@@ -378,7 +426,7 @@ fn run_kernel_benchmark(
             environment,
             config_fingerprint: benchmark_config_fingerprint(cfg, None),
             pow_fingerprint: benchmark_pow_fingerprint(),
-            bench_kind: "kernel".to_string(),
+            bench_kind: mode.report_kind_label().to_string(),
             backends: vec![backend.name().to_string()],
             preemption: vec![format!(
                 "{}={}",

@@ -20,6 +20,7 @@ pub enum BackendKind {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum BenchKind {
     Kernel,
+    KernelEffective,
     Backend,
     EndToEnd,
 }
@@ -446,6 +447,8 @@ struct Cli {
     bench: bool,
 
     /// Benchmark mode.
+    /// `kernel-effective` measures kernel throughput with wall-time accounting and the backend's
+    /// target/eval path enabled so results are directly comparable to backend-mode overhead.
     #[arg(long, value_enum, default_value_t = BenchKind::Backend)]
     bench_kind: BenchKind,
 

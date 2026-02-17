@@ -106,6 +106,7 @@ This file preserves the full engineering reference for AI agents doing optimizat
 Run deterministic local benchmarking (no API connection needed):
 
 - `--bench-kind kernel`: hash kernel only (single backend).
+- `--bench-kind kernel-effective`: kernel path with wall-time accounting and target/eval enabled (single backend), useful for isolating backend orchestration overhead.
 - `--bench-kind backend`: persistent backend workers (steady-state throughput).
 - `--bench-kind end-to-end`: includes backend start/stop per round.
 - Kernel benchmarks report both `elapsed` (steady benchmark window, from `--bench-secs`) and `wall` (full runtime including startup/teardown) per round.

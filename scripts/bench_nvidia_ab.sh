@@ -7,7 +7,7 @@ Usage:
   scripts/bench_nvidia_ab.sh \
     --baseline-dir <path> \
     --candidate-dir <path> \
-    [--bench-kind kernel|backend|end-to-end] \
+    [--bench-kind kernel|kernel-effective|backend|end-to-end] \
     [--bench-secs <n>] \
     [--bench-rounds <n>] \
     [--bench-warmup-rounds <n>] \
