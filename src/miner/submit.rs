@@ -457,6 +457,7 @@ fn stale_submit_summary(message: &str) -> Option<String> {
         let summary = match reason {
             "prev-hash mismatch" => "template no longer matches current tip".to_string(),
             "duplicate-or-stale" => "block already accepted elsewhere".to_string(),
+            "rejected-as-stale" => "daemon rejected block as stale".to_string(),
             _ => format!("template rejected ({reason})"),
         };
         return Some(summary);
@@ -498,6 +499,10 @@ fn parse_stale_tip_reject_reason(message: &str) -> Option<&'static str> {
     }
     if lower.contains("duplicate or stale") {
         return Some("duplicate-or-stale");
+    }
+    // Sanitized message from the daemon's ErrStaleBlock handler (no internal details).
+    if lower.contains("rejected as stale") {
+        return Some("rejected-as-stale");
     }
     None
 }
@@ -711,6 +716,40 @@ mod tests {
             "submit failed after 1 attempt(s): submitblock failed (500): invalid block: invalid height expected 77 got 76",
         );
         assert!(summary.is_some());
+    }
+
+    #[test]
+    fn parse_stale_tip_reject_detects_rejected_as_stale() {
+        let message = "submit failed after 1 attempt(s): submitblock failed (400 Bad Request): block rejected as stale";
+        assert_eq!(
+            parse_stale_tip_reject_reason(message),
+            Some("rejected-as-stale")
+        );
+    }
+
+    #[test]
+    fn stale_submit_outcome_detects_rejected_as_stale() {
+        let outcome = stale_submit_outcome(
+            1,
+            "submitblock failed (400 Bad Request): block rejected as stale",
+        );
+        match outcome {
+            Some(SubmitOutcome::StaleTipError { reason, .. }) => {
+                assert_eq!(reason, "rejected-as-stale");
+            }
+            _ => panic!("expected stale tip outcome for 'rejected as stale'"),
+        }
+    }
+
+    #[test]
+    fn stale_submit_summary_detects_rejected_as_stale() {
+        let summary = stale_submit_summary(
+            "submit failed after 1 attempt(s): submitblock failed (400 Bad Request): block rejected as stale",
+        );
+        assert_eq!(
+            summary.as_deref(),
+            Some("daemon rejected block as stale")
+        );
     }
 
     #[test]
