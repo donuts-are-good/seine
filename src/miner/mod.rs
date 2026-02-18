@@ -52,12 +52,12 @@ use ui::{info, warn};
 const TEMPLATE_RETRY_DELAY: Duration = Duration::from_secs(2);
 const MIN_EVENT_WAIT: Duration = Duration::from_millis(1);
 const BACKEND_EVENT_SOURCE_CAPACITY_MAX: usize = 256;
-const CPU_AUTOTUNE_RECORD_SCHEMA_VERSION: u32 = 3;
+const CPU_AUTOTUNE_RECORD_SCHEMA_VERSION: u32 = 4;
 const CPU_AUTOTUNE_LINEAR_SCAN_MAX_CANDIDATES: usize = 8;
 const CPU_AUTOTUNE_FINAL_SWEEP_RADIUS: usize = 2;
 const CPU_AUTOTUNE_TARGET_HASHES_PER_CANDIDATE: u64 = 30;
 const CPU_AUTOTUNE_MAX_SAMPLE_SECS_PER_CANDIDATE: u64 = 60;
-const CPU_AUTOTUNE_BALANCED_PEAK_FLOOR_FRAC: f64 = 0.95;
+const CPU_AUTOTUNE_BALANCED_PEAK_FLOOR_FRAC: f64 = 0.99;
 const CPU_AUTOTUNE_EFFICIENCY_PEAK_FLOOR_FRAC: f64 = 0.75;
 
 #[derive(Debug, Clone, Copy)]
@@ -2737,10 +2737,10 @@ mod tests {
 
     #[test]
     fn autotune_selection_balanced_biases_lower_when_near_peak() {
-        // 95% of peak (3.3) is 3.135, so 4 threads (3.2) is the first candidate that qualifies.
+        // 99% of peak (3.3) is 3.267, so 4 threads (3.28) is the first candidate that qualifies.
         let selection = select_cpu_autotune_candidate(
             CpuPerformanceProfile::Balanced,
-            &autotune_measurements(&[(3, 3.0), (4, 3.2), (22, 3.3)]),
+            &autotune_measurements(&[(3, 3.0), (4, 3.28), (22, 3.3)]),
         )
         .expect("selection should exist");
 
