@@ -69,6 +69,7 @@ Cumulative x86_64: from ~1.19 H/s (original) to ~2.34 H/s, **~97% total improvem
 | 35 | Interleaved lo/hi BLAMKA half-rounds | +0.95% | — | Adopted |
 | 37 | 2-column Phase 3+4 interleave | +1.56% | — | Adopted |
 | 38 | AArch64 `PowBlock` 128-byte alignment | ~0% (1T) | +0.44% short, +0.10% long (12T backend) | Adopted |
+| 47 | macOS `pcore-only` CPU affinity default | ~0% | +0.15% (12T), +2-5% directional (16T) | Adopted |
 
 Cumulative AArch64: from ~1.37 H/s (scalar) to ~2.73 H/s, **~99% total improvement**.
 
@@ -107,7 +108,7 @@ Host: Apple M4 Max, 16 cores (12P + 4E), 48 GB unified memory.
   - Baseline `27.5619 H/s` vs candidate `27.4619 H/s` (**-0.3627%**).
 - **Conclusion**: no gain on Apple Silicon in this workload window; code path reverted.
 
-### Attempt 47 (Apple): `--cpu-affinity pcore-only` topology mode (kept as opt-in)
+### Attempt 47 (Apple): `--cpu-affinity pcore-only` topology mode (adopted; default on macOS)
 
 - **Hypothesis**: For mixed P/E-core Apple SoCs, pinning CPU hashing workers to the
   P-core set may improve consistency/throughput, especially at higher thread counts
@@ -116,7 +117,8 @@ Host: Apple M4 Max, 16 cores (12P + 4E), 48 GB unified memory.
   - Added `CpuAffinityMode::PcoreOnly` and CLI value `--cpu-affinity pcore-only`.
   - CPU backend affinity resolver now truncates core ID set to `hw.perflevel0.logicalcpu`
     on macOS for this mode.
-  - Default remains `--cpu-affinity auto`; `pcore-only` is opt-in.
+  - Policy update: set `pcore-only` as the default `--cpu-affinity` on macOS
+    (other platforms remain `auto`).
 - **Measured results**:
   - 12T interleaved:
     - `data/bench_cpu_ab_pcore_only_t12_20260218_043817/summary.txt`
@@ -130,7 +132,8 @@ Host: Apple M4 Max, 16 cores (12P + 4E), 48 GB unified memory.
 - **Conclusion**:
   - `pcore-only` appears neutral-to-slightly positive at 12T and potentially more
     beneficial at 16T under mixed thermal/scheduling states.
-  - Kept as an opt-in tuning knob; not promoted to default pending longer thermal-stable confirmation.
+  - Adopted as default on macOS; remains selectable explicitly via `--cpu-affinity auto`
+    when users want prior behavior.
 
 ## 2026-02-18 Apple Silicon arena residency + shared-arena trials
 

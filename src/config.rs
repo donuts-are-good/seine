@@ -71,6 +71,10 @@ const DEFAULT_CPU_HASH_FLUSH_MS: u64 = 50;
 const DEFAULT_CPU_EVENT_DISPATCH_CAPACITY: usize = 256;
 const DEFAULT_CPU_AUTOTUNE_SECS: u64 = 6;
 const DEFAULT_CPU_AUTOTUNE_CONFIG_FILE: &str = "seine.cpu-autotune.json";
+#[cfg(target_os = "macos")]
+const DEFAULT_CPU_AFFINITY: CpuAffinityMode = CpuAffinityMode::PcoreOnly;
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_CPU_AFFINITY: CpuAffinityMode = CpuAffinityMode::Auto;
 const DEFAULT_NVIDIA_AUTOTUNE_SECS: u64 = 5;
 const DEFAULT_NVIDIA_AUTOTUNE_SAMPLES: u32 = 2;
 const DEFAULT_NVIDIA_HASHES_PER_LAUNCH_PER_LANE: u32 = 2;
@@ -191,7 +195,8 @@ struct Cli {
     threads: Option<usize>,
 
     /// CPU pinning policy for CPU mining workers.
-    #[arg(long, value_enum, default_value_t = CpuAffinityMode::Auto)]
+    /// Default: `pcore-only` on macOS Apple Silicon, otherwise `auto`.
+    #[arg(long, value_enum, default_value_t = DEFAULT_CPU_AFFINITY)]
     cpu_affinity: CpuAffinityMode,
 
     /// CPU mining profile preset; applies default threads/poll/flush knobs unless explicitly set.
