@@ -19,7 +19,7 @@ This log tracks CPU backend/hash-kernel tuning attempts and measured outcomes.
 - `2026-02-17 Apple Silicon cache-line alignment + DI L2 prefetch revisit`
 - `First-principles performance analysis (x86_64, Zen 3)`
 - `2026-02-16 x86_64 mid-compress prefetch, TLB analysis, and huge page allocation`
-- `Metal + CPU combined mode (Apple M3 Max, 48 GB unified memory)`
+- `Metal + CPU combined mode (Apple M4 Max, 48 GB unified memory)`
 - `2026-02-15 Apple Silicon further investigation (post mid-compress prefetch)`
 - `2026-02-15 Apple Silicon mid-compress prefetch + madvise investigation`
 - `2026-02-15 x86_64 cross-porting Apple Silicon optimizations`
@@ -742,7 +742,7 @@ misses, not compute.
   - Loop overhead is only 0.84% of total — no room for scheduling improvements.
 - Status: not adopted (DD path is inherently serial; DI path already overlapped).
 
-## Metal + CPU combined mode (Apple M3 Max, 48 GB unified memory)
+## Metal + CPU combined mode (Apple M4 Max, 48 GB unified memory)
 
 Tested whether running Metal GPU and CPU backends simultaneously improves total
 hashrate on Apple Silicon unified memory.
@@ -767,7 +767,7 @@ to a CPU lane instead.
 ### Why Metal can't help on unified memory
 
 1. **Shared DRAM bandwidth** — Apple Silicon unified memory means CPU and GPU
-   share the same physical DRAM banks and memory controller (~400 GB/s on M3 Max).
+   share the same physical DRAM banks and memory controller (~400 GB/s on M4 Max).
    There is no discrete VRAM to isolate. `StorageModeShared` and
    `StorageModePrivate` both resolve to the same physical memory.
 
