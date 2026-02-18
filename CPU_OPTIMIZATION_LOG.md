@@ -12,6 +12,7 @@ This log tracks CPU backend/hash-kernel tuning attempts and measured outcomes.
 ## Newest-first index
 
 - `Updated summary of cumulative adopted optimizations`
+- `2026-02-18 Apple Silicon superpage arena + pcore-only affinity trial`
 - `2026-02-18 Apple Silicon arena residency + shared-arena trials`
 - `2026-02-18 Apple Silicon hot-path revisit + build/runtime retests`
 - `2026-02-17 Apple Silicon long-window confirmations + perflevel affinity cap trial`
@@ -89,6 +90,47 @@ Cumulative AArch64: from ~1.37 H/s (scalar) to ~2.73 H/s, **~99% total improveme
   x86_64**. The function call boundary from `#[target_feature(enable = "avx2")]` was
   verified as zero-cost — Zen 3's deep OOO engine overlaps across it. The bottleneck
   is memory, not compute.
+
+## 2026-02-18 Apple Silicon superpage arena + pcore-only affinity trial
+
+Host: Apple M4 Max, 16 cores (12P + 4E), 48 GB unified memory.
+
+### Attempt 46 (Apple): 2 MiB macOS superpage arena allocation (not adopted)
+
+- **Hypothesis**: Back Argon2 worker arenas with explicit 2 MiB superpages on macOS
+  to reduce TLB pressure and improve throughput.
+- **Implementation tested**:
+  - Added best-effort superpage arena path using `vm_allocate(..., VM_FLAGS_ANYWHERE | VM_FLAGS_SUPERPAGE_SIZE_2MB)` with regular mmap fallback.
+  - Exposed via `--cpu-superpage-2mb`.
+- **A/B result (12T interleaved)**:
+  - `data/bench_cpu_ab_superpage2mb_t12_20260218_043138/summary.txt`
+  - Baseline `27.5619 H/s` vs candidate `27.4619 H/s` (**-0.3627%**).
+- **Conclusion**: no gain on Apple Silicon in this workload window; code path reverted.
+
+### Attempt 47 (Apple): `--cpu-affinity pcore-only` topology mode (kept as opt-in)
+
+- **Hypothesis**: For mixed P/E-core Apple SoCs, pinning CPU hashing workers to the
+  P-core set may improve consistency/throughput, especially at higher thread counts
+  where auto affinity may include E-core IDs.
+- **Implementation**:
+  - Added `CpuAffinityMode::PcoreOnly` and CLI value `--cpu-affinity pcore-only`.
+  - CPU backend affinity resolver now truncates core ID set to `hw.perflevel0.logicalcpu`
+    on macOS for this mode.
+  - Default remains `--cpu-affinity auto`; `pcore-only` is opt-in.
+- **Measured results**:
+  - 12T interleaved:
+    - `data/bench_cpu_ab_pcore_only_t12_20260218_043817/summary.txt`
+    - Baseline `27.3583 H/s` vs candidate `27.3981 H/s` (**+0.1454%**, near-noise).
+  - 16T interleaved (directional):
+    - `data/bench_cpu_ab_pcore_only_t16_20260218_044428/summary.txt`: **+2.3863%**
+    - `data/bench_cpu_ab_pcore_only_t16_confirm_20260218_044839/summary.txt`: **+4.9146%** (high thermal variance across legs; treat as directional).
+  - Post-cleanup sanity check (single pass, 12T):
+    - `data/bench_cpu_pcore_only_sanity_20260218_045556/`
+    - Baseline `26.8672 H/s` vs candidate `27.0638 H/s` (**+0.7318%**).
+- **Conclusion**:
+  - `pcore-only` appears neutral-to-slightly positive at 12T and potentially more
+    beneficial at 16T under mixed thermal/scheduling states.
+  - Kept as an opt-in tuning knob; not promoted to default pending longer thermal-stable confirmation.
 
 ## 2026-02-18 Apple Silicon arena residency + shared-arena trials
 

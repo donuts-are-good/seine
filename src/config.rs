@@ -34,6 +34,7 @@ pub enum BenchBaselinePolicy {
 pub enum CpuAffinityMode {
     Off,
     Auto,
+    PcoreOnly,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]

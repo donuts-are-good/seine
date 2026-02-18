@@ -93,7 +93,8 @@ This file preserves the full engineering reference for AI agents doing optimizat
 
 - Late-solution template retention is timeout-aware (derived from refresh/control/assign/prefetch timing) with time-based eviction and a bounded cache (entry and memory caps) to reduce stale drops during backend lag/spiky tip churn.
 - Deferred solution submission deduplicates by `(epoch, nonce)` across backends and suppresses repeat submit attempts across later rounds.
-- `--cpu-affinity` (`auto` or `off`) controls CPU worker pinning policy for better repeatability on NUMA/SMT hosts.
+- `--cpu-affinity` (`auto`, `pcore-only`, or `off`) controls CPU worker pinning policy.
+  - `pcore-only` (macOS) pins CPU hashing workers to the perflevel0 logical CPU set (P-core logical IDs) and can help at higher lane counts on Apple Silicon.
 - `--ui` (`auto`, `tui`, `plain`) controls rendering mode. `auto` enables TUI only when stdout/stderr are terminals.
 - A backend runtime fault quarantines only that backend; mining continues on remaining active backends when possible.
 - CPU backend runtime errors are latched per assignment so only the first fault event is emitted, avoiding queue saturation during shutdown.

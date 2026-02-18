@@ -321,10 +321,7 @@ impl PowBackend for CpuBackend {
             return Err(err);
         }
 
-        let core_ids = match self.affinity_mode {
-            CpuAffinityMode::Off => None,
-            CpuAffinityMode::Auto => core_affinity::get_core_ids().filter(|ids| !ids.is_empty()),
-        };
+        let core_ids = resolve_affinity_core_ids(self.affinity_mode);
 
         let mut spawned_handles = Vec::with_capacity(self.threads.max(1));
         let mut spawn_error = None;
@@ -588,10 +585,7 @@ impl BenchBackend for CpuBackend {
         let setup_barrier = Arc::new(Barrier::new(lanes.saturating_add(1)));
         let start_barrier = Arc::new(Barrier::new(lanes.saturating_add(1)));
         let stop_at = Arc::new(OnceLock::<Instant>::new());
-        let core_ids = match self.affinity_mode {
-            CpuAffinityMode::Off => None,
-            CpuAffinityMode::Auto => core_affinity::get_core_ids().filter(|ids| !ids.is_empty()),
-        };
+        let core_ids = resolve_affinity_core_ids(self.affinity_mode);
 
         thread::scope(|scope| {
             for lane in 0..lanes {
@@ -661,6 +655,54 @@ impl BenchBackend for CpuBackend {
 
 fn cpu_worker_loop(shared: Arc<Shared>, thread_idx: usize, core_id: Option<core_affinity::CoreId>) {
     kernel::cpu_worker_loop(shared, thread_idx, core_id);
+}
+
+fn resolve_affinity_core_ids(mode: CpuAffinityMode) -> Option<Vec<core_affinity::CoreId>> {
+    if mode == CpuAffinityMode::Off {
+        return None;
+    }
+    let mut core_ids = core_affinity::get_core_ids().filter(|ids| !ids.is_empty())?;
+    if mode == CpuAffinityMode::PcoreOnly {
+        #[cfg(target_os = "macos")]
+        if let Some(pcore_count) = macos_pcore_count() {
+            core_ids.truncate(pcore_count.min(core_ids.len()));
+        }
+    }
+    if core_ids.is_empty() {
+        None
+    } else {
+        Some(core_ids)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_pcore_count() -> Option<usize> {
+    extern "C" {
+        fn sysctlbyname(
+            name: *const u8,
+            oldp: *mut std::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *const std::ffi::c_void,
+            newlen: usize,
+        ) -> i32;
+    }
+    let mut val: u32 = 0;
+    let mut len = std::mem::size_of::<u32>();
+    let name = b"hw.perflevel0.logicalcpu\0";
+    let ret = unsafe {
+        sysctlbyname(
+            name.as_ptr(),
+            &mut val as *mut u32 as *mut std::ffi::c_void,
+            &mut len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if ret == 0 && val > 0 {
+        Some(val as usize)
+    } else {
+        None
+    }
 }
 
 fn lane_quota_for_chunk(nonce_count: u64, lane_idx: u64, lane_stride: u64) -> u64 {

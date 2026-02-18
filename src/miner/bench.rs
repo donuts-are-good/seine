@@ -1600,6 +1600,7 @@ fn cpu_affinity_label(mode: CpuAffinityMode) -> &'static str {
     match mode {
         CpuAffinityMode::Off => "off",
         CpuAffinityMode::Auto => "auto",
+        CpuAffinityMode::PcoreOnly => "pcore-only",
     }
 }
 
