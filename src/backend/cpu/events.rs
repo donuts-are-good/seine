@@ -6,6 +6,8 @@ use crate::backend::BackendEvent;
 
 use super::{Shared, CRITICAL_EVENT_RETRY_MAX_WAIT, CRITICAL_EVENT_RETRY_WAIT};
 
+const MAX_EVENT_SEND_RETRIES: u32 = 10;
+
 #[cfg(target_os = "linux")]
 pub(super) fn emit_warning(shared: &Shared, message: String) {
     emit_event(
@@ -90,6 +92,7 @@ fn send_critical_event(shared: &Shared, tx: &Sender<BackendEvent>, event: Backen
 fn send_event_with_backpressure(shared: &Shared, tx: &Sender<BackendEvent>, event: BackendEvent) {
     let mut queued = event;
     let mut retry_wait = CRITICAL_EVENT_RETRY_WAIT;
+    let mut retries = 0u32;
     loop {
         if !shared.started.load(Ordering::Acquire) {
             shared.dropped_events.fetch_add(1, Ordering::Relaxed);
@@ -103,6 +106,11 @@ fn send_event_with_backpressure(shared: &Shared, tx: &Sender<BackendEvent>, even
                 return;
             }
             Err(SendTimeoutError::Timeout(returned)) => {
+                retries += 1;
+                if retries >= MAX_EVENT_SEND_RETRIES {
+                    shared.dropped_events.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
                 queued = returned;
                 retry_wait = (retry_wait.saturating_mul(2)).min(CRITICAL_EVENT_RETRY_MAX_WAIT);
             }

@@ -634,6 +634,27 @@ impl BackendExecutor {
         backend_handle: &Arc<dyn PowBackend>,
     ) -> Option<BackendWorkerHandles> {
         let key = backend_worker_key(backend_id, backend_handle);
+
+        // Fast path: worker already exists -- lock, clone handles, drop lock.
+        if let Ok(registry) = self.workers.lock() {
+            if let Some(worker) = registry.get(&key) {
+                return Some(BackendWorkerHandles {
+                    assignment_tx: worker.assignment_tx.clone(),
+                    control_tx: worker.control_tx.clone(),
+                    pending_control: Arc::clone(&worker.pending_control),
+                    metrics: Arc::clone(&worker.metrics),
+                });
+            }
+        } else {
+            return None;
+        }
+
+        // Slow path: spawn worker outside the lock to avoid holding the mutex
+        // during thread creation.
+        let queue_capacity = backend_worker_queue_capacity(backend_handle);
+        let new_worker = spawn_backend_worker(backend_id, backend, key.backend_ptr, queue_capacity)?;
+
+        // Re-lock and insert; check again in case of a concurrent insert.
         let mut registry = self.workers.lock().ok()?;
         if let Some(worker) = registry.get(&key) {
             return Some(BackendWorkerHandles {
@@ -643,15 +664,13 @@ impl BackendExecutor {
                 metrics: Arc::clone(&worker.metrics),
             });
         }
-        let queue_capacity = backend_worker_queue_capacity(backend_handle);
-        let worker = spawn_backend_worker(backend_id, backend, key.backend_ptr, queue_capacity)?;
         let handles = BackendWorkerHandles {
-            assignment_tx: worker.assignment_tx.clone(),
-            control_tx: worker.control_tx.clone(),
-            pending_control: Arc::clone(&worker.pending_control),
-            metrics: Arc::clone(&worker.metrics),
+            assignment_tx: new_worker.assignment_tx.clone(),
+            control_tx: new_worker.control_tx.clone(),
+            pending_control: Arc::clone(&new_worker.pending_control),
+            metrics: Arc::clone(&new_worker.metrics),
         };
-        registry.insert(key, worker);
+        registry.insert(key, new_worker);
         Some(handles)
     }
 
@@ -691,7 +710,11 @@ impl BackendExecutor {
             if Instant::now() >= deadline {
                 return false;
             }
-            thread::sleep(Duration::from_millis(10));
+            // Reduced from 10ms to 1ms to minimize latency between quarantine
+            // drain and the next round start. A Condvar-based approach would
+            // eliminate polling entirely but requires structural changes to the
+            // quarantine lifecycle.
+            thread::sleep(Duration::from_millis(1));
         }
     }
 

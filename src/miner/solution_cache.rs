@@ -231,7 +231,15 @@ fn estimate_template_block_bytes(block: &crate::types::TemplateBlock) -> usize {
 }
 
 fn estimate_optional_u64(value: Option<u64>) -> usize {
-    value.map_or(0, |v| v.to_string().len().saturating_add(8))
+    value.map_or(0, |v| u64_digit_count(v).saturating_add(8))
+}
+
+fn u64_digit_count(v: u64) -> usize {
+    if v == 0 {
+        1
+    } else {
+        (v as f64).log10() as usize + 1
+    }
 }
 
 fn estimate_json_map_bytes(map: &serde_json::Map<String, Value>) -> usize {
@@ -417,5 +425,30 @@ mod tests {
         let drained = take_deferred_solutions_indexed(&mut queue, &mut keys);
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].backend_id, 9);
+    }
+
+    #[test]
+    fn u64_digit_count_covers_edge_cases() {
+        assert_eq!(super::u64_digit_count(0), 1);
+        assert_eq!(super::u64_digit_count(1), 1);
+        assert_eq!(super::u64_digit_count(9), 1);
+        assert_eq!(super::u64_digit_count(10), 2);
+        assert_eq!(super::u64_digit_count(99), 2);
+        assert_eq!(super::u64_digit_count(100), 3);
+        assert_eq!(super::u64_digit_count(999), 3);
+        assert_eq!(super::u64_digit_count(1000), 4);
+        assert_eq!(super::u64_digit_count(u64::MAX), 20);
+    }
+
+    #[test]
+    fn estimate_optional_u64_zero_for_none() {
+        assert_eq!(super::estimate_optional_u64(None), 0);
+    }
+
+    #[test]
+    fn estimate_optional_u64_adds_overhead_for_some() {
+        let estimate = super::estimate_optional_u64(Some(12345));
+        // 5 digits + 8 overhead bytes
+        assert_eq!(estimate, 13);
     }
 }

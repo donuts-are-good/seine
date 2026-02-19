@@ -211,25 +211,25 @@ impl CpuBackend {
     }
 
     fn reset_runtime_state(&self) {
-        self.shared.solution_state.store(0, Ordering::SeqCst);
-        self.shared.error_emitted.store(false, Ordering::SeqCst);
-        self.shared.work_generation.store(0, Ordering::SeqCst);
-        self.shared.active_workers.store(0, Ordering::SeqCst);
-        self.shared.ready_workers.store(0, Ordering::SeqCst);
-        self.shared.startup_failed.store(false, Ordering::SeqCst);
-        self.shared.assignment_hashes.store(0, Ordering::SeqCst);
-        self.shared.assignment_generation.store(0, Ordering::SeqCst);
+        self.shared.solution_state.store(0, Ordering::Release);
+        self.shared.error_emitted.store(false, Ordering::Release);
+        self.shared.work_generation.store(0, Ordering::Release);
+        self.shared.active_workers.store(0, Ordering::Release);
+        self.shared.ready_workers.store(0, Ordering::Release);
+        self.shared.startup_failed.store(false, Ordering::Release);
+        self.shared.assignment_hashes.store(0, Ordering::Release);
+        self.shared.assignment_generation.store(0, Ordering::Release);
         self.shared
             .assignment_reported_generation
-            .store(0, Ordering::SeqCst);
-        self.shared.completed_assignments.store(0, Ordering::SeqCst);
+            .store(0, Ordering::Release);
+        self.shared.completed_assignments.store(0, Ordering::Release);
         self.shared
             .completed_assignment_hashes
-            .store(0, Ordering::SeqCst);
+            .store(0, Ordering::Release);
         self.shared
             .completed_assignment_micros
-            .store(0, Ordering::SeqCst);
-        self.shared.dropped_events.store(0, Ordering::SeqCst);
+            .store(0, Ordering::Release);
+        self.shared.dropped_events.store(0, Ordering::Release);
         reset_hash_slots(&self.shared.hash_slots);
         if let Ok(mut started_at) = self.shared.assignment_started_at.lock() {
             *started_at = None;
@@ -1314,5 +1314,64 @@ mod tests {
 
         backend.shared.active_workers.store(0, Ordering::Release);
         backend.shared.idle_cv.notify_all();
+    }
+
+    #[test]
+    fn event_backpressure_drops_after_max_retries() {
+        // Verify that send_event_with_backpressure gives up after MAX_EVENT_SEND_RETRIES
+        // instead of blocking forever. The existing test
+        // `error_event_drops_after_sustained_backpressure` covers the "started=false" exit;
+        // this test verifies the retry-count exit path by keeping the backend started but
+        // the sink permanently full.
+        let backend = CpuBackend::new(1, CpuAffinityMode::Off);
+        backend.shared.started.store(true, Ordering::Release);
+        backend.set_instance_id(42);
+        // Create a bounded(0) sink so sends always time out
+        let (dispatch_tx, _dispatch_rx) = crossbeam_channel::bounded::<BackendEvent>(0);
+        if let Ok(mut slot) = backend.shared.event_dispatch_tx.write() {
+            *slot = Some(dispatch_tx);
+        }
+
+        let shared = Arc::clone(&backend.shared);
+        let handle = thread::spawn(move || {
+            emit_error(&shared, "backpressure test".to_string());
+        });
+
+        // The thread should complete within a bounded time (retries * max_wait ~ 1s)
+        // because it gives up after MAX_EVENT_SEND_RETRIES.
+        let completed = handle.join().is_ok();
+        assert!(completed, "emit_error should complete after hitting retry limit");
+        assert!(
+            backend.shared.dropped_events.load(Ordering::Acquire) >= 1,
+            "event should be dropped after max retries exhausted"
+        );
+    }
+
+    #[test]
+    fn reset_runtime_state_uses_release_ordering() {
+        // Verify that reset_runtime_state can be called after stop completes.
+        // This is a smoke test to confirm the Release ordering change doesn't
+        // break the reset sequence.
+        let backend = CpuBackend::new(1, CpuAffinityMode::Off);
+        backend.shared.solution_state.store(99, Ordering::SeqCst);
+        backend.shared.error_emitted.store(true, Ordering::SeqCst);
+        backend
+            .shared
+            .work_generation
+            .store(42, Ordering::SeqCst);
+        backend
+            .shared
+            .assignment_hashes
+            .store(100, Ordering::SeqCst);
+
+        backend.reset_runtime_state();
+
+        assert_eq!(backend.shared.solution_state.load(Ordering::Acquire), 0);
+        assert!(!backend.shared.error_emitted.load(Ordering::Acquire));
+        assert_eq!(backend.shared.work_generation.load(Ordering::Acquire), 0);
+        assert_eq!(
+            backend.shared.assignment_hashes.load(Ordering::Acquire),
+            0
+        );
     }
 }

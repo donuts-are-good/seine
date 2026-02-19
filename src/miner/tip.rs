@@ -210,10 +210,12 @@ pub(super) fn spawn_tip_listener(
 
     let handle = thread::spawn(move || {
         let mut retry = RetryTracker::default();
+        let mut reconnect_delay = Duration::from_millis(100);
         while !shutdown.load(Ordering::Relaxed) {
             match client.open_events_stream() {
                 Ok(resp) => {
                     retry.note_recovered("EVENTS", "events stream reconnected");
+                    reconnect_delay = Duration::from_millis(100);
                     if let Err(_err) = stream_tip_events(resp, &signal, &shutdown) {
                         if !shutdown.load(Ordering::Relaxed) {
                             retry.note_failure(
@@ -274,7 +276,8 @@ pub(super) fn spawn_tip_listener(
             }
 
             if !shutdown.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_secs(1));
+                thread::sleep(reconnect_delay);
+                reconnect_delay = (reconnect_delay.saturating_mul(2)).min(Duration::from_secs(10));
             }
         }
         let _ = done_tx.send(());
@@ -342,7 +345,10 @@ fn process_sse_line(line: &str, frame: &mut SseFrameState, signal: &TipSignal) {
     let value = raw_value.strip_prefix(' ').unwrap_or(raw_value);
 
     match field {
-        "event" => frame.event_name = value.to_string(),
+        "event" => {
+            frame.event_name.clear();
+            frame.event_name.push_str(value);
+        },
         "data" => frame.data_lines.push(value.to_string()),
         // `id` and `retry` are intentionally ignored for now.
         _ => {}
@@ -481,5 +487,42 @@ mod tests {
 
         emit_new_block(&signal, "def", 1782);
         assert!(signal.take_stale());
+    }
+
+    #[test]
+    fn sse_frame_reuses_event_name_buffer() {
+        // Verify that process_sse_line reuses the event_name String allocation
+        // rather than creating a new one each time. After processing, the capacity
+        // should be >= the length of the longest event name seen.
+        let signal = TipSignal::new(false);
+        let mut frame = SseFrameState::default();
+
+        // First event: allocates
+        process_sse_line("event: new_block", &mut frame, &signal);
+        let capacity_after_first = frame.event_name.capacity();
+        assert!(capacity_after_first >= "new_block".len());
+
+        // Reset and reprocess: should reuse the buffer
+        frame.reset();
+        process_sse_line("event: new_block", &mut frame, &signal);
+        assert_eq!(
+            frame.event_name.capacity(),
+            capacity_after_first,
+            "event_name should reuse its allocation after reset"
+        );
+    }
+
+    #[test]
+    fn sequence_increments_on_each_new_block() {
+        let signal = TipSignal::new(false);
+        let seq0 = signal.snapshot_sequence();
+
+        emit_new_block(&signal, "aaa", 1);
+        let seq1 = signal.snapshot_sequence();
+        assert_eq!(seq1, seq0 + 1);
+
+        emit_new_block(&signal, "bbb", 2);
+        let seq2 = signal.snapshot_sequence();
+        assert_eq!(seq2, seq1 + 1);
     }
 }

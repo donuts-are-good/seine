@@ -51,6 +51,15 @@ pub(super) fn distribute_work(
     let mut additional_span_consumed = 0u64;
     let mut remaining_reserved_span = options.reservation.reserved_span;
     let mut non_quarantined_retry_attempts = 0u32;
+    // Hoist template allocation outside the retry loop -- the fields are
+    // invariant across retries and the Arc can be cheaply cloned.
+    let template = Arc::new(WorkTemplate {
+        work_id: options.work_id,
+        epoch: options.epoch,
+        header_base: Arc::clone(&options.header_base),
+        target: options.target,
+        stop_at: options.stop_at,
+    });
     loop {
         if backends.is_empty() {
             bail!("all mining backends are unavailable");
@@ -66,19 +75,12 @@ pub(super) fn distribute_work(
         );
         let total_lanes = total_lanes(backends);
         let attempt_span = nonce_counts.iter().copied().sum::<u64>().max(total_lanes);
-        let template = Arc::new(WorkTemplate {
-            work_id: options.work_id,
-            epoch: options.epoch,
-            header_base: Arc::clone(&options.header_base),
-            target: options.target,
-            stop_at: options.stop_at,
-        });
 
         let mut chunk_start = attempt_start_nonce;
         let mut chunk_offset = 0u64;
         let mut dispatch_tasks = Vec::with_capacity(backends.len());
         let mut slots_by_idx = Vec::with_capacity(backends.len());
-        for (idx, slot) in std::mem::take(backends).into_iter().enumerate() {
+        for (idx, slot) in backends.drain(..).enumerate() {
             let nonce_count = *nonce_counts.get(idx).unwrap_or(&slot.lanes.max(1));
             let capabilities = backend_capabilities(&slot);
             let dispatch_iters_per_lane =

@@ -153,7 +153,6 @@ pub(super) fn cpu_worker_loop(
         control_hashes_remaining -= 1;
         pending_hashes += 1;
 
-        let now = Instant::now();
         let should_flush = should_flush_hashes(pending_hashes, now, next_flush_at, hash_batch_size);
         if should_flush {
             flush_hashes(&shared, thread_idx, &mut pending_hashes);

@@ -39,6 +39,10 @@ httpmock = "0.7"
 [profile.release]
 codegen-units = 1
 lto = "fat"
+# NOTE: Do not add `panic = "abort"` here. The miner uses `catch_unwind` in
+# production code paths (backend_executor.rs) to gracefully handle panics from
+# backend stop/execution calls. Setting panic = "abort" would bypass those
+# catch_unwind guards and cause the entire process to terminate on any backend panic.
 
 [profile.release-native]
 inherits = "release"

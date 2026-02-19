@@ -50,7 +50,7 @@ impl TemplatePrefetch {
 
         let handle = thread::spawn(move || {
             while !shutdown.load(Ordering::Relaxed) {
-                let mut request = match request_rx.recv_timeout(Duration::from_millis(100)) {
+                let mut request = match request_rx.recv_timeout(Duration::from_secs(5)) {
                     Ok(request) => request,
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -362,5 +362,26 @@ mod tests {
             .expect("a prefetched result should be returned");
         assert_eq!(result.0, 7);
         assert!(prefetch.inflight_tip_sequence.is_none());
+    }
+
+    #[test]
+    fn request_if_idle_reuses_address_allocation_on_unchanged_address() {
+        let (request_tx, _request_rx) = bounded::<PrefetchRequest>(4);
+        let (_result_tx, result_rx) = unbounded::<PrefetchResult>();
+        let (_done_tx, done_rx) = bounded::<()>(1);
+        let mut prefetch = TemplatePrefetch {
+            handle: None,
+            request_tx: Some(request_tx),
+            result_rx,
+            done_rx,
+            inflight_tip_sequence: None,
+            desired_tip_sequence: None,
+            desired_address: Some("test_addr".to_string()),
+        };
+
+        // First call sets the address
+        prefetch.request_if_idle(1, Some("test_addr"));
+        assert_eq!(prefetch.desired_address.as_deref(), Some("test_addr"));
+        assert_eq!(prefetch.inflight_tip_sequence, Some(1));
     }
 }

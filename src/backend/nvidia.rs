@@ -46,7 +46,8 @@ const NVIDIA_AUTOTUNE_REGCAP_CANDIDATES_AMPERE_PLUS: &[u32] =
     &[240, 224, 208, 192, 176, 160, 144, 128];
 const NVIDIA_AUTOTUNE_REGCAP_CANDIDATES_LEGACY: &[u32] =
     &[224, 208, 192, 176, 160, 144, 128, 112, 96];
-const NVIDIA_AUTOTUNE_LOOP_UNROLL_CANDIDATES: &[bool] = &[false];
+// Retained for reference; the staged autotune no longer iterates this axis.
+const _NVIDIA_AUTOTUNE_LOOP_UNROLL_CANDIDATES: &[bool] = &[false];
 const DEFAULT_NVIDIA_AUTOTUNE_SAMPLES: u32 = 2;
 const NVIDIA_MEMORY_RESERVE_MIB_FLOOR: u64 = 64;
 const NVIDIA_MEMORY_RESERVE_RATIO_DENOM: u64 = 64;
@@ -62,6 +63,12 @@ const ADAPTIVE_DEPTH_PRESSURE_DECAY_PER_BATCH: u32 = 1;
 const ADAPTIVE_DEPTH_DEADLINE_SLACK_FRAC: f64 = 0.75;
 const ADAPTIVE_DEPTH_DEADLINE_LAUNCH_HEADROOM_FRAC: f64 = 0.95;
 const ADAPTIVE_DEPTH_HASH_EMA_ALPHA: f64 = 0.25;
+const CUDA_TRANSIENT_RETRY_COUNT: u32 = 3;
+const CUDA_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(100),
+    Duration::from_millis(500),
+    Duration::from_millis(2000),
+];
 
 fn default_hashes_per_launch_per_lane() -> u32 {
     DEFAULT_HASHES_PER_LAUNCH_PER_LANE
@@ -318,6 +325,8 @@ struct CudaArgon2Engine {
     host_completed_iters: [u32; 1],
     host_found_index: [u32; 1],
     fused_target_check: bool,
+    last_header_base_ptr: usize,
+    last_target_ptr: usize,
 }
 
 impl CudaArgon2Engine {
@@ -462,7 +471,7 @@ impl CudaArgon2Engine {
                         }
                         Err(err)
                             if lanes > 1
-                                && format!("{err:?}").contains("CUDA_ERROR_OUT_OF_MEMORY") =>
+                                && is_cuda_oom_error(&err) =>
                         {
                             continue;
                         }
@@ -474,7 +483,7 @@ impl CudaArgon2Engine {
                     }
                 }
                 Err(err)
-                    if lanes > 1 && format!("{err:?}").contains("CUDA_ERROR_OUT_OF_MEMORY") =>
+                    if lanes > 1 && is_cuda_oom_error(&err) =>
                 {
                     continue;
                 }
@@ -526,6 +535,8 @@ impl CudaArgon2Engine {
             host_completed_iters: [0u32; 1],
             host_found_index: [u32::MAX; 1],
             fused_target_check,
+            last_header_base_ptr: 0,
+            last_target_ptr: 0,
         })
     }
 
@@ -586,14 +597,18 @@ impl CudaArgon2Engine {
         }
 
         let requested_hashes = nonces.len();
-        {
-            let mut header_view = self
-                .header_base_input
-                .try_slice_mut(0..POW_HEADER_BASE_LEN)
-                .ok_or_else(|| anyhow!("failed to slice CUDA header buffer"))?;
-            self.stream
-                .memcpy_htod(header_base, &mut header_view)
-                .map_err(cuda_driver_err)?;
+        let header_ptr = header_base.as_ptr() as usize;
+        if header_ptr != self.last_header_base_ptr {
+            {
+                let mut header_view = self
+                    .header_base_input
+                    .try_slice_mut(0..POW_HEADER_BASE_LEN)
+                    .ok_or_else(|| anyhow!("failed to slice CUDA header buffer"))?;
+                self.stream
+                    .memcpy_htod(header_base, &mut header_view)
+                    .map_err(cuda_driver_err)?;
+            }
+            self.last_header_base_ptr = header_ptr;
         }
         {
             let mut nonce_view = self
@@ -628,14 +643,18 @@ impl CudaArgon2Engine {
         }
         let use_fused_target_check = target.is_some() && self.fused_target_check;
         if let Some(target_hash) = target {
-            {
-                let mut target_view = self
-                    .target_input
-                    .try_slice_mut(0..POW_OUTPUT_LEN)
-                    .ok_or_else(|| anyhow!("failed to slice CUDA target buffer"))?;
-                self.stream
-                    .memcpy_htod(target_hash, &mut target_view)
-                    .map_err(cuda_driver_err)?;
+            let target_ptr = target_hash.as_ptr() as usize;
+            if target_ptr != self.last_target_ptr {
+                {
+                    let mut target_view = self
+                        .target_input
+                        .try_slice_mut(0..POW_OUTPUT_LEN)
+                        .ok_or_else(|| anyhow!("failed to slice CUDA target buffer"))?;
+                    self.stream
+                        .memcpy_htod(target_hash, &mut target_view)
+                        .map_err(cuda_driver_err)?;
+                }
+                self.last_target_ptr = target_ptr;
             }
             if use_fused_target_check {
                 self.host_found_index[0] = u32::MAX;
@@ -1624,6 +1643,7 @@ fn worker_loop(
     let mut control_open = true;
     let mut running = true;
     let mut adaptive_pressure = 0u32;
+    let mut transient_retries: u32 = 0;
     let mut nonce_buf = vec![0u64; engine.max_hashes_per_launch()];
     let max_launch_depth = engine.max_hashes_per_launch_per_lane().max(1);
 
@@ -1919,12 +1939,25 @@ fn worker_loop(
             &nonce_buf[..hashes_per_batch],
             Some(&current.work.template.target),
         ) {
-            Ok(done) => done,
+            Ok(done) => {
+                transient_retries = 0;
+                done
+            }
             Err(err) => {
+                let err_msg = format!("{err:#}");
+                if is_transient_cuda_error(&err_msg) && transient_retries < CUDA_TRANSIENT_RETRY_COUNT {
+                    transient_retries += 1;
+                    let delay = CUDA_TRANSIENT_RETRY_DELAYS
+                        .get(transient_retries as usize - 1)
+                        .copied()
+                        .unwrap_or(CUDA_TRANSIENT_RETRY_DELAYS[CUDA_TRANSIENT_RETRY_DELAYS.len() - 1]);
+                    thread::sleep(delay);
+                    continue;
+                }
                 emit_worker_error(
                     &shared,
                     &instance_id,
-                    format!("CUDA batch execution failed: {err:#}"),
+                    format!("CUDA batch execution failed: {err_msg}"),
                 );
                 break;
             }
@@ -2180,10 +2213,8 @@ fn send_backend_event(shared: &NvidiaShared, event: BackendEvent) {
 
     match outbound.send_timeout(event, EVENT_SEND_WAIT) {
         Ok(()) => {}
-        Err(SendTimeoutError::Timeout(returned)) => {
-            if outbound.send(returned).is_err() {
-                shared.dropped_events.fetch_add(1, Ordering::Relaxed);
-            }
+        Err(SendTimeoutError::Timeout(_)) => {
+            shared.dropped_events.fetch_add(1, Ordering::Relaxed);
         }
         Err(SendTimeoutError::Disconnected(_)) => {
             shared.dropped_events.fetch_add(1, Ordering::Relaxed);
@@ -2208,6 +2239,18 @@ fn emit_worker_error(shared: &NvidiaShared, instance_id: &AtomicU64, message: St
 
 fn cuda_driver_err(err: DriverError) -> anyhow::Error {
     anyhow!("CUDA driver error: {err:?}")
+}
+
+fn is_transient_cuda_error(msg: &str) -> bool {
+    msg.contains("LAUNCH_TIMEOUT")
+        || msg.contains("ECC_UNCORRECTABLE")
+        || msg.contains("NOT_READY")
+        || msg.contains("OPERATING_SYSTEM")
+}
+
+fn is_cuda_oom_error(err: &dyn std::fmt::Debug) -> bool {
+    let msg = format!("{err:?}");
+    msg.contains("OUT_OF_MEMORY") || msg.contains("OutOfMemory")
 }
 
 fn compile_cubin_with_nvrtc(
@@ -2926,7 +2969,6 @@ fn autotune_nvidia_kernel_tuning(
     max_lanes_override: Option<usize>,
     hashes_per_launch_per_lane: u32,
 ) -> Result<NvidiaKernelTuning> {
-    let mut best: Option<(NvidiaKernelTuning, f64, f64, f64, f64)> = None;
     let cubin_cache_dir = derive_nvidia_cubin_cache_dir(cache_path);
     let sample_count = autotune_samples.max(1);
     let (compute_cap_major, _) = query_cuda_compute_capability(selected.index).unwrap_or((0, 0));
@@ -2938,94 +2980,126 @@ fn autotune_nvidia_kernel_tuning(
     let hash_depth_candidates =
         build_autotune_hash_depth_candidates(hashes_per_launch_per_lane.max(1));
 
-    for &max_rregcount in regcap_candidates {
-        for &block_loop_unroll in NVIDIA_AUTOTUNE_LOOP_UNROLL_CANDIDATES {
-            for hashes_per_launch_per_lane in hash_depth_candidates.iter().copied() {
-                for max_lanes_hint in lane_candidates.iter().copied() {
-                    let candidate = NvidiaKernelTuning {
-                        max_rregcount,
-                        block_loop_unroll,
-                        hashes_per_launch_per_lane,
-                        max_lanes_hint,
-                    };
-                    let mut counted_samples = Vec::with_capacity(sample_count as usize);
-                    let mut throughput_samples = Vec::with_capacity(sample_count as usize);
-                    for _ in 0..sample_count {
-                        let measured = match measure_nvidia_kernel_tuning_hps(
-                            selected,
-                            candidate,
-                            autotune_secs,
-                            &cubin_cache_dir,
-                        ) {
-                            Ok(score)
-                                if score.counted_hps.is_finite()
-                                    && score.throughput_hps.is_finite() =>
-                            {
-                                score
-                            }
-                            _ => continue,
-                        };
-                        counted_samples.push(measured.counted_hps.max(0.0));
-                        throughput_samples.push(measured.throughput_hps.max(0.0));
-                    }
-                    if counted_samples.is_empty() {
-                        continue;
-                    }
-                    counted_samples
-                        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    throughput_samples
-                        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    let counted_median = median_from_sorted(&counted_samples);
-                    let counted_mean =
-                        counted_samples.iter().sum::<f64>() / counted_samples.len() as f64;
-                    let throughput_median = median_from_sorted(&throughput_samples);
-                    let throughput_mean =
-                        throughput_samples.iter().sum::<f64>() / throughput_samples.len() as f64;
-                    const EPS: f64 = 1e-9;
-                    let should_replace = match best {
-                        None => true,
-                        Some((
-                            _,
-                            best_counted_median,
-                            best_counted_mean,
-                            best_throughput_median,
-                            best_throughput_mean,
-                        )) => {
-                            if counted_median > best_counted_median + EPS {
-                                true
-                            } else if (counted_median - best_counted_median).abs() <= EPS {
-                                if counted_mean > best_counted_mean + EPS {
-                                    true
-                                } else if (counted_mean - best_counted_mean).abs() <= EPS {
-                                    if throughput_median > best_throughput_median + EPS {
-                                        true
-                                    } else if (throughput_median - best_throughput_median).abs()
-                                        <= EPS
-                                    {
-                                        throughput_mean > best_throughput_mean + EPS
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            }
+    // Stage 1: sweep regcap with default hash depth and lane hint.
+    let default_depth = hashes_per_launch_per_lane.max(1);
+    let mut best: Option<(NvidiaKernelTuning, f64, f64, f64, f64)> = None;
+
+    let evaluate_candidate = |candidate: NvidiaKernelTuning,
+                                   best: &mut Option<(NvidiaKernelTuning, f64, f64, f64, f64)>|
+     -> bool {
+        let mut counted_samples = Vec::with_capacity(sample_count as usize);
+        let mut throughput_samples = Vec::with_capacity(sample_count as usize);
+        for _ in 0..sample_count {
+            let measured = match measure_nvidia_kernel_tuning_hps(
+                selected,
+                candidate,
+                autotune_secs,
+                &cubin_cache_dir,
+            ) {
+                Ok(score) if score.counted_hps.is_finite() && score.throughput_hps.is_finite() => {
+                    score
+                }
+                _ => continue,
+            };
+            counted_samples.push(measured.counted_hps.max(0.0));
+            throughput_samples.push(measured.throughput_hps.max(0.0));
+        }
+        if counted_samples.is_empty() {
+            return false;
+        }
+        counted_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        throughput_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let counted_median = median_from_sorted(&counted_samples);
+        let counted_mean = counted_samples.iter().sum::<f64>() / counted_samples.len() as f64;
+        let throughput_median = median_from_sorted(&throughput_samples);
+        let throughput_mean =
+            throughput_samples.iter().sum::<f64>() / throughput_samples.len() as f64;
+        const EPS: f64 = 1e-9;
+        let should_replace = match best {
+            None => true,
+            Some((_, best_cm, best_cme, best_tm, best_tme)) => {
+                if counted_median > *best_cm + EPS {
+                    true
+                } else if (counted_median - *best_cm).abs() <= EPS {
+                    if counted_mean > *best_cme + EPS {
+                        true
+                    } else if (counted_mean - *best_cme).abs() <= EPS {
+                        if throughput_median > *best_tm + EPS {
+                            true
+                        } else if (throughput_median - *best_tm).abs() <= EPS {
+                            throughput_mean > *best_tme + EPS
+                        } else {
+                            false
                         }
-                    };
-                    if should_replace {
-                        best = Some((
-                            candidate,
-                            counted_median,
-                            counted_mean,
-                            throughput_median,
-                            throughput_mean,
-                        ));
+                    } else {
+                        false
                     }
+                } else {
+                    false
                 }
             }
+        };
+        if should_replace {
+            *best = Some((
+                candidate,
+                counted_median,
+                counted_mean,
+                throughput_median,
+                throughput_mean,
+            ));
+            true
+        } else {
+            false
         }
+    };
+
+    // Stage 1: find best regcap
+    for &max_rregcount in regcap_candidates {
+        let candidate = NvidiaKernelTuning {
+            max_rregcount,
+            block_loop_unroll: false,
+            hashes_per_launch_per_lane: default_depth,
+            max_lanes_hint: None,
+        };
+        evaluate_candidate(candidate, &mut best);
+    }
+
+    let best_regcap = best
+        .as_ref()
+        .map(|(t, ..)| t.max_rregcount)
+        .unwrap_or(DEFAULT_NVIDIA_MAX_RREGCOUNT);
+
+    // Stage 2: find best hash depth using best regcap
+    for depth in hash_depth_candidates.iter().copied() {
+        if depth == default_depth {
+            continue; // already tested in stage 1
+        }
+        let candidate = NvidiaKernelTuning {
+            max_rregcount: best_regcap,
+            block_loop_unroll: false,
+            hashes_per_launch_per_lane: depth,
+            max_lanes_hint: None,
+        };
+        evaluate_candidate(candidate, &mut best);
+    }
+
+    let best_depth = best
+        .as_ref()
+        .map(|(t, ..)| t.hashes_per_launch_per_lane)
+        .unwrap_or(default_depth);
+
+    // Stage 3: find best lane hint using best regcap + depth
+    for max_lanes_hint in lane_candidates.iter().copied() {
+        if max_lanes_hint.is_none() {
+            continue; // already tested
+        }
+        let candidate = NvidiaKernelTuning {
+            max_rregcount: best_regcap,
+            block_loop_unroll: false,
+            hashes_per_launch_per_lane: best_depth,
+            max_lanes_hint,
+        };
+        evaluate_candidate(candidate, &mut best);
     }
 
     let (selected_tuning, measured_hps, _, _, _) = best.ok_or_else(|| {
@@ -3359,5 +3433,77 @@ mod tests {
         assert_eq!(derive_lane_capacity_tier(2_100, 2_097_152), 1);
         assert_eq!(derive_lane_capacity_tier(4_200, 2_097_152), 2);
         assert_eq!(derive_lane_capacity_tier(9_728, 2_097_152), 4);
+    }
+
+    #[test]
+    fn is_transient_cuda_error_classifies_known_transient_errors() {
+        assert!(is_transient_cuda_error("CUDA_ERROR_LAUNCH_TIMEOUT"));
+        assert!(is_transient_cuda_error("something LAUNCH_TIMEOUT happened"));
+        assert!(is_transient_cuda_error("ECC_UNCORRECTABLE error"));
+        assert!(is_transient_cuda_error("NOT_READY"));
+        assert!(is_transient_cuda_error("OPERATING_SYSTEM error"));
+    }
+
+    #[test]
+    fn is_transient_cuda_error_rejects_non_transient_errors() {
+        assert!(!is_transient_cuda_error("CUDA_ERROR_OUT_OF_MEMORY"));
+        assert!(!is_transient_cuda_error("invalid argument"));
+        assert!(!is_transient_cuda_error("kernel launch failed"));
+    }
+
+    #[test]
+    fn is_cuda_oom_error_detects_oom_variants() {
+        assert!(is_cuda_oom_error(&"CUDA_ERROR_OUT_OF_MEMORY"));
+        assert!(is_cuda_oom_error(&"OutOfMemory"));
+        assert!(is_cuda_oom_error(&"some context OUT_OF_MEMORY here"));
+    }
+
+    #[test]
+    fn is_cuda_oom_error_rejects_non_oom() {
+        assert!(!is_cuda_oom_error(&"CUDA_ERROR_LAUNCH_TIMEOUT"));
+        assert!(!is_cuda_oom_error(&"invalid argument"));
+        assert!(!is_cuda_oom_error(&"memory allocation succeeded"));
+    }
+
+    #[test]
+    fn send_backend_event_drops_when_sink_full() {
+        let shared = NvidiaShared {
+            event_sink: Arc::new(RwLock::new(None)),
+            dropped_events: AtomicU64::new(0),
+            hashes: AtomicU64::new(0),
+            active_lanes: AtomicU64::new(0),
+            pending_work: AtomicU64::new(0),
+            inflight_assignment_hashes: AtomicU64::new(0),
+            inflight_assignment_started_at: Mutex::new(None),
+            completed_assignments: AtomicU64::new(0),
+            completed_assignment_hashes: AtomicU64::new(0),
+            completed_assignment_micros: AtomicU64::new(0),
+            active_hashes_per_launch_per_lane: AtomicU32::new(0),
+            cancel_requested: AtomicBool::new(false),
+            error_emitted: AtomicBool::new(false),
+        };
+        let (event_tx, _event_rx) = crossbeam_channel::bounded(1);
+        if let Ok(mut slot) = shared.event_sink.write() {
+            *slot = Some(event_tx.clone());
+        }
+        // Fill the channel
+        let _ = event_tx.try_send(BackendEvent::Error {
+            backend_id: 1,
+            backend: "nvidia",
+            message: "filler".to_string(),
+        });
+        // This should NOT block — it should drop the event
+        send_backend_event(
+            &shared,
+            BackendEvent::Error {
+                backend_id: 2,
+                backend: "nvidia",
+                message: "should be dropped".to_string(),
+            },
+        );
+        assert!(
+            shared.dropped_events.load(Ordering::Acquire) >= 1,
+            "event should be dropped when channel is full instead of blocking"
+        );
     }
 }
