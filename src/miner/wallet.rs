@@ -2,12 +2,15 @@ use std::env;
 use std::fs;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::is_raw_mode_enabled;
 
-use crate::api::{is_wallet_already_loaded_error, ApiClient};
+use crate::api::{
+    is_retryable_api_error, is_timeout_api_error, is_wallet_already_loaded_error, ApiClient,
+};
 use crate::config::Config;
 
 use super::mining_tui::{begin_prompt_session, render_tui_now, set_tui_state_label, TuiDisplay};
@@ -39,6 +42,8 @@ pub(super) fn auto_load_wallet(
     tui: &mut Option<TuiDisplay>,
 ) -> Result<bool> {
     const MAX_PROMPT_ATTEMPTS: u32 = 3;
+    const WALLET_LOAD_RETRY_DELAY: Duration = Duration::from_secs(3);
+    const DAEMON_RETRY_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
     let (mut password, source) = match resolve_wallet_password(cfg)? {
         Some((password, source)) => (password, source),
@@ -50,6 +55,7 @@ pub(super) fn auto_load_wallet(
         }
     };
     let mut prompt_attempt = 1u32;
+    let mut last_transient_log_at: Option<Instant> = None;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -66,6 +72,32 @@ pub(super) fn auto_load_wallet(
                 info("WALLET", "already loaded");
                 password.clear();
                 return Ok(true);
+            }
+            Err(err) if is_retryable_api_error(&err) => {
+                set_tui_state_label(tui, "daemon-syncing");
+                let now = Instant::now();
+                if last_transient_log_at.is_none_or(|last| {
+                    now.saturating_duration_since(last) >= DAEMON_RETRY_LOG_INTERVAL
+                }) {
+                    if is_timeout_api_error(&err) {
+                        warn(
+                            "DAEMON",
+                            "wallet/load timed out; daemon may still be syncing or stalled, retrying with cached wallet password",
+                        );
+                    } else {
+                        warn(
+                            "DAEMON",
+                            "wallet/load temporarily unavailable; daemon may still be syncing or stalled, retrying with cached wallet password",
+                        );
+                    }
+                    last_transient_log_at = Some(now);
+                }
+                render_tui_now(tui);
+                if !sleep_with_shutdown(shutdown, WALLET_LOAD_RETRY_DELAY) {
+                    password.clear();
+                    return Ok(false);
+                }
+                continue;
             }
             Err(err)
                 if source == WalletPasswordSource::Prompt
@@ -128,6 +160,21 @@ fn read_password_file(path: &std::path::Path) -> Result<String> {
     Ok(raw.trim_end_matches(['\r', '\n']).to_string())
 }
 
+fn sleep_with_shutdown(shutdown: &AtomicBool, duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    while !shutdown.load(Ordering::Relaxed) {
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        let sleep_for = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(100));
+        std::thread::sleep(sleep_for);
+    }
+    false
+}
+
 fn prompt_wallet_password(tui: &mut Option<TuiDisplay>) -> Result<Option<String>> {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         return Ok(None);
@@ -136,7 +183,7 @@ fn prompt_wallet_password(tui: &mut Option<TuiDisplay>) -> Result<Option<String>
     let _prompt_guard = begin_prompt_session();
     let raw_mode = is_raw_mode_enabled().unwrap_or(false);
 
-    set_tui_state_label(tui, "awaiting-wallet");
+    set_tui_state_label(tui, "wallet-password-required");
     error(
         "WALLET",
         "ACTION REQUIRED: wallet password needed to continue mining",

@@ -247,6 +247,18 @@ pub fn is_retryable_api_error(err: &anyhow::Error) -> bool {
     })
 }
 
+pub fn is_timeout_api_error(err: &anyhow::Error) -> bool {
+    if let Some(api_err) = err.downcast_ref::<ApiStatusError>() {
+        return api_err.status() == StatusCode::REQUEST_TIMEOUT;
+    }
+
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+    })
+}
+
 fn decode_json_response<T: serde::de::DeserializeOwned>(
     resp: Response,
     endpoint: &str,
@@ -455,5 +467,25 @@ mod tests {
             message: "bad nonce".to_string(),
         });
         assert!(!is_retryable_api_error(&err));
+    }
+
+    #[test]
+    fn timeout_api_error_classifies_request_timeout_status() {
+        let err = anyhow!(ApiStatusError {
+            endpoint: "wallet/load".to_string(),
+            status: StatusCode::REQUEST_TIMEOUT,
+            message: "timeout".to_string(),
+        });
+        assert!(is_timeout_api_error(&err));
+    }
+
+    #[test]
+    fn timeout_api_error_rejects_non_timeout_status() {
+        let err = anyhow!(ApiStatusError {
+            endpoint: "wallet/load".to_string(),
+            status: StatusCode::BAD_GATEWAY,
+            message: "backend down".to_string(),
+        });
+        assert!(!is_timeout_api_error(&err));
     }
 }

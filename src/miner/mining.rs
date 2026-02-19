@@ -1761,10 +1761,10 @@ fn resolve_next_template(
                 return Some(*template);
             }
             PrefetchOutcome::NoWalletLoaded => {
-                set_tui_state_label(tui, "awaiting-wallet");
+                set_tui_state_label(tui, "wallet-required");
                 warn(
                     "WALLET",
-                    "blocktemplate requires loaded wallet; attempting automatic load",
+                    "daemon reports no wallet is loaded; attempting automatic load",
                 );
                 render_tui_now(tui);
                 match auto_load_wallet(client, cfg, shutdown, tui) {
@@ -1809,10 +1809,11 @@ fn resolve_next_template(
                 }
             }
             PrefetchOutcome::Unavailable => {
+                set_tui_state_label(tui, "daemon-unavailable");
                 network_retry.note_failure(
-                    "NETWORK",
-                    "failed to fetch blocktemplate; retrying",
-                    "still failing to fetch blocktemplate; retrying",
+                    "DAEMON",
+                    "daemon did not return blocktemplate; it may still be syncing or unresponsive, retrying",
+                    "daemon still not returning blocktemplate (possibly syncing or unresponsive), retrying",
                     true,
                 );
                 render_tui_now(tui);

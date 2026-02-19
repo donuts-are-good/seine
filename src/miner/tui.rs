@@ -451,6 +451,9 @@ fn draw_stats_wide(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner
         "working" => Color::Rgb(100, 170, 100),
         "stale-tip" | "stale-refresh" => Color::Rgb(200, 170, 80),
         "solved" => Color::Rgb(120, 190, 120),
+        "wallet-required" | "wallet-password-required" => Color::Rgb(220, 170, 90),
+        "daemon-syncing" => Color::Rgb(215, 165, 95),
+        "daemon-unavailable" => Color::Rgb(210, 120, 100),
         _ => Color::Rgb(180, 180, 180),
     };
     let epoch_str = state.epoch.to_string();
