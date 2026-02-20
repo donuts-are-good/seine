@@ -43,6 +43,46 @@ If your daemon is not running yet, or you want to override detection, set these 
 
 Each CPU thread needs ~2 GB RAM (Argon2id parameters). Seine auto-sizes thread count from available cores and memory.
 
+## Linux HugePages (CPU Throughput)
+
+For best CPU mining performance on Linux, reserve explicit HugeTLB pages so each worker can map its Argon2 arena with `MAP_HUGETLB` (the backend falls back to THP if unavailable, which is often slower/inconsistent under fragmentation).
+
+- Sizing rule (2 MB hugepages): `nr_hugepages ~= threads * 1024`
+- Each CPU worker needs about `2 GiB` of hugepages (`1024 * 2 MB`)
+- Add small headroom if possible (for example `+5%`)
+
+Example for `--threads 4`:
+
+```bash
+# 4 workers * 1024 pages/worker = 4096 hugepages (~8 GiB)
+sudo sysctl -w vm.nr_hugepages=4096
+```
+
+If the kernel cannot allocate enough pages (fragmented memory), compact and retry:
+
+```bash
+echo 3 | sudo tee /proc/sys/vm/drop_caches
+echo 1 | sudo tee /proc/sys/vm/compact_memory
+sudo sysctl -w vm.nr_hugepages=4096
+```
+
+Verify reservation:
+
+```bash
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+```
+
+Persist across reboots:
+
+```bash
+echo 'vm.nr_hugepages=4096' | sudo tee /etc/sysctl.d/99-seine-hugepages.conf
+sudo sysctl --system
+```
+
+Runtime checks:
+- Startup warns with exact sizing/commands when HugeTLB is under-provisioned (`hugepages | CPU lanes=... need ...`).
+- Per-backend fallback warnings still appear if a worker falls back from `MAP_HUGETLB` (`MAP_HUGETLB unavailable; hugepage coverage...`).
+
 ## Configuration
 
 ```bash

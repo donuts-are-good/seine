@@ -768,6 +768,7 @@ pub(super) fn prepare_runtime_config(
 ) -> Result<Config> {
     let mut runtime_cfg = cfg.clone();
     maybe_autotune_cpu_threads(&mut runtime_cfg, shutdown, mode)?;
+    maybe_warn_linux_hugepages_setup(&runtime_cfg, mode);
     Ok(runtime_cfg)
 }
 
@@ -1379,6 +1380,132 @@ fn cpu_autotune_host_fingerprint() -> CpuAutotuneHostFingerprint {
         physical_cores: sys.physical_core_count(),
         total_memory_bytes: sys.total_memory(),
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default)]
+struct LinuxHugepagesMeminfo {
+    total_pages: u64,
+    free_pages: u64,
+    reserved_pages: u64,
+    page_size_kib: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn maybe_warn_linux_hugepages_setup(cfg: &Config, mode: RuntimeMode) {
+    let cpu_lanes = cfg
+        .backend_specs
+        .iter()
+        .filter(|spec| spec.kind == BackendKind::Cpu)
+        .map(|spec| spec.cpu_threads.unwrap_or(cfg.threads).max(1) as u64)
+        .sum::<u64>();
+    if cpu_lanes == 0 {
+        return;
+    }
+
+    let Some(meminfo) = read_linux_hugepages_meminfo() else {
+        return;
+    };
+    let page_size_bytes = meminfo.page_size_kib.saturating_mul(1024);
+    if page_size_bytes == 0 {
+        return;
+    }
+
+    let per_lane_pages = div_ceil_u64(CPU_LANE_MEMORY_BYTES, page_size_bytes).max(1);
+    let required_pages = per_lane_pages.saturating_mul(cpu_lanes);
+    let unreserved_pages = meminfo.free_pages.saturating_sub(meminfo.reserved_pages);
+
+    if meminfo.total_pages >= required_pages && unreserved_pages >= required_pages {
+        return;
+    }
+
+    let shortage_pages = required_pages.saturating_sub(unreserved_pages);
+    let min_total_pages = required_pages.max(meminfo.total_pages.saturating_add(shortage_pages));
+    let suggested_pages = min_total_pages.saturating_add(div_ceil_u64(min_total_pages, 20)); // +5% headroom
+    let tag = runtime_mode_tag(mode);
+
+    warn(
+        tag,
+        format!(
+            "hugepages | CPU lanes={} need ~{} HugeTLB pages ({} per lane @ {} KiB/page), but current pool is total={} free={} rsvd={} (usable ~= {}).",
+            cpu_lanes,
+            required_pages,
+            per_lane_pages,
+            meminfo.page_size_kib,
+            meminfo.total_pages,
+            meminfo.free_pages,
+            meminfo.reserved_pages,
+            unreserved_pages,
+        ),
+    );
+    warn(
+        tag,
+        format!(
+            "hugepages | setup: sudo sysctl -w vm.nr_hugepages={}  (minimum: {})",
+            suggested_pages, min_total_pages
+        ),
+    );
+    info(
+        tag,
+        format!(
+            "hugepages | persist: echo 'vm.nr_hugepages={}' | sudo tee /etc/sysctl.d/99-seine-hugepages.conf && sudo sysctl --system",
+            suggested_pages
+        ),
+    );
+    info(
+        tag,
+        "hugepages | docs: see README.md -> \"Linux HugePages (CPU Throughput)\"",
+    );
+    info(
+        tag,
+        "hugepages | if allocation is partial, run: echo 3 | sudo tee /proc/sys/vm/drop_caches && echo 1 | sudo tee /proc/sys/vm/compact_memory",
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn maybe_warn_linux_hugepages_setup(_cfg: &Config, _mode: RuntimeMode) {}
+
+#[cfg(target_os = "linux")]
+fn read_linux_hugepages_meminfo() -> Option<LinuxHugepagesMeminfo> {
+    let content = fs::read_to_string("/proc/meminfo").ok()?;
+    let mut out = LinuxHugepagesMeminfo::default();
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("HugePages_Total:") {
+            out.total_pages = parse_meminfo_u64(rest).unwrap_or(out.total_pages);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("HugePages_Free:") {
+            out.free_pages = parse_meminfo_u64(rest).unwrap_or(out.free_pages);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("HugePages_Rsvd:") {
+            out.reserved_pages = parse_meminfo_u64(rest).unwrap_or(out.reserved_pages);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("Hugepagesize:") {
+            out.page_size_kib = parse_meminfo_u64(rest).unwrap_or(out.page_size_kib);
+        }
+    }
+
+    if out.page_size_kib == 0 {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_meminfo_u64(value: &str) -> Option<u64> {
+    value.split_whitespace().next()?.parse::<u64>().ok()
+}
+
+fn div_ceil_u64(numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 {
+        return 0;
+    }
+    numerator
+        .saturating_add(denominator.saturating_sub(1))
+        .saturating_div(denominator)
 }
 
 fn build_backend_instances(cfg: &Config) -> Vec<(BackendSpec, Arc<dyn PowBackend>)> {

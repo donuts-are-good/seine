@@ -257,14 +257,20 @@ fn emit_linux_hugepage_diagnostics(
         return;
     }
 
-    let pages_needed = (block_bytes + HUGEPAGE_BYTES - 1) / HUGEPAGE_BYTES;
+    let per_worker_pages_needed = (block_bytes + HUGEPAGE_BYTES - 1) / HUGEPAGE_BYTES;
+    let worker_count = shared.hash_slots.len().max(1);
+    let total_pages_needed = per_worker_pages_needed.saturating_mul(worker_count);
     let total_kib = ((block_bytes as u64) + 1023) / 1024;
 
     let Some(mmap_arena) = arena.mmap_ref() else {
         emit_warning(
             shared,
             format!(
-                "mmap allocation unavailable — falling back to heap pages (significant TLB pressure likely, per-worker hugepages needed: {pages_needed})"
+                "mmap allocation unavailable — falling back to heap pages (significant TLB pressure likely). \
+                 HugeTLB target: {} pages for this backend ({} workers x {} pages/worker).",
+                total_pages_needed,
+                worker_count,
+                per_worker_pages_needed
             ),
         );
         return;
@@ -288,11 +294,12 @@ fn emit_linux_hugepage_diagnostics(
         shared,
         format!(
             "MAP_HUGETLB unavailable; hugepage coverage after MADV_HUGEPAGE+MADV_COLLAPSE is {:.1}% ({} / {} MiB). \
-             Throughput may be lower. Fix: reserve hugetlb pages (e.g. sudo sysctl -w vm.nr_hugepages={} per worker) or reduce worker count.",
+             Throughput may be lower. Fix: reserve hugetlb pages (e.g. sudo sysctl -w vm.nr_hugepages={} for this backend; {} per worker) or reduce worker count.",
             pct,
             huge_kib / 1024,
             total_kib / 1024,
-            pages_needed,
+            total_pages_needed,
+            per_worker_pages_needed,
         ),
     );
 }

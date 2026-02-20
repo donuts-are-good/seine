@@ -895,6 +895,11 @@ pub(super) fn run_mining_loop(
     let mut epoch = 0u64;
     let mut last_stats_print = Instant::now();
     let mut tui = init_tui_display(tui_state, Arc::clone(&shutdown));
+    if tui.is_some() {
+        // Re-emit hugepage guidance after TUI state is attached so users see it
+        // in the dashboard log pane (early startup logs happen before TUI attach).
+        super::maybe_warn_linux_hugepages_setup(cfg, RuntimeMode::Mining);
+    }
     let mut backend_weights = seed_backend_weights(backends);
     let mut control_plane = MiningControlPlane::new(client, cfg, Arc::clone(&shutdown), tip_signal);
     let mut dev_fee_tracker = DevFeeTracker::new();
