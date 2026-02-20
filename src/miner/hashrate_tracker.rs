@@ -6,6 +6,9 @@ use crate::backend::BackendInstanceId;
 const CURRENT_WINDOW_SECS: f64 = 5.0;
 const MAX_SAMPLES: usize = 600;
 const MIN_WINDOW_SECS: f64 = 2.0;
+/// Maximum lookback for bursty devices (e.g. GPU) whose hash count is flat
+/// within the standard window.
+const DEVICE_MAX_LOOKBACK_SECS: f64 = 60.0;
 
 #[derive(Clone)]
 struct HashrateSnapshot {
@@ -182,9 +185,45 @@ impl HashrateTracker {
         for (&id, &latest_hashes) in &latest.per_device {
             let oldest_hashes = oldest.per_device.get(&id).copied().unwrap_or(0);
             let dh = latest_hashes.saturating_sub(oldest_hashes);
-            rates.insert(id, dh as f64 / dt);
+            if dh > 0 {
+                rates.insert(id, dh as f64 / dt);
+            } else if latest_hashes > 0 {
+                // Device had no new hashes in the standard window.  This is
+                // common for GPU backends that produce hashes in bursts (the
+                // kernel runs for several seconds between completions).
+                // Extend the lookback to find the last sample where this
+                // device's cumulative count was lower, and compute an
+                // amortized rate over that longer period.
+                if let Some(rate) = self.extended_device_rate(now, latest, id) {
+                    rates.insert(id, rate);
+                }
+            }
         }
         rates
+    }
+
+    /// Walk backwards through the sample buffer for `id` to find the most
+    /// recent snapshot where its cumulative hash count was lower than in
+    /// `latest`.  Returns the amortized rate from that point up to `now`.
+    fn extended_device_rate(
+        &self,
+        now: Instant,
+        latest: &HashrateSnapshot,
+        id: BackendInstanceId,
+    ) -> Option<f64> {
+        let latest_hashes = latest.per_device.get(&id).copied().unwrap_or(0);
+        for sample in self.samples.iter().rev().skip(1) {
+            let dt = now.duration_since(sample.time).as_secs_f64();
+            if dt > DEVICE_MAX_LOOKBACK_SECS {
+                return None;
+            }
+            let sample_hashes = sample.per_device.get(&id).copied().unwrap_or(0);
+            if sample_hashes < latest_hashes && dt >= MIN_WINDOW_SECS {
+                let dh = latest_hashes.saturating_sub(sample_hashes);
+                return Some(dh as f64 / dt);
+            }
+        }
+        None
     }
 }
 
@@ -274,5 +313,70 @@ mod tests {
 
         assert!(nvidia_avg > 70.0);
         assert!(cpu_avg_after > 0.0);
+    }
+
+    #[test]
+    fn bursty_device_shows_nonzero_current_rate_between_bursts() {
+        // Simulates GPU + CPU: GPU produces hashes in bursts while CPU
+        // produces continuously.  Between GPU bursts, the GPU's per-device
+        // current rate should use extended lookback instead of showing 0.
+        let mut tracker = HashrateTracker::new();
+        let round_start = Instant::now();
+
+        // t=0: CPU-only, GPU not yet producing.
+        let mut device_hashes = BTreeMap::new();
+        device_hashes.insert(1u64, 100u64); // CPU
+        device_hashes.insert(2u64, 0u64); // GPU idle
+        tracker.record(100, round_start, &device_hashes);
+
+        thread::sleep(Duration::from_millis(1100));
+
+        // t≈1.1s: GPU burst of 500 hashes arrives.
+        device_hashes.insert(1u64, 200u64);
+        device_hashes.insert(2u64, 500u64);
+        tracker.record(700, round_start, &device_hashes);
+
+        thread::sleep(Duration::from_millis(1100));
+
+        // t≈2.2s: CPU progressed, GPU still idle (same cumulative).
+        device_hashes.insert(1u64, 300u64);
+        // GPU stays at 500
+        tracker.record(800, round_start, &device_hashes);
+
+        thread::sleep(Duration::from_millis(1100));
+
+        // t≈3.3s: CPU progressed more, GPU still idle.
+        device_hashes.insert(1u64, 400u64);
+        tracker.record(900, round_start, &device_hashes);
+
+        thread::sleep(Duration::from_millis(1100));
+
+        // t≈4.4s: CPU progressed more, GPU still idle.
+        device_hashes.insert(1u64, 500u64);
+        tracker.record(1000, round_start, &device_hashes);
+
+        thread::sleep(Duration::from_millis(1100));
+
+        // t≈5.5s: CPU progressed more, GPU still idle.
+        // Now the 5-second window (t≈0.5 to t≈5.5) has GPU flat at 500
+        // across most samples.
+        device_hashes.insert(1u64, 600u64);
+        tracker.record(1100, round_start, &device_hashes);
+
+        let rates = tracker.rates();
+        let gpu_current = rates.current_per_device.get(&2u64).copied().unwrap_or(0.0);
+        let cpu_current = rates.current_per_device.get(&1u64).copied().unwrap_or(0.0);
+
+        // CPU should show a normal rate from the 5-second window.
+        assert!(
+            cpu_current > 0.0,
+            "CPU current rate should be non-zero, got {cpu_current}"
+        );
+        // GPU should show a non-zero amortized rate via extended lookback
+        // rather than 0.
+        assert!(
+            gpu_current > 0.0,
+            "GPU current rate should be non-zero via extended lookback, got {gpu_current}"
+        );
     }
 }
