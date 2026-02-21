@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seine.blocknet/schemas/runtime-state.schema.json",
+  "$defs": {
+    "RuntimeState": {
+      "type": "object",
+      "required": [
+        "lifecycle",
+        "run_id",
+        "running",
+        "pending_wallet_password",
+        "pending_nvidia_count",
+        "dev_fee_percent",
+        "dev_fee_mode",
+        "dev_fee_address",
+        "backend_phases",
+        "metrics",
+        "recent_logs"
+      ],
+      "properties": {
+        "lifecycle": {
+          "type": "string",
+          "enum": ["idle", "starting", "running", "stopping", "error"]
+        },
+        "run_id": { "type": "integer", "minimum": 0 },
+        "running": { "type": "boolean" },
+        "started_at_unix_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "stopped_at_unix_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "last_error": { "type": ["string", "null"] },
+        "pending_wallet_password": { "type": "boolean" },
+        "pending_nvidia_count": { "type": "integer", "minimum": 0 },
+        "dev_fee_percent": { "type": "number", "minimum": 0 },
+        "dev_fee_mode": { "type": "string", "enum": ["user", "dev"] },
+        "dev_fee_address": { "type": "string" },
+        "effective_config": { "type": ["object", "null"], "additionalProperties": true },
+        "backend_phases": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "metrics": {
+          "type": "object",
+          "required": [
+            "start_requests",
+            "stop_requests",
+            "restart_requests",
+            "live_config_patches",
+            "wallet_unlock_requests",
+            "log_events",
+            "accepted_blocks",
+            "submitted_blocks",
+            "stale_submits",
+            "backend_quarantines"
+          ],
+          "properties": {
+            "start_requests": { "type": "integer", "minimum": 0 },
+            "stop_requests": { "type": "integer", "minimum": 0 },
+            "restart_requests": { "type": "integer", "minimum": 0 },
+            "live_config_patches": { "type": "integer", "minimum": 0 },
+            "wallet_unlock_requests": { "type": "integer", "minimum": 0 },
+            "log_events": { "type": "integer", "minimum": 0 },
+            "accepted_blocks": { "type": "integer", "minimum": 0 },
+            "submitted_blocks": { "type": "integer", "minimum": 0 },
+            "stale_submits": { "type": "integer", "minimum": 0 },
+            "backend_quarantines": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "recent_logs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["elapsed_secs", "level", "tag", "message"],
+            "properties": {
+              "elapsed_secs": { "type": "number", "minimum": 0 },
+              "level": { "type": "string" },
+              "tag": { "type": "string" },
+              "message": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

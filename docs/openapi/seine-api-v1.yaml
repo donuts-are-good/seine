@@ -1,0 +1,269 @@
+openapi: 3.1.0
+info:
+  title: Seine Control API
+  version: "1.0.0"
+  description: >-
+    Control and observability API for the Seine miner runtime.
+    This API is local-first, supports sparse config overrides, and exposes streaming runtime events.
+servers:
+  - url: http://127.0.0.1:9977
+tags:
+  - name: Health
+  - name: Runtime
+  - name: Miner
+  - name: Wallet
+  - name: Events
+  - name: Metrics
+paths:
+  /v1/health:
+    get:
+      tags: [Health]
+      summary: Health check
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /v1/runtime/state:
+    get:
+      tags: [Runtime]
+      summary: Get runtime state snapshot
+      responses:
+        '200':
+          description: Runtime snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeState'
+  /v1/runtime/config/defaults:
+    get:
+      tags: [Runtime]
+      summary: Get baseline/default config
+      responses:
+        '200':
+          description: Baseline config
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigEnvelope'
+  /v1/runtime/config/effective:
+    get:
+      tags: [Runtime]
+      summary: Get current effective config
+      responses:
+        '200':
+          description: Effective config
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigEnvelope'
+  /v1/miner/start:
+    post:
+      tags: [Miner]
+      summary: Start mining session
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartRequest'
+      responses:
+        '200':
+          description: Start requested
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: Already running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+  /v1/miner/stop:
+    post:
+      tags: [Miner]
+      summary: Stop mining session
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StopRequest'
+      responses:
+        '200':
+          description: Stop requested
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionResponse'
+  /v1/miner/restart:
+    post:
+      tags: [Miner]
+      summary: Restart mining session
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartRequest'
+      responses:
+        '200':
+          description: Restart requested
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+  /v1/miner/live-config:
+    patch:
+      tags: [Miner]
+      summary: Patch live config (safe/next-start semantics)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartRequest'
+      responses:
+        '200':
+          description: Patch handled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+  /v1/backends:
+    get:
+      tags: [Runtime]
+      summary: Get backend phase/visibility snapshot
+      responses:
+        '200':
+          description: Backend state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackendsResponse'
+  /v1/wallet/unlock:
+    post:
+      tags: [Wallet]
+      summary: Store wallet password for future session startup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WalletUnlockRequest'
+      responses:
+        '200':
+          description: Password accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+  /v1/events/stream:
+    get:
+      tags: [Events]
+      summary: Subscribe to runtime event stream (SSE)
+      responses:
+        '200':
+          description: Event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Server-Sent Events; each event payload is JSON.
+  /metrics:
+    get:
+      tags: [Metrics]
+      summary: Prometheus metrics
+      responses:
+        '200':
+          description: Metrics text
+          content:
+            text/plain:
+              schema:
+                type: string
+components:
+  schemas:
+    ErrorBody:
+      $ref: '../schemas/action-response.schema.json#/$defs/ErrorBody'
+    ActionResponse:
+      $ref: '../schemas/action-response.schema.json#/$defs/ActionResponse'
+    RuntimeState:
+      $ref: '../schemas/runtime-state.schema.json#/$defs/RuntimeState'
+    HealthResponse:
+      type: object
+      required: [status, version, started_unix_ms, now_unix_ms]
+      properties:
+        status: { type: string, enum: [ok] }
+        version: { type: string }
+        started_unix_ms: { type: integer, minimum: 0 }
+        now_unix_ms: { type: integer, minimum: 0 }
+    ConfigEnvelope:
+      type: object
+      required: [config]
+      properties:
+        config:
+          $ref: '#/components/schemas/RuntimeConfig'
+    RuntimeConfig:
+      type: object
+      additionalProperties: true
+      description: Effective config snapshot. See runtime-state schema for representative fields.
+    StartRequest:
+      $ref: '../schemas/start-request.schema.json#/$defs/StartRequest'
+    StopRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        wait_ms:
+          type: integer
+          minimum: 1
+    WalletUnlockRequest:
+      type: object
+      additionalProperties: false
+      required: [password]
+      properties:
+        password:
+          type: string
+          minLength: 1
+    BackendsResponse:
+      type: object
+      required: [pending_nvidia_count, backend_phases, configured_backends]
+      properties:
+        pending_nvidia_count:
+          type: integer
+          minimum: 0
+        backend_phases:
+          type: object
+          additionalProperties:
+            type: string
+        configured_backends:
+          type: array
+          items:
+            type: object
+            additionalProperties: true

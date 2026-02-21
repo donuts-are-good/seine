@@ -123,6 +123,43 @@ Runtime checks:
 ./seine --ui plain
 ```
 
+## Control API
+
+Seine now supports a local control API for alternative frontends.
+
+### Service mode (idle until API start)
+
+```bash
+./seine --service --api-bind 127.0.0.1:9977 --token <daemon-token>
+```
+
+Then start mining via API:
+
+```bash
+curl -s -X POST http://127.0.0.1:9977/v1/miner/start \
+  -H 'content-type: application/json' \
+  -d '{}'
+```
+
+### Embedded mode (mine immediately + expose API)
+
+```bash
+./seine --api-server --api-bind 127.0.0.1:9977
+```
+
+`/v1/miner/start` accepts `token` or `cookie_path` when you want to inject daemon auth at runtime.
+
+Key endpoints:
+- `GET /v1/runtime/state`
+- `POST /v1/miner/start`
+- `POST /v1/miner/stop`
+- `GET /v1/events/stream` (SSE)
+- `GET /metrics`
+
+Control API endpoints are open by default; no API key is required.
+
+See `docs/openapi/seine-api-v1.yaml` and `docs/llm/`.
+
 Password sources (checked in order): `--wallet-password`, `--wallet-password-file`, `SEINE_WALLET_PASSWORD` env var, interactive prompt.
 
 ## GPU Mining

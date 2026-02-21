@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use crate::api::ApiClient;
 use crate::config::read_token_from_cookie_file;
+use crate::daemon_api::ApiClient;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) enum TokenRefreshOutcome {

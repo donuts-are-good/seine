@@ -16,7 +16,7 @@ mod submit;
 mod template_prefetch;
 mod tip;
 mod tui;
-mod ui;
+pub(crate) mod ui;
 mod wallet;
 mod work_allocator;
 
@@ -33,7 +33,6 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
 
-use crate::api::ApiClient;
 use crate::backend::cpu::{CpuBackend, CpuBackendTuning};
 use crate::backend::metal::MetalBackend;
 use crate::backend::nvidia::{NvidiaBackend, NvidiaBackendTuningOptions};
@@ -45,6 +44,7 @@ use crate::backend::{
 use crate::config::{
     BackendKind, BackendSpec, Config, CpuPerformanceProfile, UiMode, WorkAllocation,
 };
+use crate::daemon_api::ApiClient;
 use scheduler::NonceReservation;
 use stats::{format_hashrate, Stats};
 use tui::{new_tui_state, TuiState};
@@ -2877,6 +2877,12 @@ mod tests {
             sse_enabled: true,
             refresh_on_same_height: false,
             ui_mode: crate::config::UiMode::Plain,
+            api_server_enabled: false,
+            service_mode: false,
+            api_bind: "127.0.0.1:9977".to_string(),
+            api_allow_unsafe_bind: false,
+            api_cors: "*".to_string(),
+            allow_wallet_prompt: true,
             bench: false,
             bench_kind: crate::config::BenchKind::Backend,
             bench_secs: 20,

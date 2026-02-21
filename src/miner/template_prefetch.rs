@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 
-use crate::api::{is_no_wallet_loaded_error, is_unauthorized_error, ApiClient};
 use crate::config::Config;
+use crate::daemon_api::{is_no_wallet_loaded_error, is_unauthorized_error, ApiClient};
 use crate::types::BlockTemplateResponse;
 
 use super::auth::{refresh_api_token_from_cookie, TokenRefreshOutcome};

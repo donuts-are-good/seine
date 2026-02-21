@@ -1,6 +1,7 @@
-mod api;
 mod backend;
 mod config;
+mod control_api;
+mod daemon_api;
 mod dev_fee;
 mod miner;
 mod types;
@@ -31,6 +32,10 @@ fn run() -> Result<()> {
                 std::process::exit(130);
             }
         })?;
+    }
+
+    if cfg.api_server_enabled || cfg.service_mode {
+        return control_api::run(cfg, shutdown);
     }
 
     miner::run(&cfg, shutdown)

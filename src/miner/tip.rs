@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError};
 use serde_json::Value;
 
-use crate::api::{is_unauthorized_error, ApiClient};
+use crate::daemon_api::{is_unauthorized_error, ApiClient};
 
 use super::auth::{refresh_api_token_from_cookie, TokenRefreshOutcome};
 use super::ui::{success, warn};

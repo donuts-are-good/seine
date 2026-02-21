@@ -442,6 +442,26 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = UiMode::Auto)]
     ui: UiMode,
 
+    /// Start local control API server alongside miner operation.
+    #[arg(long, default_value_t = false)]
+    api_server: bool,
+
+    /// API service mode: start local control API and wait for start commands.
+    #[arg(long, default_value_t = false)]
+    service: bool,
+
+    /// Bind address for local control API server.
+    #[arg(long, default_value = "127.0.0.1:9977")]
+    api_bind: String,
+
+    /// Allow non-loopback API bind addresses.
+    #[arg(long, default_value_t = false)]
+    api_allow_unsafe_bind: bool,
+
+    /// CORS allow-origin value for control API responses.
+    #[arg(long, default_value = "*")]
+    api_cors: String,
+
     /// Run local performance benchmark instead of mining over API.
     #[arg(long, default_value_t = false)]
     bench: bool,
@@ -538,6 +558,12 @@ pub struct Config {
     pub sse_enabled: bool,
     pub refresh_on_same_height: bool,
     pub ui_mode: UiMode,
+    pub api_server_enabled: bool,
+    pub service_mode: bool,
+    pub api_bind: String,
+    pub api_allow_unsafe_bind: bool,
+    pub api_cors: String,
+    pub allow_wallet_prompt: bool,
     pub bench: bool,
     pub bench_kind: BenchKind,
     pub bench_secs: u64,
@@ -667,6 +693,9 @@ impl Config {
         if cli.strict_round_accounting && cli.relaxed_accounting {
             bail!("cannot use both --strict-round-accounting and --relaxed-accounting");
         }
+        if cli.service && cli.bench {
+            bail!("--service cannot be combined with --bench");
+        }
         if let Some(threshold) = cli.bench_fail_below_pct {
             if !cli.bench {
                 bail!("--bench-fail-below-pct can only be used with --bench");
@@ -754,9 +783,18 @@ impl Config {
         } else {
             detect_daemon_context()
         };
+        let api_server_enabled = cli.api_server || cli.service;
+        if api_server_enabled && !cli.api_allow_unsafe_bind && !is_loopback_bind(&cli.api_bind) {
+            bail!(
+                "api-bind '{}' is not loopback; pass --api-allow-unsafe-bind to allow non-loopback binding",
+                cli.api_bind
+            );
+        }
 
         let (token, token_cookie_path) = if cli.bench {
             (None, None)
+        } else if cli.service {
+            resolve_service_token_with_source(&cli, daemon_context.as_ref())?
         } else {
             let (token, cookie_path) = resolve_token_with_source(&cli, daemon_context.as_ref())?;
             (Some(token), cookie_path)
@@ -832,6 +870,12 @@ impl Config {
             sse_enabled: !cli.disable_sse,
             refresh_on_same_height: cli.refresh_on_same_height,
             ui_mode: cli.ui,
+            api_server_enabled,
+            service_mode: cli.service,
+            api_bind: cli.api_bind,
+            api_allow_unsafe_bind: cli.api_allow_unsafe_bind,
+            api_cors: cli.api_cors,
+            allow_wallet_prompt: true,
             bench: cli.bench,
             bench_kind: cli.bench_kind,
             bench_secs: cli.bench_secs.max(1),
@@ -991,6 +1035,40 @@ fn resolve_token_with_source(
          You can point to it manually with:\n  \
          seine --cookie /path/to/api.cookie"
     );
+}
+
+fn resolve_service_token_with_source(
+    cli: &Cli,
+    daemon_context: Option<&DaemonContext>,
+) -> Result<(Option<String>, Option<PathBuf>)> {
+    if let Some(token) = &cli.token {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            bail!("--token is empty");
+        }
+        return Ok((Some(trimmed.to_string()), None));
+    }
+
+    if let Some(cookie) = &cli.cookie {
+        let token = read_token_from_cookie_file(cookie)?;
+        return Ok((Some(token), Some(cookie.clone())));
+    }
+
+    let mut candidates: Vec<PathBuf> = vec![cli.daemon_dir.join("api.cookie")];
+    if let Some(context) = daemon_context {
+        let daemon_cookie = context.data_dir.join("api.cookie");
+        if !candidates.contains(&daemon_cookie) {
+            candidates.push(daemon_cookie);
+        }
+    }
+
+    for path in &candidates {
+        if let Ok(token) = read_token_from_cookie_file(path) {
+            return Ok((Some(token), Some(path.clone())));
+        }
+    }
+
+    Ok((None, None))
 }
 
 /// Inspect running processes to find a `blocknet` daemon and resolve runtime context.
@@ -1157,6 +1235,23 @@ fn parse_host_port(authority: &str) -> Option<(String, u16)> {
     let (host, port) = authority.rsplit_once(':')?;
     let port = port.parse::<u16>().ok()?;
     Some((host.to_string(), port))
+}
+
+fn is_loopback_bind(bind: &str) -> bool {
+    let trimmed = bind.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if let Ok(socket_addr) = trimmed.parse::<std::net::SocketAddr>() {
+        return socket_addr.ip().is_loopback();
+    }
+
+    let Some((host, _)) = parse_host_port(trimmed) else {
+        return false;
+    };
+    let host = host.trim_matches(['[', ']']).trim().to_ascii_lowercase();
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1")
 }
 
 fn normalize_api_url(input: &str) -> String {
@@ -1598,6 +1693,11 @@ mod tests {
             disable_sse: false,
             refresh_on_same_height: false,
             ui: UiMode::Auto,
+            api_server: false,
+            service: false,
+            api_bind: "127.0.0.1:9977".to_string(),
+            api_allow_unsafe_bind: false,
+            api_cors: "*".to_string(),
             bench: false,
             bench_kind: BenchKind::Backend,
             bench_secs: 20,
@@ -1713,6 +1813,52 @@ mod tests {
         assert_eq!(token, "deadbeef");
         assert_eq!(source.as_deref(), Some(cookie.as_path()));
         let _ = fs::remove_file(cookie);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_service_token_prefers_explicit_token() {
+        let mut cli = sample_cli();
+        cli.service = true;
+        cli.token = Some("  abc123  ".to_string());
+
+        let (token, source) =
+            resolve_service_token_with_source(&cli, None).expect("token should parse");
+        assert_eq!(token.as_deref(), Some("abc123"));
+        assert!(source.is_none());
+    }
+
+    #[test]
+    fn resolve_service_token_reads_cookie_when_present() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let cookie = dir.join("api.cookie");
+        fs::write(&cookie, "deadbeef\n").expect("cookie should be written");
+
+        let mut cli = sample_cli();
+        cli.service = true;
+        cli.daemon_dir = dir.clone();
+
+        let (token, source) =
+            resolve_service_token_with_source(&cli, None).expect("cookie should be read");
+        assert_eq!(token.as_deref(), Some("deadbeef"));
+        assert_eq!(source.as_deref(), Some(cookie.as_path()));
+        let _ = fs::remove_file(cookie);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_service_token_returns_none_when_not_available() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let mut cli = sample_cli();
+        cli.service = true;
+        cli.daemon_dir = dir.clone();
+
+        let (token, source) =
+            resolve_service_token_with_source(&cli, None).expect("missing token is allowed");
+        assert!(token.is_none());
+        assert!(source.is_none());
         let _ = fs::remove_dir_all(dir);
     }
 

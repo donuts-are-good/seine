@@ -7,8 +7,8 @@ use std::time::Duration;
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 
-use crate::api::{is_retryable_api_error, is_unauthorized_error, ApiClient};
 use crate::backend::MiningSolution;
+use crate::daemon_api::{is_retryable_api_error, is_unauthorized_error, ApiClient};
 use crate::types::{
     set_block_nonce, template_height as extract_template_height, BlockTemplateResponse,
     SubmitBlockResponse, TemplateBlock,
@@ -105,7 +105,6 @@ pub(super) enum SubmitOutcome {
         got_height: u64,
     },
     StaleTipError {
-        message: String,
         reason: &'static str,
     },
     TerminalError(String),
@@ -417,8 +416,7 @@ fn stale_submit_outcome(attempts: u32, error_context: &str) -> Option<SubmitOutc
             got_height,
         });
     }
-    parse_stale_tip_reject_reason(&message)
-        .map(|reason| SubmitOutcome::StaleTipError { message, reason })
+    parse_stale_tip_reject_reason(&message).map(|reason| SubmitOutcome::StaleTipError { reason })
 }
 
 /// Infer staleness when the daemon returns a generic rejection (e.g. "block rejected")
@@ -577,7 +575,7 @@ fn handle_submit_result(result: &SubmitResult, stats: &Stats, tui: &mut Option<T
                 ),
             );
         }
-        SubmitOutcome::StaleTipError { message: _, reason } => {
+        SubmitOutcome::StaleTipError { reason } => {
             warn(
                 "SUBMIT",
                 format!("stale solution: template no longer matches current tip ({reason})"),

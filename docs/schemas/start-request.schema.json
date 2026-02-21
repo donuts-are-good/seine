@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seine.blocknet/schemas/start-request.schema.json",
+  "$defs": {
+    "BackendSpecRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["cpu", "nvidia", "metal"] },
+        "device_index": { "type": "integer", "minimum": 0 },
+        "cpu_threads": { "type": "integer", "minimum": 1 },
+        "cpu_affinity": { "type": "string", "enum": ["off", "auto", "pcore-only"] },
+        "assign_timeout_ms_override": { "type": "integer", "minimum": 1 },
+        "control_timeout_ms_override": { "type": "integer", "minimum": 1 },
+        "assign_timeout_strikes_override": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "StartRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "api_url": { "type": "string", "minLength": 1 },
+        "token": { "type": "string", "minLength": 1 },
+        "cookie_path": { "type": "string", "minLength": 1 },
+        "wallet_password": { "type": "string" },
+        "wallet_password_file": { "type": "string", "minLength": 1 },
+        "backend_specs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/BackendSpecRequest" }
+        },
+        "threads": { "type": "integer", "minimum": 1 },
+        "refresh_secs": { "type": "integer", "minimum": 1 },
+        "request_timeout_secs": { "type": "integer", "minimum": 1 },
+        "events_stream_timeout_secs": { "type": "integer", "minimum": 1 },
+        "events_idle_timeout_secs": { "type": "integer", "minimum": 1 },
+        "stats_secs": { "type": "integer", "minimum": 1 },
+        "hash_poll_ms": { "type": "integer", "minimum": 1 },
+        "cpu_hash_batch_size": { "type": "integer", "minimum": 1 },
+        "cpu_control_check_interval_hashes": { "type": "integer", "minimum": 1 },
+        "cpu_hash_flush_ms": { "type": "integer", "minimum": 1 },
+        "cpu_event_dispatch_capacity": { "type": "integer", "minimum": 1 },
+        "cpu_profile": { "type": "string", "enum": ["balanced", "throughput", "efficiency"] },
+        "cpu_affinity": { "type": "string", "enum": ["off", "auto", "pcore-only"] },
+        "cpu_autotune_threads": { "type": "boolean" },
+        "cpu_autotune_min_threads": { "type": "integer", "minimum": 1 },
+        "cpu_autotune_max_threads": { "type": "integer", "minimum": 1 },
+        "cpu_autotune_secs": { "type": "integer", "minimum": 1 },
+        "nvidia_autotune_secs": { "type": "integer", "minimum": 1 },
+        "nvidia_autotune_samples": { "type": "integer", "minimum": 1 },
+        "nvidia_max_rregcount": { "type": "integer", "minimum": 1 },
+        "nvidia_max_lanes": { "type": "integer", "minimum": 1 },
+        "nvidia_dispatch_iters_per_lane": { "type": "integer", "minimum": 1 },
+        "nvidia_allocation_iters_per_lane": { "type": "integer", "minimum": 1 },
+        "nvidia_hashes_per_launch_per_lane": { "type": "integer", "minimum": 1 },
+        "nvidia_fused_target_check": { "type": "boolean" },
+        "nvidia_adaptive_launch_depth": { "type": "boolean" },
+        "nvidia_enforce_template_stop": { "type": "boolean" },
+        "metal_max_lanes": { "type": "integer", "minimum": 1 },
+        "metal_hashes_per_launch_per_lane": { "type": "integer", "minimum": 1 },
+        "backend_assign_timeout_ms": { "type": "integer", "minimum": 1 },
+        "backend_assign_timeout_strikes": { "type": "integer", "minimum": 1 },
+        "backend_control_timeout_ms": { "type": "integer", "minimum": 1 },
+        "allow_best_effort_deadlines": { "type": "boolean" },
+        "prefetch_wait_ms": { "type": "integer", "minimum": 1 },
+        "tip_listener_join_wait_ms": { "type": "integer", "minimum": 1 },
+        "submit_join_wait_ms": { "type": "integer", "minimum": 1 },
+        "strict_round_accounting": { "type": "boolean" },
+        "start_nonce": { "type": "integer", "minimum": 0 },
+        "nonce_iters_per_lane": { "type": "integer", "minimum": 1 },
+        "work_allocation": { "type": "string", "enum": ["adaptive", "static"] },
+        "sub_round_rebalance_ms": { "type": "integer", "minimum": 0 },
+        "sse_enabled": { "type": "boolean" },
+        "refresh_on_same_height": { "type": "boolean" },
+        "ui_mode": { "type": "string", "enum": ["auto", "tui", "plain"] }
+      }
+    }
+  }
+}

@@ -8,9 +8,9 @@ use anyhow::{bail, Result};
 use blocknet_pow_spec::POW_HEADER_BASE_LEN;
 use crossbeam_channel::Receiver;
 
-use crate::api::ApiClient;
 use crate::backend::{BackendEvent, MiningSolution};
 use crate::config::{Config, WorkAllocation};
+use crate::daemon_api::ApiClient;
 use crate::dev_fee::DevFeeTracker;
 use crate::types::{
     decode_hex, parse_target, template_difficulty, template_height, BlockTemplateResponse,
@@ -2330,10 +2330,8 @@ mod tests {
             SubmitOutcome::RetryableError(message) => {
                 panic!("expected terminal submit failure, got retryable error: {message}");
             }
-            SubmitOutcome::StaleTipError { message, reason } => {
-                panic!(
-                    "expected terminal submit failure, got stale-tip error ({reason}): {message}"
-                );
+            SubmitOutcome::StaleTipError { reason } => {
+                panic!("expected terminal submit failure, got stale-tip error ({reason})");
             }
             SubmitOutcome::Response(_) => panic!("unauthorized submit should fail"),
         }

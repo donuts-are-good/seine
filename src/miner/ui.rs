@@ -1,5 +1,5 @@
 use std::io::IsTerminal;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use super::tui::{LogEntry, LogLevel, TuiState};
@@ -20,6 +20,17 @@ static COLOR_ENABLED: OnceLock<bool> = OnceLock::new();
 static LOG_START: OnceLock<Instant> = OnceLock::new();
 static OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static TUI_STATE: OnceLock<TuiState> = OnceLock::new();
+static LOG_SINK: OnceLock<Mutex<Option<LogSink>>> = OnceLock::new();
+
+type LogSink = Arc<dyn Fn(UiLogEvent) + Send + Sync + 'static>;
+
+#[derive(Clone)]
+pub(crate) struct UiLogEvent {
+    pub elapsed_secs: f64,
+    pub level: &'static str,
+    pub tag: String,
+    pub message: String,
+}
 
 #[derive(Clone, Copy)]
 enum Level {
@@ -31,6 +42,16 @@ enum Level {
 }
 
 impl Level {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Success => "success",
+            Self::Warn => "warn",
+            Self::Error => "error",
+            Self::Mined => "mined",
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Info => "INFO",
@@ -107,6 +128,11 @@ pub(super) fn set_tui_state(state: TuiState) {
     let _ = TUI_STATE.set(state);
 }
 
+pub(crate) fn set_log_sink(sink: Option<Arc<dyn Fn(UiLogEvent) + Send + Sync + 'static>>) {
+    let mut slot = lock(log_sink_lock());
+    *slot = sink;
+}
+
 fn level_to_tui(level: Level) -> LogLevel {
     match level {
         Level::Info => LogLevel::Info,
@@ -118,12 +144,20 @@ fn level_to_tui(level: Level) -> LogLevel {
 }
 
 fn log(level: Level, tag: &str, message: &str) {
+    let elapsed_secs = log_elapsed().as_secs_f64();
+    emit_log_sink(UiLogEvent {
+        elapsed_secs,
+        level: level.as_str(),
+        tag: tag.to_string(),
+        message: message.to_string(),
+    });
+
     if let Some(tui_state) = TUI_STATE.get() {
         if suppress_in_tui(tag, message) {
             return;
         }
         let entry = LogEntry {
-            elapsed_secs: log_elapsed().as_secs_f64(),
+            elapsed_secs,
             level: level_to_tui(level),
             tag: tag.to_string(),
             message: message.to_string(),
@@ -135,7 +169,7 @@ fn log(level: Level, tag: &str, message: &str) {
     }
 
     let colors = use_color();
-    let time_plain = format!("{:>7.1}s", log_elapsed().as_secs_f64());
+    let time_plain = format!("{:>7.1}s", elapsed_secs);
     let level_plain = format!(" {:^4} ", level.label());
     let tag_plain = format!(" {:<8} ", tag);
     let prefix_plain = format!("{time_plain} {level_plain} {tag_plain}");
@@ -161,6 +195,20 @@ fn log(level: Level, tag: &str, message: &str) {
     } else {
         println!("{prefix} {body}");
     }
+}
+
+fn emit_log_sink(event: UiLogEvent) {
+    let sink = {
+        let slot = lock(log_sink_lock());
+        slot.clone()
+    };
+    if let Some(sink) = sink {
+        sink(event);
+    }
+}
+
+fn log_sink_lock() -> &'static Mutex<Option<LogSink>> {
+    LOG_SINK.get_or_init(|| Mutex::new(None))
 }
 
 fn suppress_in_tui(tag: &str, message: &str) -> bool {

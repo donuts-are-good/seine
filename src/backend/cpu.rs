@@ -664,7 +664,10 @@ fn resolve_affinity_core_ids(mode: CpuAffinityMode) -> Option<Vec<core_affinity:
     if mode == CpuAffinityMode::Off {
         return None;
     }
+    #[cfg(target_os = "macos")]
     let mut core_ids = core_affinity::get_core_ids().filter(|ids| !ids.is_empty())?;
+    #[cfg(not(target_os = "macos"))]
+    let core_ids = core_affinity::get_core_ids().filter(|ids| !ids.is_empty())?;
     if mode == CpuAffinityMode::PcoreOnly {
         #[cfg(target_os = "macos")]
         if let Some(pcore_count) = macos_pcore_count() {

@@ -8,10 +8,10 @@ use anyhow::{bail, Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::is_raw_mode_enabled;
 
-use crate::api::{
+use crate::config::Config;
+use crate::daemon_api::{
     is_retryable_api_error, is_timeout_api_error, is_wallet_already_loaded_error, ApiClient,
 };
-use crate::config::Config;
 
 use super::mining_tui::{begin_prompt_session, render_tui_now, set_tui_state_label, TuiDisplay};
 use super::ui::{error, info, success, warn};
@@ -48,6 +48,9 @@ pub(super) fn auto_load_wallet(
     let (mut password, source) = match resolve_wallet_password(cfg)? {
         Some((password, source)) => (password, source),
         None => {
+            if !cfg.allow_wallet_prompt {
+                return Ok(false);
+            }
             let Some(password) = prompt_wallet_password(tui)? else {
                 return Ok(false);
             };

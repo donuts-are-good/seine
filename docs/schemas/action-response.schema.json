@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seine.blocknet/schemas/action-response.schema.json",
+  "$defs": {
+    "ErrorBody": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "ActionResponse": {
+      "type": "object",
+      "required": ["ok", "message", "requires_restart", "state"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "message": { "type": "string" },
+        "requires_restart": { "type": "boolean" },
+        "state": {
+          "$ref": "./runtime-state.schema.json#/$defs/RuntimeState"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
