@@ -42,17 +42,24 @@ cargo build --release
 ./target/release/seine
 ```
 
-Zero-argument mode is the default path. Seine auto-resolves:
-- API URL from running daemon args when available (`--api`), else `http://127.0.0.1:8332`
-- auth token from `api.cookie` (auto-discovered from daemon data dir)
-- backends (CPU + NVIDIA when available)
-- CPU threads from available cores and RAM
+### Zero-argument mode (recommended)
+
+Running `./seine` with no flags is the default path.
+Prerequisite: the Blocknet daemon is running with `--api` and has a readable `api.cookie`.
+
+What it auto-detects:
+- daemon API URL from running daemon args (`--api`) when available, else `http://127.0.0.1:8332`
+- daemon auth token from `api.cookie` (using detected daemon data dir, then `--daemon-dir`)
+- mining backends (CPU + NVIDIA when available)
+- CPU thread count from available cores and RAM
 
 If your daemon is not running yet, or you want to override detection, set these explicitly:
 
 ```bash
 ./seine --api-url http://127.0.0.1:8332 --cookie /path/to/data/api.cookie
 ```
+
+Full CLI reference: [`docs/MINER_FLAGS.md`](docs/MINER_FLAGS.md)
 
 ## Requirements
 
@@ -107,6 +114,8 @@ Runtime checks:
 
 ## Configuration
 
+All miner flags are documented in [`docs/MINER_FLAGS.md`](docs/MINER_FLAGS.md).
+
 ```bash
 # Set CPU thread count explicitly
 ./seine --threads 4
@@ -126,6 +135,7 @@ Runtime checks:
 ## Control API
 
 Seine now supports a local control API for alternative frontends.
+Full API docs: [`docs/API.md`](docs/API.md)
 
 ### Service mode (idle until API start)
 
@@ -157,8 +167,6 @@ Key endpoints:
 - `GET /metrics`
 
 Control API endpoints are open by default; no API key is required.
-
-See `docs/openapi/seine-api-v1.yaml` and `docs/llm/`.
 
 Password sources (checked in order): `--wallet-password`, `--wallet-password-file`, `SEINE_WALLET_PASSWORD` env var, interactive prompt.
 
@@ -210,5 +218,8 @@ Run offline benchmarks without a daemon connection:
 ## Further Reading
 
 - [AGENTS.md](AGENTS.md) — Architecture details, tuning knobs, benchmarking harness
+- [docs/MINER_FLAGS.md](docs/MINER_FLAGS.md) — Complete CLI flag reference
+- [docs/API.md](docs/API.md) — Control API guide (REST, SSE, metrics)
+- [docs/openapi/seine-api-v1.yaml](docs/openapi/seine-api-v1.yaml) — OpenAPI specification
 - [CPU_OPTIMIZATION_LOG.md](CPU_OPTIMIZATION_LOG.md) — CPU backend tuning history
 - [NVIDIA_OPTIMIZATION_LOG.md](NVIDIA_OPTIMIZATION_LOG.md) — NVIDIA backend tuning history
