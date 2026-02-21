@@ -2,6 +2,14 @@
 
 This file preserves the full engineering reference for AI agents doing optimization work on seine.
 
+## Agent Formatting Policy
+
+- Use the repository-pinned Rust toolchain for formatting (`rust-toolchain.toml` currently pins `1.93.0`).
+- Run formatting via the pinned toolchain explicitly: `cargo +1.93.0 fmt` (or `rustup run 1.93.0 rustfmt`).
+- Do not run repository-wide formatting (`cargo fmt --all`) unless the user explicitly asks for it.
+- By default, format only the files that were edited for the task.
+- Do not include unrelated formatting-only changes in commits unless the user explicitly requests them.
+
 ## Status
 
 - CPU backend: implemented (Argon2id, consensus-compatible params).

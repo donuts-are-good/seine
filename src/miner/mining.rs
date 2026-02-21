@@ -52,10 +52,9 @@ use super::tui::TuiState;
 use super::ui::{error, info, mined, success, warn};
 use super::wallet::auto_load_wallet;
 use super::{
-    cancel_backend_slots, collect_backend_hashes, distribute_work,
-    format_round_backend_telemetry, next_work_id, quiesce_backend_slots, total_lanes,
-    BackendRoundTelemetry, BackendSlot, RuntimeBackendEventAction, RuntimeMode,
-    TEMPLATE_RETRY_DELAY,
+    cancel_backend_slots, collect_backend_hashes, distribute_work, format_round_backend_telemetry,
+    next_work_id, quiesce_backend_slots, total_lanes, BackendRoundTelemetry, BackendSlot,
+    RuntimeBackendEventAction, RuntimeMode, TEMPLATE_RETRY_DELAY,
 };
 
 type BackendEventAction = RuntimeBackendEventAction;
@@ -371,10 +370,10 @@ impl<'a> MiningControlPlane<'a> {
         &mut self,
         template: SubmitTemplate,
         solution: MiningSolution,
+        is_dev_fee: bool,
         stats: &Stats,
         tui: &mut Option<TuiDisplay>,
     ) -> bool {
-        let is_dev_fee = self.dev_fee_address.is_some();
         let request_id = self.next_submit_request_id();
         if !self.enqueue_submit_request(
             SubmitRequest {
@@ -388,7 +387,9 @@ impl<'a> MiningControlPlane<'a> {
         ) {
             return false;
         }
-        stats.bump_submitted();
+        if !is_dev_fee {
+            stats.bump_submitted();
+        }
         self.flush_submit_backlog();
         self.collect_submit_worker_results(stats, tui);
         true
@@ -593,6 +594,7 @@ struct ExecuteRoundPhase<'a, 'cp> {
     cfg: &'a Config,
     shutdown: &'a Arc<AtomicBool>,
     tip_signal: Option<&'a TipSignal>,
+    is_dev_round: bool,
     epoch: u64,
     work_id: u64,
     stop_at: Instant,
@@ -624,6 +626,7 @@ fn execute_round_phase(phase: ExecuteRoundPhase<'_, '_>) -> Result<()> {
         cfg,
         shutdown,
         tip_signal,
+        is_dev_round,
         epoch,
         work_id,
         stop_at,
@@ -732,7 +735,13 @@ fn execute_round_phase(phase: ExecuteRoundPhase<'_, '_>) -> Result<()> {
             let submit_template = current_submit_template
                 .get_or_insert_with(|| SubmitTemplate::from_template(current_template))
                 .clone();
-            if control_plane.submit_template(submit_template, solution.clone(), stats, tui) {
+            if control_plane.submit_template(
+                submit_template,
+                solution.clone(),
+                is_dev_round,
+                stats,
+                tui,
+            ) {
                 inflight_solution_keys.insert(key);
                 enqueued_solution = Some(solution.clone());
             } else {
@@ -759,6 +768,7 @@ fn execute_round_phase(phase: ExecuteRoundPhase<'_, '_>) -> Result<()> {
             control_plane,
             epoch,
             submit_template,
+            is_dev_round,
             backends,
             DeferredSubmitState {
                 recent_templates,
@@ -833,7 +843,9 @@ fn execute_round_phase(phase: ExecuteRoundPhase<'_, '_>) -> Result<()> {
                 state_label: "solved",
             },
         );
-        mined("SOLVE", format!("solution found! backend={backend_label}"));
+        if !is_dev_round {
+            mined("SOLVE", format!("solution found! backend={backend_label}"));
+        }
     } else if round_state.stale_tip_event {
         update_tui(
             tui,
@@ -1007,8 +1019,9 @@ pub(super) fn run_mining_loop(
 
         let mode_changed = dev_fee_tracker.begin_round();
         control_plane.set_dev_fee_address(dev_fee_tracker.address());
+        let is_dev_round = dev_fee_tracker.is_dev_round();
         if mode_changed {
-            if dev_fee_tracker.is_dev_round() {
+            if is_dev_round {
                 info("DEV FEE", "mining for dev");
             } else {
                 info("DEV FEE", "mining for user");
@@ -1075,6 +1088,7 @@ pub(super) fn run_mining_loop(
             cfg,
             shutdown: &shutdown,
             tip_signal,
+            is_dev_round,
             epoch,
             work_id,
             stop_at,
@@ -1115,6 +1129,7 @@ pub(super) fn run_mining_loop(
             &mut recent_templates_bytes,
             epoch,
             SubmitTemplate::from_template(&template),
+            is_dev_round,
             recent_template_retention,
             recent_template_cache_size,
             recent_template_cache_max_bytes,
@@ -1162,6 +1177,7 @@ pub(super) fn run_mining_loop(
             } else if control_plane.submit_template(
                 final_submit_template.clone(),
                 solution.clone(),
+                dev_fee_tracker.is_dev_round(),
                 &stats,
                 &mut tui,
             ) {
@@ -1186,6 +1202,7 @@ pub(super) fn run_mining_loop(
             &mut control_plane,
             epoch,
             &final_submit_template,
+            dev_fee_tracker.is_dev_round(),
             backends,
             DeferredSubmitState {
                 recent_templates: &recent_templates,
@@ -1936,6 +1953,7 @@ fn process_submit_results(
     stats: &Stats,
 ) {
     let mut accepted_epochs = HashSet::new();
+    let mut user_accepted_epochs = HashSet::new();
     for result in results {
         let key = (result.solution.epoch, result.solution.nonce);
         inflight_solution_keys.remove(&key);
@@ -1943,6 +1961,9 @@ fn process_submit_results(
             SubmitOutcome::Response(resp) => {
                 if resp.accepted {
                     accepted_epochs.insert(result.solution.epoch);
+                    if !result.is_dev_fee {
+                        user_accepted_epochs.insert(result.solution.epoch);
+                    }
                 }
                 remember_submitted_solution(
                     submitted_solution_order,
@@ -1992,6 +2013,8 @@ fn process_submit_results(
         );
         if dropped > 0 {
             stats.add_dropped(dropped);
+        }
+        if dropped > 0 && user_accepted_epochs.contains(&epoch) {
             info(
                 "SUBMIT",
                 format!(
@@ -2057,6 +2080,7 @@ fn submit_deferred_solutions(
     control_plane: &mut MiningControlPlane<'_>,
     current_epoch: u64,
     current_submit_template: &SubmitTemplate,
+    current_is_dev_fee: bool,
     backends: &[BackendSlot],
     state: DeferredSubmitState<'_>,
 ) {
@@ -2073,9 +2097,10 @@ fn submit_deferred_solutions(
         {
             continue;
         }
-        let Some(submit_template) = submit_template_for_solution_epoch(
+        let Some((submit_template, is_dev_fee)) = submit_template_for_solution_epoch(
             current_epoch,
             current_submit_template,
+            current_is_dev_fee,
             state.recent_templates,
             solution.epoch,
         ) else {
@@ -2089,8 +2114,13 @@ fn submit_deferred_solutions(
             state.stats.add_dropped(1);
             continue;
         };
-        if control_plane.submit_template(submit_template, solution.clone(), state.stats, state.tui)
-        {
+        if control_plane.submit_template(
+            submit_template,
+            solution.clone(),
+            is_dev_fee,
+            state.stats,
+            state.tui,
+        ) {
             state.inflight_solution_keys.insert(key);
         } else {
             defer_solution_indexed(
@@ -2773,12 +2803,19 @@ mod tests {
             epoch: 9,
             recorded_at: Instant::now(),
             submit_template: previous,
+            is_dev_fee: true,
             estimated_bytes: 128,
         });
 
-        assert!(submit_template_for_solution_epoch(10, &current, &recent, 10).is_some());
-        assert!(submit_template_for_solution_epoch(10, &current, &recent, 9).is_some());
-        assert!(submit_template_for_solution_epoch(10, &current, &recent, 8).is_none());
+        assert!(
+            submit_template_for_solution_epoch(10, &current, false, &recent, 10)
+                .is_some_and(|(_, is_dev_fee)| !is_dev_fee)
+        );
+        assert!(
+            submit_template_for_solution_epoch(10, &current, false, &recent, 9)
+                .is_some_and(|(_, is_dev_fee)| is_dev_fee)
+        );
+        assert!(submit_template_for_solution_epoch(10, &current, false, &recent, 8).is_none());
     }
 
     #[test]
@@ -2792,6 +2829,7 @@ mod tests {
                 &mut bytes,
                 epoch,
                 SubmitTemplate::from_template(&sample_template("tmpl")),
+                false,
                 Duration::from_secs(60),
                 max_entries,
                 usize::MAX,
@@ -2814,6 +2852,7 @@ mod tests {
             epoch: 1,
             recorded_at: Instant::now() - Duration::from_secs(10),
             submit_template: SubmitTemplate::from_template(&sample_template("old")),
+            is_dev_fee: true,
             estimated_bytes: 256,
         });
         remember_recent_template(
@@ -2821,6 +2860,7 @@ mod tests {
             &mut bytes,
             2,
             SubmitTemplate::from_template(&sample_template("new")),
+            false,
             Duration::from_secs(1),
             64,
             usize::MAX,
@@ -2844,6 +2884,7 @@ mod tests {
                 template_id: "x".repeat(80),
                 template_height: Some(1),
             },
+            false,
             Duration::from_secs(60),
             64,
             max_bytes,
@@ -2856,6 +2897,7 @@ mod tests {
                 template_id: "y".repeat(80),
                 template_height: Some(2),
             },
+            false,
             Duration::from_secs(60),
             64,
             max_bytes,

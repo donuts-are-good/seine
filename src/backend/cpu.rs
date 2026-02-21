@@ -217,11 +217,15 @@ impl CpuBackend {
         self.shared.ready_workers.store(0, Ordering::Release);
         self.shared.startup_failed.store(false, Ordering::Release);
         self.shared.assignment_hashes.store(0, Ordering::Release);
-        self.shared.assignment_generation.store(0, Ordering::Release);
+        self.shared
+            .assignment_generation
+            .store(0, Ordering::Release);
         self.shared
             .assignment_reported_generation
             .store(0, Ordering::Release);
-        self.shared.completed_assignments.store(0, Ordering::Release);
+        self.shared
+            .completed_assignments
+            .store(0, Ordering::Release);
         self.shared
             .completed_assignment_hashes
             .store(0, Ordering::Release);
@@ -1339,7 +1343,10 @@ mod tests {
         // The thread should complete within a bounded time (retries * max_wait ~ 1s)
         // because it gives up after MAX_EVENT_SEND_RETRIES.
         let completed = handle.join().is_ok();
-        assert!(completed, "emit_error should complete after hitting retry limit");
+        assert!(
+            completed,
+            "emit_error should complete after hitting retry limit"
+        );
         assert!(
             backend.shared.dropped_events.load(Ordering::Acquire) >= 1,
             "event should be dropped after max retries exhausted"
@@ -1354,10 +1361,7 @@ mod tests {
         let backend = CpuBackend::new(1, CpuAffinityMode::Off);
         backend.shared.solution_state.store(99, Ordering::SeqCst);
         backend.shared.error_emitted.store(true, Ordering::SeqCst);
-        backend
-            .shared
-            .work_generation
-            .store(42, Ordering::SeqCst);
+        backend.shared.work_generation.store(42, Ordering::SeqCst);
         backend
             .shared
             .assignment_hashes
@@ -1368,9 +1372,6 @@ mod tests {
         assert_eq!(backend.shared.solution_state.load(Ordering::Acquire), 0);
         assert!(!backend.shared.error_emitted.load(Ordering::Acquire));
         assert_eq!(backend.shared.work_generation.load(Ordering::Acquire), 0);
-        assert_eq!(
-            backend.shared.assignment_hashes.load(Ordering::Acquire),
-            0
-        );
+        assert_eq!(backend.shared.assignment_hashes.load(Ordering::Acquire), 0);
     }
 }

@@ -61,8 +61,7 @@ pub fn parse_target(target_hex: &str) -> Result<[u8; 32]> {
         );
     }
     let mut target = [0u8; 32];
-    hex::decode_to_slice(clean, &mut target)
-        .context("failed to decode target hex")?;
+    hex::decode_to_slice(clean, &mut target).context("failed to decode target hex")?;
     Ok(target)
 }
 

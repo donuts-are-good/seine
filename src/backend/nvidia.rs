@@ -469,10 +469,7 @@ impl CudaArgon2Engine {
                             ));
                             break;
                         }
-                        Err(err)
-                            if lanes > 1
-                                && is_cuda_oom_error(&err) =>
-                        {
+                        Err(err) if lanes > 1 && is_cuda_oom_error(&err) => {
                             continue;
                         }
                         Err(err) => {
@@ -482,9 +479,7 @@ impl CudaArgon2Engine {
                         }
                     }
                 }
-                Err(err)
-                    if lanes > 1 && is_cuda_oom_error(&err) =>
-                {
+                Err(err) if lanes > 1 && is_cuda_oom_error(&err) => {
                     continue;
                 }
                 Err(err) => {
@@ -1945,12 +1940,16 @@ fn worker_loop(
             }
             Err(err) => {
                 let err_msg = format!("{err:#}");
-                if is_transient_cuda_error(&err_msg) && transient_retries < CUDA_TRANSIENT_RETRY_COUNT {
+                if is_transient_cuda_error(&err_msg)
+                    && transient_retries < CUDA_TRANSIENT_RETRY_COUNT
+                {
                     transient_retries += 1;
                     let delay = CUDA_TRANSIENT_RETRY_DELAYS
                         .get(transient_retries as usize - 1)
                         .copied()
-                        .unwrap_or(CUDA_TRANSIENT_RETRY_DELAYS[CUDA_TRANSIENT_RETRY_DELAYS.len() - 1]);
+                        .unwrap_or(
+                            CUDA_TRANSIENT_RETRY_DELAYS[CUDA_TRANSIENT_RETRY_DELAYS.len() - 1],
+                        );
                     thread::sleep(delay);
                     continue;
                 }
@@ -2985,7 +2984,7 @@ fn autotune_nvidia_kernel_tuning(
     let mut best: Option<(NvidiaKernelTuning, f64, f64, f64, f64)> = None;
 
     let evaluate_candidate = |candidate: NvidiaKernelTuning,
-                                   best: &mut Option<(NvidiaKernelTuning, f64, f64, f64, f64)>|
+                              best: &mut Option<(NvidiaKernelTuning, f64, f64, f64, f64)>|
      -> bool {
         let mut counted_samples = Vec::with_capacity(sample_count as usize);
         let mut throughput_samples = Vec::with_capacity(sample_count as usize);

@@ -348,7 +348,7 @@ fn process_sse_line(line: &str, frame: &mut SseFrameState, signal: &TipSignal) {
         "event" => {
             frame.event_name.clear();
             frame.event_name.push_str(value);
-        },
+        }
         "data" => frame.data_lines.push(value.to_string()),
         // `id` and `retry` are intentionally ignored for now.
         _ => {}

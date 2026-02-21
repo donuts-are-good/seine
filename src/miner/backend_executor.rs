@@ -654,7 +654,8 @@ impl BackendExecutor {
         // Slow path: spawn worker outside the lock to avoid holding it
         // during thread creation.
         let queue_capacity = backend_worker_queue_capacity(backend_handle);
-        let new_worker = spawn_backend_worker(backend_id, backend, key.backend_ptr, queue_capacity)?;
+        let new_worker =
+            spawn_backend_worker(backend_id, backend, key.backend_ptr, queue_capacity)?;
 
         // Write-lock and insert; check again in case of a concurrent insert.
         let mut registry = self.workers.write().ok()?;

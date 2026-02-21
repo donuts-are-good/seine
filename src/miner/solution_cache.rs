@@ -24,6 +24,7 @@ pub(super) struct RecentTemplateEntry {
     pub(super) epoch: u64,
     pub(super) recorded_at: Instant,
     pub(super) submit_template: SubmitTemplate,
+    pub(super) is_dev_fee: bool,
     pub(super) estimated_bytes: usize,
 }
 
@@ -157,16 +158,17 @@ pub(super) fn take_deferred_solutions_indexed(
 pub(super) fn submit_template_for_solution_epoch(
     current_epoch: u64,
     current_submit_template: &SubmitTemplate,
+    current_is_dev_fee: bool,
     recent_templates: &VecDeque<RecentTemplateEntry>,
     solution_epoch: u64,
-) -> Option<SubmitTemplate> {
+) -> Option<(SubmitTemplate, bool)> {
     if solution_epoch == current_epoch {
-        return Some(current_submit_template.clone());
+        return Some((current_submit_template.clone(), current_is_dev_fee));
     }
 
     for entry in recent_templates.iter().rev() {
         if entry.epoch == solution_epoch {
-            return Some(entry.submit_template.clone());
+            return Some((entry.submit_template.clone(), entry.is_dev_fee));
         }
     }
 
@@ -178,6 +180,7 @@ pub(super) fn remember_recent_template(
     recent_templates_bytes: &mut usize,
     epoch: u64,
     submit_template: SubmitTemplate,
+    is_dev_fee: bool,
     retention: Duration,
     max_entries: usize,
     max_bytes: usize,
@@ -191,6 +194,7 @@ pub(super) fn remember_recent_template(
         epoch,
         recorded_at: now,
         submit_template,
+        is_dev_fee,
         estimated_bytes,
     });
     *recent_templates_bytes = recent_templates_bytes.saturating_add(estimated_bytes);

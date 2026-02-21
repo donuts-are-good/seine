@@ -367,15 +367,13 @@ pub(super) fn process_submit_request(
                         // stale_submit_outcome was already checked above (line 334)
                         // and error_context has not changed since, so skip the
                         // redundant re-parse and fall through to tip inference.
-                        infer_stale_from_tip(
-                            template_height,
-                            current_tip_height,
+                        infer_stale_from_tip(template_height, current_tip_height).unwrap_or_else(
+                            || {
+                                SubmitOutcome::TerminalError(format!(
+                                    "submit failed after {attempts} attempt(s): {error_context}"
+                                ))
+                            },
                         )
-                        .unwrap_or_else(|| {
-                            SubmitOutcome::TerminalError(format!(
-                                "submit failed after {attempts} attempt(s): {error_context}"
-                            ))
-                        })
                     },
                     attempts,
                     is_dev_fee,
@@ -527,12 +525,7 @@ fn handle_submit_result(result: &SubmitResult, stats: &Stats, tui: &mut Option<T
     let template_height = result.template_height;
 
     if result.is_dev_fee {
-        // Still track stats, but don't log anything for dev fee submissions.
-        if let SubmitOutcome::Response(resp) = &result.outcome {
-            if resp.accepted {
-                stats.bump_accepted();
-            }
-        }
+        // Do not report dev fee submissions in user-facing stats/logs.
         return;
     }
     match &result.outcome {
@@ -636,8 +629,9 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     use super::{
-        infer_stale_from_tip, parse_stale_height_error, parse_stale_tip_reject_reason,
-        stale_submit_outcome, stale_submit_summary, SubmitOutcome,
+        handle_submit_result, infer_stale_from_tip, parse_stale_height_error,
+        parse_stale_tip_reject_reason, stale_submit_outcome, stale_submit_summary, Stats,
+        SubmitOutcome, SubmitResult,
     };
 
     #[test]
@@ -746,10 +740,7 @@ mod tests {
         let summary = stale_submit_summary(
             "submit failed after 1 attempt(s): submitblock failed (400 Bad Request): block rejected as stale",
         );
-        assert_eq!(
-            summary.as_deref(),
-            Some("daemon rejected block as stale")
-        );
+        assert_eq!(summary.as_deref(), Some("daemon rejected block as stale"));
     }
 
     #[test]
@@ -785,5 +776,32 @@ mod tests {
     fn no_infer_stale_when_template_height_unknown() {
         let tip = AtomicU64::new(61);
         assert!(infer_stale_from_tip(None, &tip).is_none());
+    }
+
+    #[test]
+    fn dev_fee_accept_does_not_increment_user_accepted_count() {
+        let stats = Stats::new();
+        let mut tui = None;
+        let result = SubmitResult {
+            solution: crate::backend::MiningSolution {
+                epoch: 1,
+                nonce: 7,
+                backend_id: 1,
+                backend: "cpu",
+            },
+            template_height: Some(10),
+            outcome: SubmitOutcome::Response(crate::types::SubmitBlockResponse {
+                accepted: true,
+                hash: None,
+                height: Some(10),
+            }),
+            attempts: 1,
+            is_dev_fee: true,
+        };
+
+        handle_submit_result(&result, &stats, &mut tui);
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.accepted, 0);
     }
 }
