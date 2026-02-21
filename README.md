@@ -196,6 +196,29 @@ cargo build --release --no-default-features --features metal
 
 ## Building from Source
 
+Requires [Rust](https://rustup.rs/) and GNU Make.
+
+Using Make:
+
+```bash
+# Default build (includes NVIDIA support)
+make
+
+# CPU-only build (no CUDA dependency)
+make build-cpu
+
+# Host-native CPU build (optimized for your specific CPU)
+make build-native
+
+# Run tests
+make test
+
+# Package a release zip for current platform
+make release
+```
+
+Or directly with Cargo:
+
 ```bash
 # Default build (includes NVIDIA support)
 cargo build --release
