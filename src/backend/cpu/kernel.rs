@@ -293,13 +293,19 @@ fn emit_linux_hugepage_diagnostics(
     emit_warning(
         shared,
         format!(
-            "MAP_HUGETLB unavailable; hugepage coverage after MADV_HUGEPAGE+MADV_COLLAPSE is {:.1}% ({} / {} MiB). \
-             Throughput may be lower. Fix: reserve hugetlb pages (e.g. sudo sysctl -w vm.nr_hugepages={} for this backend; {} per worker) or reduce worker count.",
+            "MAP_HUGETLB unavailable; hugepage coverage is {:.1}% ({} / {} MiB) after MADV_HUGEPAGE+MADV_COLLAPSE. Throughput may be lower.",
             pct,
             huge_kib / 1024,
             total_kib / 1024,
+        ),
+    );
+    emit_warning(
+        shared,
+        format!(
+            "HugeTLB fix: reserve ~{} pages for this backend ({} per worker): sudo sysctl -w vm.nr_hugepages={}. Or reduce worker count.",
             total_pages_needed,
             per_worker_pages_needed,
+            total_pages_needed,
         ),
     );
 }
