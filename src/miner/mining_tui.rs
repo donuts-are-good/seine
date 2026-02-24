@@ -148,6 +148,13 @@ impl TuiDisplay {
     fn set_state_and_render(&mut self, state_label: &str) {
         if let Ok(mut s) = self.state.lock() {
             s.state = state_label.to_string();
+            if should_zero_current_hashrate(state_label) {
+                let zero = format_hashrate_ui(0.0);
+                s.round_hashrate = zero.clone();
+                for device in &mut s.device_hashrates {
+                    device.current = zero.clone();
+                }
+            }
         }
         self.last_state_label = state_label.to_string();
         self.render_now();
@@ -160,6 +167,17 @@ impl TuiDisplay {
             Err(TrySendError::Disconnected(_)) => {}
         }
     }
+}
+
+fn should_zero_current_hashrate(state_label: &str) -> bool {
+    matches!(
+        state_label,
+        "wallet-required"
+            | "wallet-password-required"
+            | "daemon-syncing"
+            | "daemon-unavailable"
+            | "invalid-address"
+    )
 }
 
 impl Drop for TuiDisplay {
@@ -348,4 +366,24 @@ fn spawn_tui_quit_watcher(shutdown: Arc<AtomicBool>) -> (Arc<AtomicBool>, JoinHa
         }
     });
     (stop, handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_zero_current_hashrate;
+
+    #[test]
+    fn zeroes_current_hashrate_for_non_mining_states() {
+        for state in [
+            "wallet-required",
+            "wallet-password-required",
+            "daemon-syncing",
+            "daemon-unavailable",
+            "invalid-address",
+        ] {
+            assert!(should_zero_current_hashrate(state));
+        }
+        assert!(!should_zero_current_hashrate("working"));
+        assert!(!should_zero_current_hashrate("refresh"));
+    }
 }
