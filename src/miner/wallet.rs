@@ -10,7 +10,8 @@ use crossterm::terminal::is_raw_mode_enabled;
 
 use crate::config::Config;
 use crate::daemon_api::{
-    is_retryable_api_error, is_timeout_api_error, is_wallet_already_loaded_error, ApiClient,
+    is_retryable_api_error, is_timeout_api_error, is_wallet_already_loaded_error,
+    is_wallet_wrong_password_error, ApiClient,
 };
 
 use super::mining_tui::{begin_prompt_session, render_tui_now, set_tui_state_label, TuiDisplay};
@@ -75,6 +76,24 @@ pub(super) fn auto_load_wallet(
                 info("WALLET", "already loaded");
                 password.clear();
                 return Ok(true);
+            }
+            Err(err) if is_wallet_wrong_password_error(&err) => {
+                set_tui_state_label(tui, "wallet-password-required");
+                if source == WalletPasswordSource::Prompt && prompt_attempt < MAX_PROMPT_ATTEMPTS {
+                    warn("WALLET", format!("load failed: {err:#}"));
+                    render_tui_now(tui);
+                    prompt_attempt += 1;
+                    let Some(next_password) = prompt_wallet_password(tui)? else {
+                        return Ok(false);
+                    };
+                    password.clear();
+                    password = next_password;
+                    continue;
+                }
+                password.clear();
+                return Err(err).with_context(|| {
+                    format!("wallet password was rejected using {}", source.as_str())
+                });
             }
             Err(err) if is_retryable_api_error(&err) => {
                 set_tui_state_label(tui, "daemon-syncing");

@@ -285,6 +285,13 @@ pub fn is_wallet_already_loaded_error(err: &anyhow::Error) -> bool {
         && api_err.message().trim() == "wallet already loaded"
 }
 
+pub fn is_wallet_wrong_password_error(err: &anyhow::Error) -> bool {
+    let Some(api_err) = err.downcast_ref::<ApiStatusError>() else {
+        return false;
+    };
+    api_err.endpoint() == "wallet/load" && is_wallet_wrong_password_message(api_err.message())
+}
+
 pub fn is_unauthorized_error(err: &anyhow::Error) -> bool {
     let Some(api_err) = err.downcast_ref::<ApiStatusError>() else {
         return false;
@@ -367,6 +374,16 @@ fn parse_error_message(body: String) -> String {
             .unwrap_or(body);
     }
     body
+}
+
+fn is_wallet_wrong_password_message(message: &str) -> bool {
+    let message = message.trim().to_ascii_lowercase();
+    message.contains("wrong password")
+        || message.contains("incorrect password")
+        || message.contains("invalid password")
+        || message.contains("failed to decrypt wallet")
+        || message.contains("could not decrypt wallet")
+        || message.contains("message authentication failed")
 }
 
 #[cfg(test)]
@@ -493,6 +510,45 @@ mod tests {
             .expect_err("wallet load should fail");
         assert!(is_wallet_already_loaded_error(&err));
         mock.assert();
+    }
+
+    #[test]
+    fn wallet_wrong_password_error_is_classified() {
+        let err = anyhow!(ApiStatusError {
+            endpoint: "wallet/load".to_string(),
+            status: StatusCode::BAD_REQUEST,
+            message: "wrong password".to_string(),
+        });
+        assert!(is_wallet_wrong_password_error(&err));
+    }
+
+    #[test]
+    fn wallet_wrong_password_error_is_classified_from_decrypt_failure_message() {
+        let err = anyhow!(ApiStatusError {
+            endpoint: "wallet/load".to_string(),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message:
+                "failed to decrypt wallet (wrong password?): cipher: message authentication failed"
+                    .to_string(),
+        });
+        assert!(is_wallet_wrong_password_error(&err));
+    }
+
+    #[test]
+    fn wallet_wrong_password_error_rejects_non_password_failures() {
+        let wrong_endpoint = anyhow!(ApiStatusError {
+            endpoint: "submitblock".to_string(),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "wrong password".to_string(),
+        });
+        assert!(!is_wallet_wrong_password_error(&wrong_endpoint));
+
+        let wrong_message = anyhow!(ApiStatusError {
+            endpoint: "wallet/load".to_string(),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "database unavailable".to_string(),
+        });
+        assert!(!is_wallet_wrong_password_error(&wrong_message));
     }
 
     #[test]
