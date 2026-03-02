@@ -14,7 +14,7 @@ use metal::{
 use crate::backend::{
     AssignmentSemantics, BackendCapabilities, BackendEvent, BackendExecutionModel,
     BackendInstanceId, BackendTelemetry, BenchBackend, DeadlineSupport, MiningSolution, PowBackend,
-    PreemptionGranularity, WorkAssignment,
+    PreemptionGranularity, WorkAssignment, pow_hash_from_last_block_words,
 };
 
 const BACKEND_NAME: &str = "metal";
@@ -88,12 +88,19 @@ impl MetalShared {
         }
     }
 
-    fn emit_solution(&self, instance_id: BackendInstanceId, epoch: u64, nonce: u64) {
+    fn emit_solution(
+        &self,
+        instance_id: BackendInstanceId,
+        epoch: u64,
+        nonce: u64,
+        hash: Option<[u8; 32]>,
+    ) {
         self.emit_event(
             instance_id,
             BackendEvent::Solution(MiningSolution {
                 epoch,
                 nonce,
+                hash,
                 backend_id: instance_id,
                 backend: BACKEND_NAME,
             }),
@@ -314,6 +321,7 @@ impl MetalArgon2Engine {
             return Ok(FillBatchResult {
                 hashes_done: 0,
                 solved_nonce: None,
+                solved_hash: None,
             });
         }
         if requested_hashes > self.max_hashes_per_launch {
@@ -440,27 +448,55 @@ impl MetalArgon2Engine {
             .saturating_mul(active_lanes as u64)
             .min(requested_hashes as u64);
 
-        let solved_nonce = if found_index_one_based != u32::MAX && found_index_one_based > 0 {
+        let (solved_nonce, solved_hash) =
+            if found_index_one_based != u32::MAX && found_index_one_based > 0 {
             let idx = (found_index_one_based - 1) as usize;
             if idx < nonces.len() {
-                Some(nonces[idx])
+                (Some(nonces[idx]), Some(self.read_last_block_hash(idx)?))
             } else {
-                None
+                (None, None)
             }
         } else {
-            None
+            (None, None)
         };
 
         Ok(FillBatchResult {
             hashes_done,
             solved_nonce,
+            solved_hash,
         })
+    }
+
+    fn read_last_block_hash(&self, hash_idx: usize) -> Result<[u8; 32]> {
+        let start = hash_idx
+            .checked_mul(128)
+            .ok_or_else(|| anyhow!("hash index overflow while reading Metal last block"))?;
+        let end = start
+            .checked_add(128)
+            .ok_or_else(|| anyhow!("hash index overflow while reading Metal last block"))?;
+        let max_words = (self.max_hashes_per_launch as usize).saturating_mul(128);
+        if end > max_words {
+            bail!(
+                "hash index {} out of range for Metal last-block buffer (capacity words={})",
+                hash_idx,
+                max_words
+            );
+        }
+
+        let mut block_words = [0u64; 128];
+        unsafe {
+            let words_ptr = self.last_blocks_buf.contents() as *const u64;
+            let words = std::slice::from_raw_parts(words_ptr.add(start), 128);
+            block_words.copy_from_slice(words);
+        }
+        Ok(pow_hash_from_last_block_words(&block_words))
     }
 }
 
 struct FillBatchResult {
     hashes_done: u64,
     solved_nonce: Option<u64>,
+    solved_hash: Option<[u8; 32]>,
 }
 
 fn write_u32(buf: &Buffer, value: u32) {
@@ -895,6 +931,7 @@ fn metal_worker_loop(
                             instance_id,
                             assignment.work.template.epoch,
                             solved_nonce,
+                            result.solved_hash,
                         );
                     }
                 }

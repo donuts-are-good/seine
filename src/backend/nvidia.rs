@@ -28,7 +28,7 @@ use crate::backend::{
     AssignmentSemantics, BackendCallStatus, BackendCapabilities, BackendEvent,
     BackendExecutionModel, BackendInstanceId, BackendTelemetry, BenchBackend, DeadlineSupport,
     KernelBenchSample, MiningSolution, PowBackend, PreemptionGranularity, WorkAssignment,
-    WorkTemplate,
+    WorkTemplate, pow_hash_from_last_block_words,
 };
 const BACKEND_NAME: &str = "nvidia";
 const CUDA_KERNEL_SRC: &str = include_str!("nvidia_kernel.cu");
@@ -299,6 +299,7 @@ struct NonblockingControlState {
 struct FillBatchResult {
     hashes_done: usize,
     solved_nonce: Option<u64>,
+    solved_hash: Option<[u8; 32]>,
 }
 
 struct CudaArgon2Engine {
@@ -605,6 +606,7 @@ impl CudaArgon2Engine {
             return Ok(FillBatchResult {
                 hashes_done: 0,
                 solved_nonce: None,
+                solved_hash: None,
             });
         }
 
@@ -792,10 +794,12 @@ impl CudaArgon2Engine {
             return Ok(FillBatchResult {
                 hashes_done: 0,
                 solved_nonce: None,
+                solved_hash: None,
             });
         }
 
         let mut solved_nonce = None;
+        let mut solved_hash = None;
         if target.is_some() {
             if use_fused_target_check {
                 {
@@ -854,6 +858,7 @@ impl CudaArgon2Engine {
                 let idx = (self.host_found_index[0] - 1) as usize;
                 if idx < hashes_done {
                     solved_nonce = Some(nonces[idx]);
+                    solved_hash = Some(self.read_last_block_hash(idx)?);
                 }
             }
         }
@@ -861,7 +866,26 @@ impl CudaArgon2Engine {
         Ok(FillBatchResult {
             hashes_done,
             solved_nonce,
+            solved_hash,
         })
+    }
+
+    fn read_last_block_hash(&self, hash_idx: usize) -> Result<[u8; 32]> {
+        let start = hash_idx
+            .checked_mul(128)
+            .ok_or_else(|| anyhow!("hash index overflow while reading CUDA last block"))?;
+        let end = start
+            .checked_add(128)
+            .ok_or_else(|| anyhow!("hash index overflow while reading CUDA last block"))?;
+        let block_view = self
+            .last_blocks
+            .try_slice(start..end)
+            .ok_or_else(|| anyhow!("failed to slice CUDA last-block buffer"))?;
+        let mut host_words = [0u64; 128];
+        self.stream
+            .memcpy_dtoh(&block_view, &mut host_words)
+            .map_err(cuda_driver_err)?;
+        Ok(pow_hash_from_last_block_words(&host_words))
     }
 }
 
@@ -2051,6 +2075,7 @@ fn worker_loop(
                 BackendEvent::Solution(MiningSolution {
                     epoch: current.work.template.epoch,
                     nonce,
+                    hash: done.solved_hash,
                     backend_id: instance_id.load(Ordering::Acquire),
                     backend: BACKEND_NAME,
                 }),

@@ -192,6 +192,7 @@ pub(super) fn cpu_worker_loop(
                     BackendEvent::Solution(MiningSolution {
                         epoch: template.epoch,
                         nonce,
+                        hash: Some(output),
                         backend_id: shared.instance_id.load(Ordering::Acquire),
                         backend: "cpu",
                     }),

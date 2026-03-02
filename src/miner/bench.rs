@@ -2130,6 +2130,7 @@ mod tests {
             BackendEvent::Solution(crate::backend::MiningSolution {
                 epoch: 99,
                 nonce: 123,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             }),

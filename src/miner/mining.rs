@@ -2763,6 +2763,7 @@ mod tests {
             solution: MiningSolution {
                 epoch: 1,
                 nonce: 99,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             },
@@ -2815,6 +2816,7 @@ mod tests {
                 BackendEvent::Solution(MiningSolution {
                     epoch: 41,
                     nonce: 9,
+                    hash: None,
                     backend_id: 1,
                     backend: "cpu",
                 }),
@@ -2861,6 +2863,7 @@ mod tests {
                 BackendEvent::Solution(MiningSolution {
                     epoch: 41,
                     nonce: 9,
+                    hash: None,
                     backend_id: 1,
                     backend: "cpu",
                 }),
@@ -2901,6 +2904,7 @@ mod tests {
                 BackendEvent::Solution(MiningSolution {
                     epoch: 43,
                     nonce: 9,
+                    hash: None,
                     backend_id: 1,
                     backend: "cpu",
                 }),
@@ -2928,6 +2932,7 @@ mod tests {
         let mut solved = Some(MiningSolution {
             epoch: 42,
             nonce: 7,
+            hash: None,
             backend_id: 1,
             backend: "cpu",
         });
@@ -2951,6 +2956,7 @@ mod tests {
                 BackendEvent::Solution(MiningSolution {
                     epoch: 42,
                     nonce: 11,
+                    hash: None,
                     backend_id: 1,
                     backend: "cpu",
                 }),
@@ -2990,6 +2996,7 @@ mod tests {
             .send(BackendEvent::Solution(MiningSolution {
                 epoch: 42,
                 nonce: 3,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             }))
@@ -2998,6 +3005,7 @@ mod tests {
             .send(BackendEvent::Solution(MiningSolution {
                 epoch: 41,
                 nonce: 5,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             }))
@@ -3006,6 +3014,7 @@ mod tests {
             .send(BackendEvent::Solution(MiningSolution {
                 epoch: 42,
                 nonce: 9,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             }))
@@ -3045,36 +3054,42 @@ mod tests {
             MiningSolution {
                 epoch: 4,
                 nonce: 7,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             },
             MiningSolution {
                 epoch: 5,
                 nonce: 9,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             },
             MiningSolution {
                 epoch: 4,
                 nonce: 7,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             },
             MiningSolution {
                 epoch: 4,
                 nonce: 7,
+                hash: None,
                 backend_id: 2,
                 backend: "cpu",
             },
             MiningSolution {
                 epoch: 4,
                 nonce: 7,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             },
             MiningSolution {
                 epoch: 4,
                 nonce: 7,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             },
@@ -3095,6 +3110,7 @@ mod tests {
         let primary = MiningSolution {
             epoch: 5,
             nonce: 42,
+            hash: None,
             backend_id: 1,
             backend: "cpu",
         };
@@ -3102,18 +3118,21 @@ mod tests {
             MiningSolution {
                 epoch: 5,
                 nonce: 42,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             },
             MiningSolution {
                 epoch: 5,
                 nonce: 42,
+                hash: None,
                 backend_id: 2,
                 backend: "cpu",
             },
             MiningSolution {
                 epoch: 5,
                 nonce: 9,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             },
@@ -3133,6 +3152,7 @@ mod tests {
                 MiningSolution {
                     epoch: idx,
                     nonce: idx,
+                    hash: None,
                     backend_id: 1,
                     backend: "cpu",
                 },
@@ -3151,6 +3171,7 @@ mod tests {
             MiningSolution {
                 epoch: 10,
                 nonce: 77,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             },
@@ -3160,6 +3181,7 @@ mod tests {
             MiningSolution {
                 epoch: 10,
                 nonce: 77,
+                hash: None,
                 backend_id: 9,
                 backend: "nvidia",
             },
@@ -3179,6 +3201,7 @@ mod tests {
             MiningSolution {
                 epoch: 42,
                 nonce: 11,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             },
@@ -3190,6 +3213,7 @@ mod tests {
             MiningSolution {
                 epoch: 42,
                 nonce: 13,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             },
@@ -3201,6 +3225,7 @@ mod tests {
             MiningSolution {
                 epoch: 43,
                 nonce: 17,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             },
@@ -3215,6 +3240,7 @@ mod tests {
             solution: MiningSolution {
                 epoch: 42,
                 nonce: 7,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             },
@@ -3398,12 +3424,14 @@ mod tests {
         let solution = MiningSolution {
             epoch: 9,
             nonce: 42,
+            hash: None,
             backend_id: 1,
             backend: "cpu",
         };
         let cross_backend = MiningSolution {
             epoch: 9,
             nonce: 42,
+            hash: None,
             backend_id: 2,
             backend: "cpu",
         };
@@ -3416,6 +3444,7 @@ mod tests {
             let entry = MiningSolution {
                 epoch: 100 + idx as u64,
                 nonce: idx as u64,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             };

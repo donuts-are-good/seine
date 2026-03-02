@@ -4,6 +4,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
+use blake2::digest::{Update, VariableOutput};
+use blake2::Blake2bVar;
 use crossbeam_channel::Sender;
 
 pub mod cpu;
@@ -255,8 +257,29 @@ pub struct WorkAssignment {
 pub struct MiningSolution {
     pub epoch: u64,
     pub nonce: u64,
+    pub hash: Option<[u8; 32]>,
     pub backend_id: BackendInstanceId,
     pub backend: &'static str,
+}
+
+pub fn pow_hash_from_last_block_words(last_block_words: &[u64; 128]) -> [u8; 32] {
+    let mut block_bytes = [0u8; 1024];
+    for (idx, word) in last_block_words.iter().enumerate() {
+        let offset = idx * 8;
+        block_bytes[offset..offset + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    pow_hash_from_last_block_bytes(&block_bytes)
+}
+
+pub fn pow_hash_from_last_block_bytes(last_block_bytes: &[u8; 1024]) -> [u8; 32] {
+    let mut hash = [0u8; 32];
+    let mut digest = Blake2bVar::new(hash.len()).expect("fixed 32-byte output length");
+    digest.update(&(hash.len() as u32).to_le_bytes());
+    digest.update(last_block_bytes);
+    digest
+        .finalize_variable(&mut hash)
+        .expect("output length should match");
+    hash
 }
 
 #[derive(Debug, Clone)]

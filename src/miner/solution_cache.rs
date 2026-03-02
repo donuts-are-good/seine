@@ -340,6 +340,7 @@ mod tests {
         MiningSolution {
             epoch,
             nonce,
+            hash: None,
             backend_id: 1,
             backend: "cpu",
         }

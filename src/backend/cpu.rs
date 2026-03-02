@@ -1108,6 +1108,7 @@ mod tests {
             .send(BackendEvent::Solution(MiningSolution {
                 epoch: 1,
                 nonce: 1,
+                hash: None,
                 backend_id: 99,
                 backend: "cpu",
             }))
@@ -1175,6 +1176,7 @@ mod tests {
             .send(BackendEvent::Solution(MiningSolution {
                 epoch: 1,
                 nonce: 1,
+                hash: None,
                 backend_id: 99,
                 backend: "cpu",
             }))

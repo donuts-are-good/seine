@@ -789,6 +789,7 @@ mod tests {
             solution: crate::backend::MiningSolution {
                 epoch: 1,
                 nonce: 7,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             },
@@ -816,6 +817,7 @@ mod tests {
             solution: crate::backend::MiningSolution {
                 epoch: 1,
                 nonce: 9,
+                hash: None,
                 backend_id: 1,
                 backend: "cpu",
             },
