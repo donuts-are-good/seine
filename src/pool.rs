@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +15,16 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_millis(250);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const CHANNEL_CAPACITY: usize = 4096;
+const STRATUM_PROTOCOL_VERSION: u32 = 2;
+const STRATUM_CAPABILITY_LOGIN_NEGOTIATION: &str = "login_negotiation";
+const STRATUM_CAPABILITY_VALIDATION_STATUS: &str = "share_validation_status";
+const STRATUM_CAPABILITY_SUBMIT_CLAIMED_HASH: &str = "submit_claimed_hash";
+
+const CLIENT_CAPABILITIES: &[&str] = &[
+    STRATUM_CAPABILITY_LOGIN_NEGOTIATION,
+    STRATUM_CAPABILITY_VALIDATION_STATUS,
+    STRATUM_CAPABILITY_SUBMIT_CLAIMED_HASH,
+];
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PoolJob {
@@ -46,10 +56,24 @@ pub struct PoolSubmitAck {
 }
 
 #[derive(Debug, Clone)]
+pub struct PoolLoginAck {
+    pub protocol_version: u32,
+    pub capabilities: Vec<String>,
+    pub required_capabilities: Vec<String>,
+}
+
+impl PoolLoginAck {
+    pub fn supports(&self, capability: &str) -> bool {
+        let probe = capability.trim().to_ascii_lowercase();
+        self.capabilities.iter().any(|entry| entry == &probe)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum PoolEvent {
     Connected,
     Disconnected(String),
-    LoginAccepted,
+    LoginAccepted(PoolLoginAck),
     LoginRejected(String),
     Job(PoolJob),
     SubmitAck(PoolSubmitAck),
@@ -59,6 +83,7 @@ pub enum PoolEvent {
 struct PoolSubmit {
     job_id: String,
     nonce: u64,
+    claimed_hash: Option<[u8; 32]>,
 }
 
 #[derive(Debug)]
@@ -91,9 +116,18 @@ impl PoolClient {
         })
     }
 
-    pub fn submit_share(&self, job_id: String, nonce: u64) -> Result<()> {
+    pub fn submit_share(
+        &self,
+        job_id: String,
+        nonce: u64,
+        claimed_hash: Option<[u8; 32]>,
+    ) -> Result<()> {
         self.submit_tx
-            .send(PoolSubmit { job_id, nonce })
+            .send(PoolSubmit {
+                job_id,
+                nonce,
+                claimed_hash,
+            })
             .map_err(|_| anyhow!("pool submit channel closed"))
     }
 
@@ -127,12 +161,16 @@ struct StratumRequest<'a, T: Serialize> {
 struct LoginParams<'a> {
     address: &'a str,
     worker: &'a str,
+    protocol_version: u32,
+    capabilities: &'static [&'static str],
 }
 
 #[derive(Debug, Serialize)]
 struct SubmitParams<'a> {
     job_id: &'a str,
     nonce: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claimed_hash: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,6 +187,16 @@ struct StratumMessage {
     error: Option<String>,
     #[serde(default)]
     result: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct LoginResult {
+    #[serde(default)]
+    protocol_version: Option<u32>,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    required_capabilities: Vec<String>,
 }
 
 fn run_pool_client_thread(
@@ -173,6 +221,7 @@ fn run_pool_client_thread(
                 }
                 let mut pending_submits = HashMap::<u64, PoolSubmit>::new();
                 let mut login_confirmed = false;
+                let mut submit_claimed_hash_enabled = true;
 
                 loop {
                     if shutdown.load(Ordering::Relaxed) {
@@ -183,7 +232,14 @@ fn run_pool_client_thread(
                     while let Ok(submit) = submit_rx.try_recv() {
                         let request_id = next_request_id;
                         next_request_id = next_request_id.wrapping_add(1).max(LOGIN_REQUEST_ID + 1);
-                        if send_submit(&mut stream, request_id, &submit).is_err() {
+                        if send_submit(
+                            &mut stream,
+                            request_id,
+                            &submit,
+                            submit_claimed_hash_enabled,
+                        )
+                        .is_err()
+                        {
                             let _ = event_tx.try_send(PoolEvent::Disconnected(
                                 "failed to send submit request".to_string(),
                             ));
@@ -216,6 +272,9 @@ fn run_pool_client_thread(
                                 &mut login_confirmed,
                                 &mut pending_submits,
                             ) {
+                                if let PoolEvent::LoginAccepted(ack) = &event {
+                                    submit_claimed_hash_enabled = should_send_claimed_hash(ack);
+                                }
                                 let _ = event_tx.try_send(event);
                             }
                         }
@@ -295,18 +354,34 @@ fn send_login(stream: &mut TcpStream, address: &str, worker: &str) -> Result<()>
     let request = StratumRequest {
         id: LOGIN_REQUEST_ID,
         method: "login",
-        params: LoginParams { address, worker },
+        params: LoginParams {
+            address,
+            worker,
+            protocol_version: STRATUM_PROTOCOL_VERSION,
+            capabilities: CLIENT_CAPABILITIES,
+        },
     };
     send_json_line(stream, &request)
 }
 
-fn send_submit(stream: &mut TcpStream, request_id: u64, submit: &PoolSubmit) -> Result<()> {
+fn send_submit(
+    stream: &mut TcpStream,
+    request_id: u64,
+    submit: &PoolSubmit,
+    include_claimed_hash: bool,
+) -> Result<()> {
+    let claimed_hash_hex = if include_claimed_hash {
+        submit.claimed_hash.map(hex::encode)
+    } else {
+        None
+    };
     let request = StratumRequest {
         id: request_id,
         method: "submit",
         params: SubmitParams {
             job_id: &submit.job_id,
             nonce: submit.nonce,
+            claimed_hash: claimed_hash_hex.as_deref(),
         },
     };
     send_json_line(stream, &request)
@@ -348,7 +423,8 @@ fn decode_pool_message(
             .unwrap_or(false);
         if status_ok {
             *login_confirmed = true;
-            return Some(PoolEvent::LoginAccepted);
+            let ack = parse_login_result(msg.result);
+            return Some(PoolEvent::LoginAccepted(ack));
         }
         *login_confirmed = false;
         return Some(PoolEvent::LoginRejected("pool rejected login".to_string()));
@@ -386,6 +462,52 @@ fn decode_pool_message(
     }))
 }
 
+fn parse_login_result(result: Option<Value>) -> PoolLoginAck {
+    let parsed = result
+        .and_then(|value| serde_json::from_value::<LoginResult>(value).ok())
+        .unwrap_or_default();
+    let protocol_version = parsed
+        .protocol_version
+        .filter(|version| *version > 0)
+        .unwrap_or(1);
+
+    PoolLoginAck {
+        protocol_version,
+        capabilities: normalize_capability_list(parsed.capabilities),
+        required_capabilities: normalize_capability_list(parsed.required_capabilities),
+    }
+}
+
+fn normalize_capability_list(values: Vec<String>) -> Vec<String> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let mut seen = HashSet::<String>::new();
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let capability = value.trim().to_ascii_lowercase();
+        if capability.is_empty() {
+            continue;
+        }
+        if seen.insert(capability.clone()) {
+            out.push(capability);
+        }
+    }
+    out
+}
+
+fn should_send_claimed_hash(ack: &PoolLoginAck) -> bool {
+    if ack.capabilities.is_empty()
+        && ack.required_capabilities.is_empty()
+        && ack.protocol_version < STRATUM_PROTOCOL_VERSION
+    {
+        // Legacy pool response without negotiation metadata: stay optimistic and
+        // include claimed hash, because older pools generally ignore unknown fields.
+        return true;
+    }
+    ack.supports(STRATUM_CAPABILITY_SUBMIT_CLAIMED_HASH)
+}
+
 fn parse_pool_endpoint(pool_url: &str) -> Result<String> {
     let trimmed = pool_url.trim();
     if trimmed.is_empty() {
@@ -414,5 +536,221 @@ fn sleep_with_shutdown(shutdown: &AtomicBool, duration: Duration) {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn capture_payload<F>(writer: F) -> Value
+    where
+        F: FnOnce(&mut TcpStream),
+    {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("test listener should bind to loopback");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose local address");
+
+        let reader_thread = thread::spawn(move || {
+            let (socket, _) = listener.accept().expect("test listener should accept");
+            let mut line = String::new();
+            let mut reader = BufReader::new(socket);
+            reader
+                .read_line(&mut line)
+                .expect("pool submit payload should be readable");
+            line
+        });
+
+        let mut stream = TcpStream::connect(addr).expect("test stream should connect");
+        writer(&mut stream);
+        drop(stream);
+
+        let raw = reader_thread
+            .join()
+            .expect("reader thread should complete cleanly");
+        serde_json::from_str(raw.trim()).expect("submit payload should decode as valid json")
+    }
+
+    fn capture_login_payload(address: &str, worker: &str) -> Value {
+        capture_payload(|stream| {
+            send_login(stream, address, worker).expect("login payload should serialize");
+        })
+    }
+
+    fn capture_submit_payload(
+        submit: PoolSubmit,
+        request_id: u64,
+        include_claimed_hash: bool,
+    ) -> Value {
+        capture_payload(|stream| {
+            send_submit(stream, request_id, &submit, include_claimed_hash)
+                .expect("submit payload should serialize");
+        })
+    }
+
+    #[test]
+    fn send_login_includes_protocol_negotiation_fields() {
+        let payload = capture_login_payload("XbTestAddress", "rig01");
+
+        assert_eq!(
+            payload.get("id").and_then(Value::as_u64),
+            Some(LOGIN_REQUEST_ID)
+        );
+        assert_eq!(payload.get("method").and_then(Value::as_str), Some("login"));
+        assert_eq!(
+            payload
+                .get("params")
+                .and_then(|params| params.get("protocol_version"))
+                .and_then(Value::as_u64),
+            Some(STRATUM_PROTOCOL_VERSION as u64)
+        );
+        let capabilities = payload
+            .get("params")
+            .and_then(|params| params.get("capabilities"))
+            .and_then(Value::as_array)
+            .expect("login params should include capabilities array");
+        assert!(
+            capabilities
+                .iter()
+                .any(|entry| entry.as_str() == Some(STRATUM_CAPABILITY_SUBMIT_CLAIMED_HASH)),
+            "client should advertise claimed hash support"
+        );
+    }
+
+    #[test]
+    fn send_submit_includes_claimed_hash_for_v2_pools() {
+        let payload = capture_submit_payload(
+            PoolSubmit {
+                job_id: "job-1".to_string(),
+                nonce: 42,
+                claimed_hash: Some([0xAB; 32]),
+            },
+            99,
+            true,
+        );
+        let expected_hash = "ab".repeat(32);
+
+        assert_eq!(payload.get("id").and_then(Value::as_u64), Some(99));
+        assert_eq!(
+            payload.get("method").and_then(Value::as_str),
+            Some("submit")
+        );
+        assert_eq!(
+            payload
+                .get("params")
+                .and_then(|params| params.get("job_id"))
+                .and_then(Value::as_str),
+            Some("job-1")
+        );
+        assert_eq!(
+            payload
+                .get("params")
+                .and_then(|params| params.get("nonce"))
+                .and_then(Value::as_u64),
+            Some(42)
+        );
+        assert_eq!(
+            payload
+                .get("params")
+                .and_then(|params| params.get("claimed_hash"))
+                .and_then(Value::as_str),
+            Some(expected_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn send_submit_omits_claimed_hash_for_legacy_pools() {
+        let payload = capture_submit_payload(
+            PoolSubmit {
+                job_id: "job-2".to_string(),
+                nonce: 7,
+                claimed_hash: Some([0xCD; 32]),
+            },
+            100,
+            false,
+        );
+
+        let params = payload
+            .get("params")
+            .expect("submit payload should include params object");
+        assert!(
+            params.get("claimed_hash").is_none(),
+            "legacy submit payload should omit claimed_hash"
+        );
+    }
+
+    #[test]
+    fn decode_login_result_with_negotiated_capabilities() {
+        let mut login_confirmed = false;
+        let mut pending_submits = HashMap::<u64, PoolSubmit>::new();
+        let raw = r#"{"id":1,"status":"ok","result":{"protocol_version":2,"capabilities":["submit_claimed_hash","share_validation_status"],"required_capabilities":["submit_claimed_hash"]}}"#;
+
+        let event = decode_pool_message(raw, &mut login_confirmed, &mut pending_submits)
+            .expect("login response should decode");
+        assert!(login_confirmed, "login should be marked confirmed");
+
+        match event {
+            PoolEvent::LoginAccepted(ack) => {
+                assert_eq!(ack.protocol_version, 2);
+                assert!(ack.supports(STRATUM_CAPABILITY_SUBMIT_CLAIMED_HASH));
+                assert_eq!(
+                    ack.required_capabilities,
+                    vec![STRATUM_CAPABILITY_SUBMIT_CLAIMED_HASH.to_string()]
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_login_result_defaults_to_legacy_when_missing() {
+        let mut login_confirmed = false;
+        let mut pending_submits = HashMap::<u64, PoolSubmit>::new();
+        let raw = r#"{"id":1,"status":"ok"}"#;
+
+        let event = decode_pool_message(raw, &mut login_confirmed, &mut pending_submits)
+            .expect("legacy login response should decode");
+        assert!(login_confirmed, "login should be marked confirmed");
+
+        match event {
+            PoolEvent::LoginAccepted(ack) => {
+                assert_eq!(ack.protocol_version, 1);
+                assert!(ack.capabilities.is_empty());
+                assert!(ack.required_capabilities.is_empty());
+                assert!(
+                    should_send_claimed_hash(&ack),
+                    "legacy responses should keep claimed hash enabled"
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claimed_hash_toggle_respects_negotiation() {
+        let legacy = PoolLoginAck {
+            protocol_version: 1,
+            capabilities: Vec::new(),
+            required_capabilities: Vec::new(),
+        };
+        assert!(should_send_claimed_hash(&legacy));
+
+        let negotiated_without_claimed_hash = PoolLoginAck {
+            protocol_version: 2,
+            capabilities: vec![STRATUM_CAPABILITY_VALIDATION_STATUS.to_string()],
+            required_capabilities: Vec::new(),
+        };
+        assert!(!should_send_claimed_hash(&negotiated_without_claimed_hash));
+
+        let negotiated_with_claimed_hash = PoolLoginAck {
+            protocol_version: 2,
+            capabilities: vec![STRATUM_CAPABILITY_SUBMIT_CLAIMED_HASH.to_string()],
+            required_capabilities: Vec::new(),
+        };
+        assert!(should_send_claimed_hash(&negotiated_with_claimed_hash));
     }
 }

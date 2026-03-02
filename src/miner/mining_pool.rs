@@ -335,8 +335,19 @@ fn handle_pool_event(
             set_tui_state_label(tui, "pool-disconnected");
             std::thread::sleep(TEMPLATE_RETRY_DELAY);
         }
-        PoolEvent::LoginAccepted => {
-            success("POOL", "login accepted");
+        PoolEvent::LoginAccepted(ack) => {
+            let required = if ack.required_capabilities.is_empty() {
+                "none".to_string()
+            } else {
+                ack.required_capabilities.join(",")
+            };
+            success(
+                "POOL",
+                format!(
+                    "login accepted (protocol v{}, required={required})",
+                    ack.protocol_version
+                ),
+            );
             set_tui_state_label(tui, "pool-authenticated");
         }
         PoolEvent::LoginRejected(message) => {
@@ -531,7 +542,7 @@ fn submit_pool_solution(
     }
 
     if pool_client
-        .submit_share(job.job.job_id.clone(), solution.nonce)
+        .submit_share(job.job.job_id.clone(), solution.nonce, solution.hash)
         .is_ok()
     {
         stats.bump_submitted();
