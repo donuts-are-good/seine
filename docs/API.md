@@ -15,7 +15,7 @@ Seine supports two API startup modes.
 ### Service Mode (idle until API start)
 
 ```bash
-./seine --service --api-bind 127.0.0.1:9977 --token <daemon-token>
+./seine --service --api-bind 127.0.0.1:9977
 ```
 
 Behavior:
@@ -42,11 +42,12 @@ Behavior:
 - Non-loopback bind requires `--api-allow-unsafe-bind`.
 - CORS allow-origin is configurable via `--api-cors` (default `*`).
 
-## Daemon Auth for Mining Sessions
+## Mode-Specific Start Requirements
 
-Mining sessions require daemon auth token.
+- Pool mode (`mode=pool`) requires `mining_address`, `pool_url`, and `pool_worker`.
+- Daemon mode (`mode=daemon`) requires daemon auth token.
 
-You can provide auth via:
+Daemon auth can be provided via:
 
 - Startup flags: `--token` or `--cookie`
 - Start request payload fields: `token` or `cookie_path`
@@ -54,7 +55,7 @@ You can provide auth via:
 Rules:
 
 - `token` and `cookie_path` are mutually exclusive in a start/patch payload.
-- If auth is missing, `/v1/miner/start` returns `400`.
+- Missing required mode-specific fields make `/v1/miner/start` return `400`.
 
 ## Endpoint Summary
 
@@ -91,7 +92,7 @@ See schema files:
 
 High-impact groups:
 
-- Connectivity/auth: `api_url`, `token`, `cookie_path`
+- Mode/connectivity/auth: `mode`, `api_url`, `token`, `cookie_path`, `mining_address`, `pool_url`, `pool_worker`
 - Backend topology: `backend_specs`, `threads`, `cpu_affinity`, `cpu_profile`
 - Runtime timing: `refresh_secs`, `request_timeout_secs`, `stats_secs`
 - CPU/NVIDIA/Metal tuning knobs (same names as runtime config fields)
@@ -158,7 +159,7 @@ Prometheus metrics exposed by the control API:
 ### 1. Start Service, Check Health
 
 ```bash
-./seine --service --api-bind 127.0.0.1:9977 --token <daemon-token>
+./seine --service --api-bind 127.0.0.1:9977
 curl -s http://127.0.0.1:9977/v1/health
 ```
 
@@ -167,7 +168,15 @@ curl -s http://127.0.0.1:9977/v1/health
 ```bash
 curl -s -X POST http://127.0.0.1:9977/v1/miner/start \
   -H 'content-type: application/json' \
-  -d '{"threads":2,"work_allocation":"adaptive","stats_secs":5}'
+  -d '{
+    "mode":"pool",
+    "mining_address":"PpkFxY...",
+    "pool_url":"stratum+tcp://pool.example.com:3333",
+    "pool_worker":"rig-01",
+    "threads":2,
+    "work_allocation":"adaptive",
+    "stats_secs":5
+  }'
 ```
 
 ### 3. Watch Live Events

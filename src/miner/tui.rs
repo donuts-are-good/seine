@@ -108,7 +108,9 @@ pub struct TuiStateInner {
     pub dev_fee_active: bool,
 
     // Config (set once at startup)
+    pub mode: String,
     pub api_url: String,
+    pub pool_worker: String,
     pub threads: usize,
     pub refresh_secs: u64,
     pub sse_enabled: bool,
@@ -150,7 +152,9 @@ impl TuiStateInner {
             pending_nvidia_since: None,
             dev_fee_active: false,
 
+            mode: String::new(),
             api_url: String::new(),
+            pool_worker: String::new(),
             threads: 0,
             refresh_secs: 0,
             sse_enabled: false,
@@ -272,7 +276,7 @@ fn draw_dashboard(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner)
     // Pending devices are always 1-per-line (not paired in wide mode)
     let device_rows = active_rows + pending_count;
     let devices_height: u16 = if device_rows > 0 { 2 + device_rows } else { 0 };
-    let config_height: u16 = if wide { 4 } else { 8 };
+    let config_height: u16 = if wide { 5 } else { 8 };
     let header_height: u16 = 4;
 
     let chunks = Layout::default()
@@ -668,7 +672,7 @@ fn draw_config(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner) {
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(4)])
+        .constraints([Constraint::Length(5), Constraint::Min(4)])
         .split(area);
     draw_config_runtime_panel(frame, rows[0], state);
     draw_config_wallet_panel(frame, rows[1], state);
@@ -676,12 +680,16 @@ fn draw_config(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner) {
 
 fn draw_config_runtime_panel(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner) {
     let line1 = Line::from(vec![
-        Span::styled("  API: ", LABEL_STYLE),
+        Span::styled("  Endpoint: ", LABEL_STYLE),
         Span::styled(&state.api_url, VALUE_STYLE),
-        Span::styled("  Threads: ", LABEL_STYLE),
-        Span::styled(state.threads.to_string(), VALUE_STYLE),
     ]);
     let line2 = Line::from(vec![
+        Span::styled("  Threads: ", LABEL_STYLE),
+        Span::styled(state.threads.to_string(), VALUE_STYLE),
+        Span::styled("  Worker: ", LABEL_STYLE),
+        Span::styled(&state.pool_worker, VALUE_STYLE),
+    ]);
+    let line3 = Line::from(vec![
         Span::styled("  Backends: ", LABEL_STYLE),
         Span::styled(&state.backends_desc, VALUE_STYLE),
     ]);
@@ -689,7 +697,7 @@ fn draw_config_runtime_panel(frame: &mut ratatui::Frame, area: Rect, state: &Tui
         .title(Span::styled(" CONFIG ", TITLE_STYLE))
         .borders(Borders::ALL)
         .border_style(BORDER_STYLE);
-    let config = Paragraph::new(vec![line1, line2]).block(config_block);
+    let config = Paragraph::new(vec![line1, line2, line3]).block(config_block);
     frame.render_widget(config, area);
 }
 

@@ -21,7 +21,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::config::{
     read_token_from_cookie_file, BackendKind, BackendSpec, Config, CpuAffinityMode,
-    CpuPerformanceProfile, UiMode, WorkAllocation,
+    CpuPerformanceProfile, MiningMode, UiMode, WorkAllocation,
 };
 use crate::dev_fee::{DEV_ADDRESS, DEV_FEE_PERCENT};
 use crate::miner::ui::{set_log_sink, UiLogEvent};
@@ -121,7 +121,10 @@ struct ApiConfigView {
     api_allow_unsafe_bind: bool,
     api_cors: String,
     api_key_required: bool,
+    mode: String,
     api_url: String,
+    pool_url: Option<String>,
+    pool_worker: Option<String>,
     has_token: bool,
     cookie_path: Option<String>,
     wallet_password_present: bool,
@@ -189,7 +192,10 @@ impl From<&Config> for ApiConfigView {
             api_allow_unsafe_bind: cfg.api_allow_unsafe_bind,
             api_cors: cfg.api_cors.clone(),
             api_key_required: false,
+            mode: mining_mode_to_str(cfg.mode).to_string(),
             api_url: cfg.api_url.clone(),
+            pool_url: cfg.pool_url.clone(),
+            pool_worker: cfg.pool_worker.clone(),
             has_token: cfg.token.is_some(),
             cookie_path: cfg
                 .token_cookie_path
@@ -556,14 +562,47 @@ impl MinerSupervisor {
         cfg.allow_wallet_prompt = allow_wallet_prompt;
         cfg.bench = false;
         cfg.service_mode = false;
-        if cfg
-            .token
-            .as_ref()
-            .map_or(true, |token| token.trim().is_empty())
-        {
-            bail!(
-                "missing API token; provide --token/--cookie at startup or include token/cookie_path in start payload"
-            );
+        match cfg.mode {
+            MiningMode::Daemon => {
+                if cfg
+                    .token
+                    .as_ref()
+                    .map_or(true, |token| token.trim().is_empty())
+                {
+                    bail!(
+                        "daemon mode requires an API token; provide --token/--cookie at startup or include token/cookie_path in start payload"
+                    );
+                }
+            }
+            MiningMode::Pool => {
+                if cfg
+                    .mining_address
+                    .as_ref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    bail!(
+                        "pool mode requires mining_address; provide --address at startup or include mining_address in start payload"
+                    );
+                }
+                if cfg
+                    .pool_url
+                    .as_ref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    bail!(
+                        "pool mode requires pool_url; provide --pool-url at startup or include pool_url in start payload"
+                    );
+                }
+                if cfg
+                    .pool_worker
+                    .as_ref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    bail!(
+                        "pool mode requires pool_worker; provide --pool-worker at startup or include pool_worker in start payload"
+                    );
+                }
+            }
         }
 
         let run_shutdown = Arc::new(AtomicBool::new(false));
@@ -850,12 +889,15 @@ struct BackendSpecPatch {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 struct StartRequest {
+    mode: Option<String>,
     api_url: Option<String>,
     token: Option<String>,
     cookie_path: Option<String>,
     wallet_password: Option<String>,
     wallet_password_file: Option<String>,
     mining_address: Option<String>,
+    pool_url: Option<String>,
+    pool_worker: Option<String>,
     backend_specs: Option<Vec<BackendSpecPatch>>,
     threads: Option<usize>,
     refresh_secs: Option<u64>,
@@ -1035,6 +1077,78 @@ fn parse_api_bind_addr(bind: &str) -> Result<SocketAddr> {
     }
 
     bail!("invalid api-bind '{bind}' (expected host:port)")
+}
+
+fn normalize_pool_url(value: &str) -> Result<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        bail!("pool_url cannot be empty");
+    }
+
+    let authority = trimmed
+        .strip_prefix("stratum+tcp://")
+        .unwrap_or(trimmed)
+        .split('/')
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    if authority.is_empty() || authority.contains("://") {
+        bail!("pool_url must be host:port or stratum+tcp://host:port");
+    }
+
+    let (host, port) = parse_pool_host_port(authority)?;
+    let host_for_url = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Ok(format!("stratum+tcp://{host_for_url}:{port}"))
+}
+
+fn parse_pool_host_port(authority: &str) -> Result<(String, u16)> {
+    let authority = authority.trim();
+    if authority.is_empty() {
+        bail!("pool_url authority is empty");
+    }
+    if authority.chars().all(|c| c.is_ascii_digit()) {
+        let port = authority
+            .parse::<u16>()
+            .with_context(|| format!("invalid pool port in '{authority}'"))?;
+        return Ok(("127.0.0.1".to_string(), port));
+    }
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        let closing = rest
+            .find(']')
+            .ok_or_else(|| anyhow!("invalid IPv6 pool authority '{authority}'"))?;
+        let host = rest[..closing].to_string();
+        let port_part = rest
+            .get(closing + 1..)
+            .and_then(|v| v.strip_prefix(':'))
+            .ok_or_else(|| anyhow!("pool_url must include port in '{authority}'"))?;
+        let port = port_part
+            .parse::<u16>()
+            .with_context(|| format!("invalid pool port in '{authority}'"))?;
+        return Ok((host, port));
+    }
+
+    if authority.matches(':').count() == 1 {
+        let (host, port) = authority
+            .split_once(':')
+            .ok_or_else(|| anyhow!("pool_url must include port"))?;
+        let port = port
+            .parse::<u16>()
+            .with_context(|| format!("invalid pool port in '{authority}'"))?;
+        return Ok((host.to_string(), port));
+    }
+
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("pool_url must include port"))?;
+    let port = port
+        .parse::<u16>()
+        .with_context(|| format!("invalid pool port in '{authority}'"))?;
+    Ok((host.to_string(), port))
 }
 
 fn classify_start_or_restart_error(err: anyhow::Error, operation: &str) -> ApiError {
@@ -1309,6 +1423,9 @@ fn apply_start_patch(cfg: &mut Config, patch: &StartRequest) -> Result<()> {
         bail!("token and cookie_path are mutually exclusive");
     }
 
+    if let Some(mode) = patch.mode.as_deref() {
+        cfg.mode = parse_mining_mode(mode)?;
+    }
     if let Some(api_url) = patch.api_url.as_ref() {
         let api_url = api_url.trim();
         if api_url.is_empty() {
@@ -1346,6 +1463,16 @@ fn apply_start_patch(cfg: &mut Config, patch: &StartRequest) -> Result<()> {
             bail!("mining_address cannot be empty");
         }
         cfg.mining_address = Some(mining_address.to_string());
+    }
+    if let Some(pool_url) = patch.pool_url.as_ref() {
+        cfg.pool_url = Some(normalize_pool_url(pool_url)?);
+    }
+    if let Some(pool_worker) = patch.pool_worker.as_ref() {
+        let pool_worker = pool_worker.trim();
+        if pool_worker.is_empty() {
+            bail!("pool_worker cannot be empty");
+        }
+        cfg.pool_worker = Some(pool_worker.to_string());
     }
     if let Some(specs) = patch.backend_specs.as_ref() {
         cfg.backend_specs = parse_backend_specs_patch(specs)?;
@@ -1686,6 +1813,14 @@ fn parse_cpu_affinity(value: &str) -> Result<CpuAffinityMode> {
     }
 }
 
+fn parse_mining_mode(value: &str) -> Result<MiningMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pool" => Ok(MiningMode::Pool),
+        "daemon" => Ok(MiningMode::Daemon),
+        other => bail!("invalid mode '{other}' (expected: pool|daemon)"),
+    }
+}
+
 fn parse_ui_mode(value: &str) -> Result<UiMode> {
     match value.trim().to_ascii_lowercase().as_str() {
         "auto" => Ok(UiMode::Auto),
@@ -1715,6 +1850,13 @@ fn cpu_affinity_to_str(value: CpuAffinityMode) -> &'static str {
         CpuAffinityMode::Off => "off",
         CpuAffinityMode::Auto => "auto",
         CpuAffinityMode::PcoreOnly => "pcore-only",
+    }
+}
+
+fn mining_mode_to_str(value: MiningMode) -> &'static str {
+    match value {
+        MiningMode::Pool => "pool",
+        MiningMode::Daemon => "daemon",
     }
 }
 

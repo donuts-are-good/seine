@@ -4,7 +4,7 @@
 
 Run:
 ```bash
-./seine --service --api-bind 127.0.0.1:9977 --token <daemon-token>
+./seine --service --api-bind 127.0.0.1:9977
 ```
 
 Check health:
@@ -21,10 +21,18 @@ curl -s http://127.0.0.1:9977/v1/runtime/config/defaults
 ```bash
 curl -s -X POST http://127.0.0.1:9977/v1/miner/start \
   -H 'content-type: application/json' \
-  -d '{"threads":2,"work_allocation":"adaptive","stats_secs":5}'
+  -d '{
+    "mode":"pool",
+    "mining_address":"PpkFxY...",
+    "pool_url":"stratum+tcp://pool.example.com:3333",
+    "pool_worker":"rig-01",
+    "threads":2,
+    "work_allocation":"adaptive",
+    "stats_secs":5
+  }'
 ```
 
-If daemon auth is not preconfigured, include one of:
+If starting in daemon mode and daemon auth is not preconfigured, include one of:
 - `token` in `POST /v1/miner/start`
 - `cookie_path` in `POST /v1/miner/start`
 

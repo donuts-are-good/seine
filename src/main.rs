@@ -4,7 +4,9 @@ mod control_api;
 mod daemon_api;
 mod dev_fee;
 mod miner;
+mod pool;
 mod types;
+mod user_config;
 mod version;
 
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -20,11 +20,15 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "mode": { "type": "string", "enum": ["pool", "daemon"] },
         "api_url": { "type": "string", "minLength": 1 },
         "token": { "type": "string", "minLength": 1 },
         "cookie_path": { "type": "string", "minLength": 1 },
         "wallet_password": { "type": "string" },
         "wallet_password_file": { "type": "string", "minLength": 1 },
+        "mining_address": { "type": "string", "minLength": 1 },
+        "pool_url": { "type": "string", "minLength": 1 },
+        "pool_worker": { "type": "string", "minLength": 1 },
         "backend_specs": {
           "type": "array",
           "minItems": 1,

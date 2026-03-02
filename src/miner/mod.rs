@@ -5,6 +5,7 @@ mod bench;
 mod hash_poll;
 mod hashrate_tracker;
 mod mining;
+mod mining_pool;
 mod mining_tui;
 mod round_control;
 mod round_driver;
@@ -42,7 +43,7 @@ use crate::backend::{
     PreemptionGranularity, WORK_ID_MAX,
 };
 use crate::config::{
-    BackendKind, BackendSpec, Config, CpuPerformanceProfile, UiMode, WorkAllocation,
+    BackendKind, BackendSpec, Config, CpuPerformanceProfile, MiningMode, UiMode, WorkAllocation,
 };
 use crate::daemon_api::ApiClient;
 use scheduler::NonceReservation;
@@ -183,6 +184,13 @@ enum CpuAutotuneMeasureOutcome {
 }
 
 pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
+    if cfg!(debug_assertions) {
+        warn(
+            "MINER",
+            "debug build detected; expected hashrate is much lower than release. Use a --release build for real mining throughput.",
+        );
+    }
+
     if cfg.bench {
         return bench::run_benchmark(cfg, shutdown.as_ref());
     }
@@ -385,18 +393,21 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
     let cfg = &runtime_cfg;
 
     let backend_executor = backend_executor::BackendExecutor::new();
-
-    let token = cfg
-        .token
-        .clone()
-        .ok_or_else(|| anyhow!("missing API token in mining mode"))?;
-    let client = ApiClient::new(
-        cfg.api_url.clone(),
-        token,
-        cfg.request_timeout,
-        cfg.events_stream_timeout,
-        cfg.events_idle_timeout,
-    )?;
+    let daemon_client = if cfg.mode == MiningMode::Daemon {
+        let token = cfg
+            .token
+            .clone()
+            .ok_or_else(|| anyhow!("missing API token in daemon mining mode"))?;
+        Some(ApiClient::new(
+            cfg.api_url.clone(),
+            token,
+            cfg.request_timeout,
+            cfg.events_stream_timeout,
+            cfg.events_idle_timeout,
+        )?)
+    } else {
+        None
+    };
 
     // Phase 3: Build and activate non-NVIDIA backends synchronously.
     // CPU/Metal start is fast. Non-NVIDIA get IDs 1..M, NVIDIA get IDs M+1..M+N.
@@ -503,13 +514,46 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
     if let Some(hint) = cfg.nvidia_hint {
         info("HINT", hint);
     }
+    info(
+        "CONFIG",
+        format!("data directory: {}", cfg.data_dir.display()),
+    );
+    info(
+        "CONFIG",
+        format!("user settings file: {}", cfg.user_config_path.display()),
+    );
+    if cfg.user_config_created {
+        info(
+            "CONFIG",
+            "created first-run config file (edit this file to change defaults)",
+        );
+    }
 
+    let endpoint_label = match cfg.mode {
+        MiningMode::Daemon => format!("api={}", cfg.api_url),
+        MiningMode::Pool => format!(
+            "pool={} worker={}",
+            cfg.pool_url.as_deref().unwrap_or("<missing-pool-url>"),
+            cfg.pool_worker
+                .as_deref()
+                .unwrap_or("<missing-pool-worker>")
+        ),
+    };
+    let auth_label = if cfg.mode == MiningMode::Daemon {
+        auth_source_label(cfg)
+    } else {
+        "n/a".to_string()
+    };
+    let effective_prefix = match cfg.mode {
+        MiningMode::Daemon => "effective | daemon",
+        MiningMode::Pool => "effective",
+    };
     info(
         "MINER",
         format!(
-            "effective | api={} auth={} backends={} cpu_threads={} ui={}",
-            cfg.api_url,
-            auth_source_label(cfg),
+            "{effective_prefix} | {} auth={} backends={} cpu_threads={} ui={}",
+            endpoint_label,
+            auth_label,
             backend_names(&backends),
             cpu_threads_summary(&backends),
             if tui_state.is_some() { "tui" } else { "plain" }
@@ -676,7 +720,16 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
         }
     }
 
-    let tip_listener = if cfg.sse_enabled {
+    let deferred_backends = if might_have_deferred {
+        Some((deferred_rx, pending_nvidia_count))
+    } else {
+        None
+    };
+
+    let tip_listener = if cfg.mode == MiningMode::Daemon && cfg.sse_enabled {
+        let client = daemon_client
+            .as_ref()
+            .ok_or_else(|| anyhow!("daemon client is not initialized"))?;
         Some(mining::spawn_tip_listener(
             client.clone(),
             Arc::clone(&shutdown),
@@ -687,25 +740,37 @@ pub fn run(cfg: &Config, shutdown: Arc<AtomicBool>) -> Result<()> {
         None
     };
 
-    let deferred_backends = if might_have_deferred {
-        Some((deferred_rx, pending_nvidia_count))
-    } else {
-        None
+    let result = match cfg.mode {
+        MiningMode::Daemon => {
+            let client = daemon_client
+                .as_ref()
+                .ok_or_else(|| anyhow!("daemon client is not initialized"))?;
+            mining::run_mining_loop(
+                cfg,
+                client,
+                Arc::clone(&shutdown),
+                mining::MiningRuntimeBackends {
+                    backends: &mut backends,
+                    backend_events: &backend_events,
+                    backend_executor: &backend_executor,
+                },
+                tui_state,
+                tip_listener.as_ref().map(mining::TipListener::signal),
+                deferred_backends,
+            )
+        }
+        MiningMode::Pool => mining_pool::run_pool_mining_loop(
+            cfg,
+            Arc::clone(&shutdown),
+            mining::MiningRuntimeBackends {
+                backends: &mut backends,
+                backend_events: &backend_events,
+                backend_executor: &backend_executor,
+            },
+            tui_state,
+            deferred_backends,
+        ),
     };
-
-    let result = mining::run_mining_loop(
-        cfg,
-        &client,
-        Arc::clone(&shutdown),
-        mining::MiningRuntimeBackends {
-            backends: &mut backends,
-            backend_events: &backend_events,
-            backend_executor: &backend_executor,
-        },
-        tui_state,
-        tip_listener.as_ref().map(mining::TipListener::signal),
-        deferred_backends,
-    );
 
     let shutdown_requested = shutdown.load(Ordering::SeqCst);
     info("MINER", "shutting down: stopping backends...");
@@ -748,7 +813,15 @@ fn should_enable_tui(cfg: &Config) -> bool {
 fn build_tui_state(cfg: &Config, backends: &[BackendSlot]) -> TuiState {
     let tui_state = new_tui_state();
     if let Ok(mut s) = tui_state.lock() {
-        s.api_url = cfg.api_url.clone();
+        s.mode = match cfg.mode {
+            MiningMode::Pool => "pool".to_string(),
+            MiningMode::Daemon => "daemon".to_string(),
+        };
+        s.api_url = match cfg.mode {
+            MiningMode::Daemon => cfg.api_url.clone(),
+            MiningMode::Pool => cfg.pool_url.clone().unwrap_or_else(|| "---".to_string()),
+        };
+        s.pool_worker = cfg.pool_worker.clone().unwrap_or_else(|| "---".to_string());
         s.threads = cfg.threads;
         s.refresh_secs = cfg.refresh_interval.as_secs();
         s.sse_enabled = cfg.sse_enabled;
@@ -2947,6 +3020,9 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
+            mode: MiningMode::Daemon,
+            pool_url: None,
+            pool_worker: None,
             api_url: "http://127.0.0.1:8332".to_string(),
             token: Some("test-token".to_string()),
             token_cookie_path: None,
@@ -3012,6 +3088,9 @@ mod tests {
             sse_enabled: true,
             refresh_on_same_height: false,
             ui_mode: crate::config::UiMode::Plain,
+            data_dir: std::path::PathBuf::from("./data"),
+            user_config_path: std::path::PathBuf::from("./data/seine.config.json"),
+            user_config_created: false,
             api_server_enabled: false,
             service_mode: false,
             api_bind: "127.0.0.1:9977".to_string(),

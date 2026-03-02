@@ -6,7 +6,7 @@ External miner for Blocknet with pluggable CPU and NVIDIA GPU backends.
 
 ## Quick Start
 
-### 1. Sync the Blocknet daemon
+### 1. Optional: Sync the Blocknet daemon (daemon mode only)
 
 If this is your first time running the daemon, start it without any flags to create a wallet and sync the blockchain:
 
@@ -20,7 +20,7 @@ You will be prompted to set a wallet password. Once the daemon starts, wait for 
 
 When sync is complete, type `exit` to shut down the daemon.
 
-### 2. Restart the daemon with the API enabled
+### 2. Optional: Restart the daemon with the API enabled (daemon mode only)
 
 ```bash
 ./blocknet --daemon --api 127.0.0.1:8332
@@ -45,18 +45,23 @@ cargo build --release
 ### Zero-argument mode (recommended)
 
 Running `./seine` with no flags is the default path.
-Prerequisite: the Blocknet daemon is running with `--api` and has a readable `api.cookie`.
+Default mode is **pool**.
 
-What it auto-detects:
-- daemon API URL from running daemon args (`--api`) when available, else `http://127.0.0.1:8332`
-- daemon auth token from `api.cookie` (using detected daemon data dir, then `--daemon-dir`)
+First startup behavior:
+- prompts for your Blocknet address
+- prompts for pool URL (defaults to `stratum+tcp://127.0.0.1:3333`)
 - mining backends (CPU + NVIDIA when available)
 - CPU thread count from available cores and RAM
 
-If your daemon is not running yet, or you want to override detection, set these explicitly:
+These values are cached in:
+- `./seine-data/seine.config.json` by default (`--data-dir` changes the base directory)
 
 ```bash
-./seine --api-url http://127.0.0.1:8332 --cookie /path/to/data/api.cookie
+# Force daemon mode explicitly
+./seine --mode daemon --api-url http://127.0.0.1:8332 --cookie /path/to/data/api.cookie
+
+# Override pool endpoint and worker in pool mode
+./seine --pool-url stratum+tcp://pool.example.com:3333 --pool-worker rig-01
 ```
 
 Full CLI reference: [`docs/MINER_FLAGS.md`](docs/MINER_FLAGS.md)
@@ -128,14 +133,19 @@ All miner flags are documented in [`docs/MINER_FLAGS.md`](docs/MINER_FLAGS.md).
 # Wallet password (if wallet is encrypted)
 ./seine --wallet-password-file /path/to/wallet.pass
 
-# Mine to a specific payout address (instead of daemon wallet default)
+# Pool mode controls
 ./seine --address PpkFxY...
+./seine --pool-url stratum+tcp://pool.example.com:3333
+./seine --pool-worker rig-01
+
+# Force daemon mode (requires daemon API auth)
+./seine --mode daemon --cookie /path/to/api.cookie
 
 # Plain log output instead of TUI
 ./seine --ui plain
 ```
 
-Note: when `--address` matches the daemon wallet address, Seine keeps wallet pending/unlocked stats in the TUI. If it differs, TUI balance fields show `---` for the override address.
+Note: in daemon mode, when `--address` matches the daemon wallet address, Seine keeps wallet pending/unlocked stats in the TUI. If it differs, TUI balance fields show `---` for the override address.
 
 ## Control API
 
@@ -145,7 +155,7 @@ Full API docs: [`docs/API.md`](docs/API.md)
 ### Service mode (idle until API start)
 
 ```bash
-./seine --service --api-bind 127.0.0.1:9977 --token <daemon-token>
+./seine --service --api-bind 127.0.0.1:9977
 ```
 
 Then start mining via API:
@@ -153,7 +163,12 @@ Then start mining via API:
 ```bash
 curl -s -X POST http://127.0.0.1:9977/v1/miner/start \
   -H 'content-type: application/json' \
-  -d '{}'
+  -d '{
+    "mode":"pool",
+    "mining_address":"PpkFxY...",
+    "pool_url":"stratum+tcp://pool.example.com:3333",
+    "pool_worker":"rig-01"
+  }'
 ```
 
 ### Embedded mode (mine immediately + expose API)
@@ -162,7 +177,7 @@ curl -s -X POST http://127.0.0.1:9977/v1/miner/start \
 ./seine --api-server --api-bind 127.0.0.1:9977
 ```
 
-`/v1/miner/start` accepts `token` or `cookie_path` when you want to inject daemon auth at runtime.
+`/v1/miner/start` accepts mode-specific fields (`mode`, `pool_url`, `pool_worker`, `mining_address`) plus daemon auth fields (`token` or `cookie_path`) when running in daemon mode.
 
 Key endpoints:
 - `GET /v1/runtime/state`

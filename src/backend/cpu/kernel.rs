@@ -111,10 +111,10 @@ pub(super) fn cpu_worker_loop(
             continue;
         }
 
-        let now = Instant::now();
-        let deadline_check_due = now >= next_deadline_check_at;
+        let loop_started_at = Instant::now();
+        let deadline_check_due = loop_started_at >= next_deadline_check_at;
         if control_hashes_remaining == 0 || deadline_check_due {
-            if now >= template.stop_at {
+            if loop_started_at >= template.stop_at {
                 flush_hashes(&shared, thread_idx, &mut pending_hashes);
                 mark_worker_inactive(&shared, &mut worker_active);
                 local_work = None;
@@ -127,7 +127,7 @@ pub(super) fn cpu_worker_loop(
                     .clamp(1, control_check_interval_hashes);
             }
             if deadline_check_due {
-                next_deadline_check_at = now + MAX_DEADLINE_CHECK_INTERVAL;
+                next_deadline_check_at = loop_started_at + MAX_DEADLINE_CHECK_INTERVAL;
             }
         }
 
@@ -153,10 +153,16 @@ pub(super) fn cpu_worker_loop(
         control_hashes_remaining -= 1;
         pending_hashes += 1;
 
-        let should_flush = should_flush_hashes(pending_hashes, now, next_flush_at, hash_batch_size);
+        let hash_completed_at = Instant::now();
+        let should_flush = should_flush_hashes(
+            pending_hashes,
+            hash_completed_at,
+            next_flush_at,
+            hash_batch_size,
+        );
         if should_flush {
             flush_hashes(&shared, thread_idx, &mut pending_hashes);
-            next_flush_at = now + shared.hash_flush_interval;
+            next_flush_at = hash_completed_at + shared.hash_flush_interval;
         }
 
         if hash_meets_target(&output, &template.target) {

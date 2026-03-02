@@ -1,14 +1,20 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use blocknet_pow_spec::CPU_LANE_MEMORY_BYTES;
 use clap::{ArgAction, Parser, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "nvidia")]
 use std::process::Command;
+
+use crate::user_config::{
+    read_user_config, write_user_config, UserConfig, USER_CONFIG_SCHEMA_VERSION,
+};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, ValueEnum)]
 pub enum BackendKind {
@@ -29,6 +35,13 @@ pub enum BenchKind {
 pub enum BenchBaselinePolicy {
     Strict,
     IgnoreEnvironment,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum MiningMode {
+    Pool,
+    Daemon,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -82,6 +95,8 @@ const DEFAULT_NVIDIA_HASHES_PER_LAUNCH_PER_LANE: u32 = 2;
 const DEFAULT_NVIDIA_AUTOTUNE_CONFIG_FILE: &str = "seine.nvidia-autotune.json";
 const DEFAULT_METAL_HASHES_PER_LAUNCH_PER_LANE: u32 = 2;
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8332";
+const DEFAULT_POOL_URL: &str = "stratum+tcp://127.0.0.1:3333";
+const DEFAULT_USER_CONFIG_FILE: &str = "seine.config.json";
 
 #[derive(Debug, Clone)]
 struct DaemonContext {
@@ -150,6 +165,19 @@ pub struct BackendSpec {
     about = "Seine net miner for Blocknet"
 )]
 struct Cli {
+    /// Mining mode. Default is pool mode.
+    #[arg(long, value_enum)]
+    mode: Option<MiningMode>,
+
+    /// Stratum pool endpoint for pool mode.
+    /// Accepts host:port or stratum+tcp://host:port.
+    #[arg(long = "pool-url")]
+    pool_url: Option<String>,
+
+    /// Worker name used when logging into a pool.
+    #[arg(long = "pool-worker")]
+    pool_worker: Option<String>,
+
     /// API base URL for the blocknet daemon.
     /// When omitted, Seine auto-detects from a running daemon and falls back to 127.0.0.1:8332.
     #[arg(long = "api-url")]
@@ -513,6 +541,9 @@ struct Cli {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub mode: MiningMode,
+    pub pool_url: Option<String>,
+    pub pool_worker: Option<String>,
     pub api_url: String,
     pub token: Option<String>,
     pub token_cookie_path: Option<PathBuf>,
@@ -568,6 +599,9 @@ pub struct Config {
     pub sse_enabled: bool,
     pub refresh_on_same_height: bool,
     pub ui_mode: UiMode,
+    pub data_dir: PathBuf,
+    pub user_config_path: PathBuf,
+    pub user_config_created: bool,
     pub api_server_enabled: bool,
     pub service_mode: bool,
     pub api_bind: String,
@@ -589,7 +623,31 @@ pub struct Config {
 
 impl Config {
     pub fn parse() -> Result<Self> {
-        let cli = Cli::parse();
+        let mut cli = Cli::parse();
+        let user_config_path = cli.data_dir.join(DEFAULT_USER_CONFIG_FILE);
+        let user_cfg = read_user_config(&user_config_path)?;
+        let user_config_exists = user_cfg.is_some();
+
+        apply_user_config_defaults(&mut cli, user_cfg.as_ref());
+        let mut user_config_created = false;
+        let should_prompt_for_pool_bootstrap = !cli.bench && !cli.service;
+        if !user_config_exists {
+            if should_prompt_for_pool_bootstrap {
+                resolve_first_run_pool_inputs(&mut cli, &user_config_path)?;
+            }
+            persist_bootstrap_user_config(&cli, &user_config_path)?;
+            user_config_created = true;
+        } else if cli.mode.unwrap_or(MiningMode::Pool) == MiningMode::Pool {
+            ensure_pool_mode_inputs_available(&cli, &user_config_path)?;
+            if cli
+                .pool_worker
+                .as_ref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                cli.pool_worker = Some(generate_default_pool_worker());
+            }
+        }
+
         if let Some(threads) = cli.threads {
             if threads == 0 {
                 bail!("threads must be >= 1");
@@ -598,6 +656,16 @@ impl Config {
         if let Some(mining_address) = cli.mining_address.as_ref() {
             if mining_address.trim().is_empty() {
                 bail!("--address is empty");
+            }
+        }
+        if let Some(pool_url) = cli.pool_url.as_ref() {
+            if normalize_pool_url(pool_url).is_none() {
+                bail!("--pool-url must be host:port or stratum+tcp://host:port");
+            }
+        }
+        if let Some(pool_worker) = cli.pool_worker.as_ref() {
+            if pool_worker.trim().is_empty() {
+                bail!("--pool-worker is empty");
             }
         }
         if cli.nonce_iters_per_lane == 0 {
@@ -793,7 +861,8 @@ impl Config {
             gpu_memory_reservation,
         )?;
 
-        let daemon_context = if cli.bench {
+        let mode = cli.mode.unwrap_or(MiningMode::Pool);
+        let daemon_context = if cli.bench || mode == MiningMode::Pool {
             None
         } else {
             detect_daemon_context()
@@ -806,7 +875,7 @@ impl Config {
             );
         }
 
-        let (token, token_cookie_path) = if cli.bench {
+        let (token, token_cookie_path) = if cli.bench || mode == MiningMode::Pool {
             (None, None)
         } else if cli.service {
             resolve_service_token_with_source(&cli, daemon_context.as_ref())?
@@ -814,7 +883,14 @@ impl Config {
             let (token, cookie_path) = resolve_token_with_source(&cli, daemon_context.as_ref())?;
             (Some(token), cookie_path)
         };
-        let api_url = resolve_api_url(cli.api_url.as_deref(), daemon_context.as_ref());
+        let api_url = if mode == MiningMode::Daemon {
+            resolve_api_url(cli.api_url.as_deref(), daemon_context.as_ref())
+        } else {
+            cli.api_url
+                .as_deref()
+                .map(normalize_api_url)
+                .unwrap_or_else(|| DEFAULT_API_URL.to_string())
+        };
         let strict_round_accounting = cli.strict_round_accounting && !cli.relaxed_accounting;
         let nvidia_enforce_template_stop = match cli.nvidia_template_stop_policy {
             NvidiaTemplateStopPolicy::Auto => strict_round_accounting,
@@ -823,6 +899,12 @@ impl Config {
         };
 
         Ok(Self {
+            mode,
+            pool_url: cli.pool_url.as_deref().and_then(normalize_pool_url),
+            pool_worker: cli
+                .pool_worker
+                .as_ref()
+                .map(|value| value.trim().to_string()),
             api_url,
             token,
             token_cookie_path,
@@ -886,6 +968,9 @@ impl Config {
             sse_enabled: !cli.disable_sse,
             refresh_on_same_height: cli.refresh_on_same_height,
             ui_mode: cli.ui,
+            data_dir: cli.data_dir,
+            user_config_path,
+            user_config_created,
             api_server_enabled,
             service_mode: cli.service,
             api_bind: cli.api_bind,
@@ -1278,6 +1363,186 @@ fn normalize_api_url(input: &str) -> String {
     format!("http://{trimmed}")
 }
 
+fn normalize_pool_url(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let authority = trimmed
+        .strip_prefix("stratum+tcp://")
+        .unwrap_or(trimmed)
+        .split('/')
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    if authority.is_empty() || authority.contains("://") {
+        return None;
+    }
+    let (host, port) = parse_host_port(authority)?;
+    let host_for_url = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Some(format!("stratum+tcp://{host_for_url}:{port}"))
+}
+
+fn apply_user_config_defaults(cli: &mut Cli, user_cfg: Option<&UserConfig>) {
+    if let Some(user_cfg) = user_cfg {
+        if cli.mode.is_none() {
+            cli.mode = user_cfg.mode;
+        }
+        if cli.mining_address.is_none() {
+            cli.mining_address = user_cfg.address.clone();
+        }
+        if cli.pool_url.is_none() {
+            cli.pool_url = user_cfg.pool_url.clone();
+        }
+        if cli.pool_worker.is_none() {
+            cli.pool_worker = user_cfg.pool_worker.clone();
+        }
+    }
+
+    if cli.mode.is_none() {
+        cli.mode = Some(MiningMode::Pool);
+    }
+}
+
+fn resolve_first_run_pool_inputs(cli: &mut Cli, user_config_path: &Path) -> Result<()> {
+    let mode = cli.mode.unwrap_or(MiningMode::Pool);
+    cli.mode = Some(mode);
+    if mode != MiningMode::Pool {
+        return Ok(());
+    }
+
+    let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+
+    if cli
+        .mining_address
+        .as_ref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        if !interactive {
+            bail!(
+                "pool mode first startup requires an address in non-interactive mode.\n\
+                 Provide --address and --pool-url, or create {} manually.",
+                user_config_path.display()
+            );
+        }
+        let address =
+            prompt_required_value("Enter your Blocknet address (used for pool login): ", None)?;
+        cli.mining_address = Some(address);
+    }
+
+    if cli
+        .pool_url
+        .as_ref()
+        .and_then(|value| normalize_pool_url(value))
+        .is_none()
+    {
+        if !interactive {
+            bail!(
+                "pool mode first startup requires --pool-url in non-interactive mode.\n\
+                 Provide --address and --pool-url, or create {} manually.",
+                user_config_path.display()
+            );
+        }
+        let pool_url = prompt_required_value(
+            "Enter pool URL [default: stratum+tcp://127.0.0.1:3333]: ",
+            Some(DEFAULT_POOL_URL),
+        )?;
+        cli.pool_url = Some(pool_url);
+    }
+
+    if cli
+        .pool_worker
+        .as_ref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        cli.pool_worker = Some(generate_default_pool_worker());
+    }
+
+    Ok(())
+}
+
+fn ensure_pool_mode_inputs_available(cli: &Cli, user_config_path: &Path) -> Result<()> {
+    let mode = cli.mode.unwrap_or(MiningMode::Pool);
+    if mode != MiningMode::Pool {
+        return Ok(());
+    }
+    if cli
+        .mining_address
+        .as_ref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        bail!(
+            "pool mode requires a mining address.\n\
+             Pass --address or edit {}.",
+            user_config_path.display()
+        );
+    }
+    if cli
+        .pool_url
+        .as_ref()
+        .and_then(|value| normalize_pool_url(value))
+        .is_none()
+    {
+        bail!(
+            "pool mode requires a valid pool URL.\n\
+             Pass --pool-url (host:port or stratum+tcp://host:port) or edit {}.",
+            user_config_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn persist_bootstrap_user_config(cli: &Cli, user_config_path: &Path) -> Result<()> {
+    let mode = cli.mode.unwrap_or(MiningMode::Pool);
+    let cfg = UserConfig {
+        schema_version: USER_CONFIG_SCHEMA_VERSION,
+        mode: Some(mode),
+        address: cli
+            .mining_address
+            .as_ref()
+            .map(|value| value.trim().to_string()),
+        pool_url: cli.pool_url.as_deref().and_then(normalize_pool_url),
+        pool_worker: cli
+            .pool_worker
+            .as_ref()
+            .map(|value| value.trim().to_string()),
+    };
+    write_user_config(user_config_path, &cfg)
+}
+
+fn prompt_required_value(prompt: &str, default: Option<&str>) -> Result<String> {
+    loop {
+        eprint!("{prompt}");
+        io::stderr().flush()?;
+        let mut line = String::new();
+        io::stdin()
+            .read_line(&mut line)
+            .context("failed reading user input")?;
+        let value = line.trim();
+        if value.is_empty() {
+            if let Some(default) = default {
+                return Ok(default.to_string());
+            }
+            continue;
+        }
+        return Ok(value.to_string());
+    }
+}
+
+fn generate_default_pool_worker() -> String {
+    let mut buf = [0u8; 2];
+    if getrandom::getrandom(&mut buf).is_ok() {
+        let value = u16::from_le_bytes(buf) % 10_000;
+        return format!("seine-{value:04}");
+    }
+    format!("seine-{:04}", default_nonce_seed() as u16 % 10_000)
+}
+
 fn default_nonce_seed() -> u64 {
     let mut buf = [0u8; 8];
     getrandom::getrandom(&mut buf).expect("OS randomness should be available");
@@ -1463,6 +1728,7 @@ fn expand_backend_specs(
 /// Uses `sysctlbyname("hw.perflevel0.logicalcpu")` which returns the P-core
 /// count on heterogeneous (big.LITTLE) Apple Silicon SoCs.  Falls back to
 /// `None` on non-macOS, Intel Macs (no perflevels), or if the query fails.
+#[allow(dead_code)]
 fn pcore_count() -> Option<usize> {
     #[cfg(target_os = "macos")]
     {
@@ -1506,6 +1772,7 @@ fn logical_cpu_parallelism() -> usize {
         .max(1)
 }
 
+#[allow(dead_code)]
 fn macos_hybrid_pcore_parallelism_cap(pcore_count: usize, logical_parallelism: usize) -> usize {
     let logical_parallelism = logical_parallelism.max(1);
     let pcore_count = pcore_count.max(1).min(logical_parallelism);
@@ -1524,6 +1791,10 @@ fn cpu_parallelism_cap(affinity: CpuAffinityMode) -> usize {
                 return macos_hybrid_pcore_parallelism_cap(pcore_count, logical_parallelism);
             }
         }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = affinity;
     }
     logical_parallelism
 }
@@ -1727,6 +1998,9 @@ mod tests {
 
     fn sample_cli() -> Cli {
         Cli {
+            mode: Some(MiningMode::Daemon),
+            pool_url: None,
+            pool_worker: None,
             api_url: None,
             token: None,
             wallet_password: None,
