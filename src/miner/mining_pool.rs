@@ -441,6 +441,9 @@ fn handle_pool_event(
             if ack.accepted {
                 stats.bump_accepted();
                 success("SHARE", "accepted");
+                if let Some(display) = tui.as_mut() {
+                    display.mark_block_found();
+                }
             } else {
                 stats.bump_stale_shares();
                 let reason = ack.error.as_deref().unwrap_or("unknown");
@@ -721,16 +724,12 @@ impl PoolUiTelemetryClient {
             .map_err(|err| anyhow!("GET {} failed: {err}", self.stats_url))?;
 
         let hashrate = body
-            .pointer("/pool/hashrate")
+            .pointer("/chain/network_hashrate")
             .and_then(value_as_f64)
-            .or_else(|| body.pointer("/hashrate").and_then(value_as_f64))
-            .or_else(|| {
-                body.pointer("/pool/estimated_hashrate")
-                    .and_then(value_as_f64)
-            })
-            .ok_or_else(|| anyhow!("missing pool hashrate field"))?;
+            .or_else(|| body.pointer("/network_hashrate").and_then(value_as_f64))
+            .ok_or_else(|| anyhow!("missing network hashrate field"))?;
         if !hashrate.is_finite() || hashrate < 0.0 {
-            bail!("invalid pool.hashrate value");
+            bail!("invalid network hashrate value");
         }
         Ok(format_hashrate_ui(hashrate))
     }
