@@ -19,6 +19,9 @@ const STRATUM_PROTOCOL_VERSION: u32 = 2;
 const STRATUM_CAPABILITY_LOGIN_NEGOTIATION: &str = "login_negotiation";
 const STRATUM_CAPABILITY_VALIDATION_STATUS: &str = "share_validation_status";
 const STRATUM_CAPABILITY_SUBMIT_CLAIMED_HASH: &str = "submit_claimed_hash";
+const SUBMIT_REJECT_REASON_DISCONNECTED: &str = "pool disconnected";
+const SUBMIT_REJECT_REASON_LOGIN_REJECTED: &str = "pool login rejected";
+const SUBMIT_REJECT_REASON_SEND_FAILED: &str = "submit interrupted during reconnect";
 
 const CLIENT_CAPABILITIES: &[&str] = &[
     STRATUM_CAPABILITY_LOGIN_NEGOTIATION,
@@ -214,8 +217,18 @@ fn run_pool_client_thread(
     while !shutdown.load(Ordering::Relaxed) {
         match connect_pool_stream(&endpoint) {
             Ok((mut stream, mut reader)) => {
+                reject_queued_submits(
+                    &event_tx,
+                    &submit_rx,
+                    SUBMIT_REJECT_REASON_DISCONNECTED,
+                );
                 let _ = event_tx.try_send(PoolEvent::Connected);
                 if let Err(_err) = send_login(&mut stream, &address, &worker) {
+                    reject_queued_submits(
+                        &event_tx,
+                        &submit_rx,
+                        SUBMIT_REJECT_REASON_DISCONNECTED,
+                    );
                     let _ = event_tx.try_send(PoolEvent::Disconnected(format!(
                         "{}",
                         friendly_pool_disconnect_message(&endpoint)
@@ -233,26 +246,43 @@ fn run_pool_client_thread(
                     }
 
                     let mut reconnect_requested = false;
-                    while let Ok(submit) = submit_rx.try_recv() {
-                        let request_id = next_request_id;
-                        next_request_id = next_request_id.wrapping_add(1).max(LOGIN_REQUEST_ID + 1);
-                        if send_submit(
-                            &mut stream,
-                            request_id,
-                            &submit,
-                            submit_claimed_hash_enabled,
-                        )
-                        .is_err()
-                        {
-                            let _ = event_tx.try_send(PoolEvent::Disconnected(format!(
-                                "{}",
-                                friendly_pool_disconnect_message(&endpoint)
-                            )));
-                            pending_submits.clear();
-                            reconnect_requested = true;
-                            break;
+                    if login_confirmed {
+                        while let Ok(submit) = submit_rx.try_recv() {
+                            let request_id = next_request_id;
+                            next_request_id =
+                                next_request_id.wrapping_add(1).max(LOGIN_REQUEST_ID + 1);
+                            if send_submit(
+                                &mut stream,
+                                request_id,
+                                &submit,
+                                submit_claimed_hash_enabled,
+                            )
+                            .is_err()
+                            {
+                                reject_submit(
+                                    &event_tx,
+                                    submit,
+                                    SUBMIT_REJECT_REASON_SEND_FAILED,
+                                );
+                                reject_pending_submits(
+                                    &event_tx,
+                                    &mut pending_submits,
+                                    SUBMIT_REJECT_REASON_SEND_FAILED,
+                                );
+                                reject_queued_submits(
+                                    &event_tx,
+                                    &submit_rx,
+                                    SUBMIT_REJECT_REASON_SEND_FAILED,
+                                );
+                                let _ = event_tx.try_send(PoolEvent::Disconnected(format!(
+                                    "{}",
+                                    friendly_pool_disconnect_message(&endpoint)
+                                )));
+                                reconnect_requested = true;
+                                break;
+                            }
+                            pending_submits.insert(request_id, submit);
                         }
-                        pending_submits.insert(request_id, submit);
                     }
                     if reconnect_requested {
                         sleep_with_shutdown(&shutdown, RECONNECT_DELAY);
@@ -262,6 +292,16 @@ fn run_pool_client_thread(
                     let mut line = String::new();
                     match reader.read_line(&mut line) {
                         Ok(0) => {
+                            reject_pending_submits(
+                                &event_tx,
+                                &mut pending_submits,
+                                SUBMIT_REJECT_REASON_DISCONNECTED,
+                            );
+                            reject_queued_submits(
+                                &event_tx,
+                                &submit_rx,
+                                SUBMIT_REJECT_REASON_DISCONNECTED,
+                            );
                             let _ = event_tx.try_send(PoolEvent::Disconnected(format!(
                                 "{}",
                                 friendly_pool_disconnect_message(&endpoint)
@@ -273,15 +313,43 @@ fn run_pool_client_thread(
                             if trimmed.is_empty() {
                                 continue;
                             }
-                            if let Some(event) = decode_pool_message(
+                            if let Some(mut event) = decode_pool_message(
                                 trimmed,
                                 &mut login_confirmed,
                                 &mut pending_submits,
                             ) {
                                 if let PoolEvent::LoginAccepted(ack) = &event {
-                                    submit_claimed_hash_enabled = should_send_claimed_hash(ack);
+                                    match evaluate_login_ack(ack) {
+                                        Ok(include_claimed_hash) => {
+                                            submit_claimed_hash_enabled = include_claimed_hash;
+                                        }
+                                        Err(message) => {
+                                            login_confirmed = false;
+                                            event = PoolEvent::LoginRejected(message);
+                                        }
+                                    }
                                 }
+                                let login_rejected =
+                                    matches!(&event, PoolEvent::LoginRejected(_));
                                 let _ = event_tx.try_send(event);
+                                if login_rejected {
+                                    reject_pending_submits(
+                                        &event_tx,
+                                        &mut pending_submits,
+                                        SUBMIT_REJECT_REASON_LOGIN_REJECTED,
+                                    );
+                                    reject_queued_submits(
+                                        &event_tx,
+                                        &submit_rx,
+                                        SUBMIT_REJECT_REASON_LOGIN_REJECTED,
+                                    );
+                                    let _ = event_tx.try_send(PoolEvent::Disconnected(format!(
+                                        "{}",
+                                        friendly_pool_disconnect_message(&endpoint)
+                                    )));
+                                    sleep_with_shutdown(&shutdown, RECONNECT_DELAY);
+                                    break;
+                                }
                             }
                         }
                         Err(err)
@@ -292,6 +360,16 @@ fn run_pool_client_thread(
                                     | ErrorKind::Interrupted
                             ) => {}
                         Err(_err) => {
+                            reject_pending_submits(
+                                &event_tx,
+                                &mut pending_submits,
+                                SUBMIT_REJECT_REASON_DISCONNECTED,
+                            );
+                            reject_queued_submits(
+                                &event_tx,
+                                &submit_rx,
+                                SUBMIT_REJECT_REASON_DISCONNECTED,
+                            );
                             let _ = event_tx.try_send(PoolEvent::Disconnected(format!(
                                 "{}",
                                 friendly_pool_disconnect_message(&endpoint)
@@ -302,6 +380,11 @@ fn run_pool_client_thread(
                 }
             }
             Err(err) => {
+                reject_queued_submits(
+                    &event_tx,
+                    &submit_rx,
+                    SUBMIT_REJECT_REASON_DISCONNECTED,
+                );
                 let detail = format!("{err:#}");
                 let _ = event_tx.try_send(PoolEvent::Disconnected(friendly_pool_connect_error(
                     &endpoint, &detail,
@@ -473,15 +556,19 @@ fn decode_pool_message(
     let accepted = if msg.error.is_some() {
         false
     } else if let Some(result) = result {
-        result
-            .get("accepted")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
+        if let Some(value) = result.get("accepted").and_then(Value::as_bool) {
+            value
+        } else {
+            msg.status
+                .as_deref()
+                .map(|status| status.eq_ignore_ascii_case("ok"))
+                .unwrap_or(false)
+        }
     } else {
         msg.status
             .as_deref()
             .map(|status| status.eq_ignore_ascii_case("ok"))
-            .unwrap_or(true)
+            .unwrap_or(false)
     };
     let difficulty = result
         .and_then(|value| value.get("difficulty"))
@@ -554,6 +641,51 @@ fn should_send_claimed_hash(ack: &PoolLoginAck) -> bool {
         return true;
     }
     ack.supports(STRATUM_CAPABILITY_SUBMIT_CLAIMED_HASH)
+        || ack
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == STRATUM_CAPABILITY_SUBMIT_CLAIMED_HASH)
+}
+
+fn evaluate_login_ack(ack: &PoolLoginAck) -> std::result::Result<bool, String> {
+    for capability in &ack.required_capabilities {
+        if !CLIENT_CAPABILITIES.iter().any(|supported| supported == capability) {
+            return Err(format!(
+                "pool requires unsupported capability {capability}"
+            ));
+        }
+    }
+    Ok(should_send_claimed_hash(ack))
+}
+
+fn reject_submit(event_tx: &Sender<PoolEvent>, submit: PoolSubmit, reason: &str) {
+    let _ = event_tx.try_send(PoolEvent::SubmitAck(PoolSubmitAck {
+        job_id: submit.job_id,
+        nonce: submit.nonce,
+        accepted: false,
+        difficulty: None,
+        error: Some(reason.to_string()),
+    }));
+}
+
+fn reject_pending_submits(
+    event_tx: &Sender<PoolEvent>,
+    pending_submits: &mut HashMap<u64, PoolSubmit>,
+    reason: &str,
+) {
+    for (_, submit) in pending_submits.drain() {
+        reject_submit(event_tx, submit, reason);
+    }
+}
+
+fn reject_queued_submits(
+    event_tx: &Sender<PoolEvent>,
+    submit_rx: &Receiver<PoolSubmit>,
+    reason: &str,
+) {
+    while let Ok(submit) = submit_rx.try_recv() {
+        reject_submit(event_tx, submit, reason);
+    }
 }
 
 fn parse_pool_endpoint(pool_url: &str) -> Result<String> {
@@ -590,8 +722,12 @@ fn sleep_with_shutdown(shutdown: &AtomicBool, duration: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::thread;
+    use std::time::{Duration, Instant};
 
     fn capture_payload<F>(writer: F) -> Value
     where
@@ -800,6 +936,13 @@ mod tests {
             required_capabilities: Vec::new(),
         };
         assert!(should_send_claimed_hash(&negotiated_with_claimed_hash));
+
+        let required_claimed_hash = PoolLoginAck {
+            protocol_version: 2,
+            capabilities: Vec::new(),
+            required_capabilities: vec![STRATUM_CAPABILITY_SUBMIT_CLAIMED_HASH.to_string()],
+        };
+        assert!(should_send_claimed_hash(&required_claimed_hash));
     }
 
     #[test]
@@ -827,5 +970,323 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn decode_submit_ack_without_status_or_accepted_is_rejected() {
+        let mut login_confirmed = true;
+        let mut pending_submits = HashMap::<u64, PoolSubmit>::new();
+        pending_submits.insert(
+            9,
+            PoolSubmit {
+                job_id: "job-ambiguous".to_string(),
+                nonce: 88,
+                claimed_hash: None,
+            },
+        );
+        let raw = r#"{"id":9,"result":{}}"#;
+
+        let event = decode_pool_message(raw, &mut login_confirmed, &mut pending_submits)
+            .expect("submit response should decode");
+        match event {
+            PoolEvent::SubmitAck(ack) => {
+                assert!(!ack.accepted, "ambiguous submit ack should be treated as rejected");
+                assert_eq!(ack.error.as_deref(), Some("pool rejected share"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_login_ack_rejects_unsupported_required_capability() {
+        let ack = PoolLoginAck {
+            protocol_version: 2,
+            capabilities: vec![STRATUM_CAPABILITY_SUBMIT_CLAIMED_HASH.to_string()],
+            required_capabilities: vec!["future_capability".to_string()],
+        };
+        let err = evaluate_login_ack(&ack).expect_err("unsupported capability should fail login");
+        assert!(err.contains("unsupported capability"));
+        assert!(err.contains("future_capability"));
+    }
+
+    #[test]
+    fn pool_client_waits_for_login_before_sending_submit() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("test listener should bind to loopback");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose local address");
+
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("server should accept client");
+            let mut reader = BufReader::new(
+                socket
+                    .try_clone()
+                    .expect("server socket clone should succeed"),
+            );
+            reader
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+
+            let mut login_line = String::new();
+            reader
+                .read_line(&mut login_line)
+                .expect("server should read login");
+            let login_value: Value =
+                serde_json::from_str(login_line.trim()).expect("login payload should decode");
+            assert_eq!(
+                login_value.get("method").and_then(Value::as_str),
+                Some("login")
+            );
+
+            // Before login acknowledgement, submit must not be written.
+            reader
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .expect("set short read timeout");
+            let mut pre_login_submit = String::new();
+            match reader.read_line(&mut pre_login_submit) {
+                Err(err)
+                    if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Ok(_) => panic!(
+                    "submit arrived before login ack: {}",
+                    pre_login_submit.trim()
+                ),
+                Err(err) => panic!("unexpected read error before login ack: {err}"),
+            }
+
+            let login_ack = serde_json::json!({
+                "id": LOGIN_REQUEST_ID,
+                "status": "ok",
+                "result": {
+                    "protocol_version": 2,
+                    "capabilities": ["submit_claimed_hash"],
+                    "required_capabilities": []
+                }
+            });
+            let mut login_ack_bytes =
+                serde_json::to_vec(&login_ack).expect("serialize login ack should succeed");
+            login_ack_bytes.push(b'\n');
+            socket
+                .write_all(&login_ack_bytes)
+                .expect("server should write login ack");
+
+            reader
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout for submit");
+            let mut submit_line = String::new();
+            reader
+                .read_line(&mut submit_line)
+                .expect("server should read submit after login ack");
+            let submit_value: Value =
+                serde_json::from_str(submit_line.trim()).expect("submit payload should decode");
+            assert_eq!(
+                submit_value.get("method").and_then(Value::as_str),
+                Some("submit")
+            );
+        });
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let client = PoolClient::connect(
+            &format!("127.0.0.1:{}", addr.port()),
+            "BTestAddress".to_string(),
+            "rig01".to_string(),
+            Arc::clone(&shutdown),
+        )
+        .expect("pool client should connect");
+        let mut saw_login_accepted = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(PoolEvent::LoginAccepted(_)) =
+                client.recv_event_timeout(Duration::from_millis(200))
+            {
+                saw_login_accepted = true;
+                break;
+            }
+        }
+        assert!(saw_login_accepted, "expected login accepted event");
+        client
+            .submit_share("job-1".to_string(), 42, Some([0xAA; 32]))
+            .expect("submit should enqueue");
+
+        server.join().expect("server thread should finish");
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn pool_client_reconnects_after_login_rejection() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("test listener should bind to loopback");
+        listener
+            .set_nonblocking(true)
+            .expect("listener should allow nonblocking accept");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose local address");
+
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let accept_next = || loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "timed out waiting for client connection"
+                        );
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(err) => panic!("accept failed: {err}"),
+                }
+            };
+
+            let mut first = accept_next();
+            let mut first_reader = BufReader::new(
+                first
+                    .try_clone()
+                    .expect("first socket clone should succeed"),
+            );
+            first_reader
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            let mut first_login = String::new();
+            first_reader
+                .read_line(&mut first_login)
+                .expect("server should read first login");
+            let first_login_value: Value =
+                serde_json::from_str(first_login.trim()).expect("first login should decode");
+            assert_eq!(
+                first_login_value.get("method").and_then(Value::as_str),
+                Some("login")
+            );
+            first
+                .write_all(br#"{"id":1,"error":"bad login"}"#)
+                .expect("server should write login rejection");
+            first.write_all(b"\n").expect("server should terminate line");
+            drop(first);
+
+            let mut second = accept_next();
+            let mut second_reader = BufReader::new(
+                second
+                    .try_clone()
+                    .expect("second socket clone should succeed"),
+            );
+            second_reader
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            let mut second_login = String::new();
+            second_reader
+                .read_line(&mut second_login)
+                .expect("server should read reconnect login");
+            let second_login_value: Value =
+                serde_json::from_str(second_login.trim()).expect("second login should decode");
+            assert_eq!(
+                second_login_value.get("method").and_then(Value::as_str),
+                Some("login")
+            );
+            second
+                .write_all(br#"{"id":1,"status":"ok","result":{"protocol_version":2,"capabilities":["submit_claimed_hash"],"required_capabilities":[]}}"#)
+                .expect("server should write second login ack");
+            second.write_all(b"\n").expect("server should terminate line");
+        });
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let _client = PoolClient::connect(
+            &format!("127.0.0.1:{}", addr.port()),
+            "BTestAddress".to_string(),
+            "rig01".to_string(),
+            Arc::clone(&shutdown),
+        )
+        .expect("pool client should connect");
+
+        server.join().expect("server thread should finish");
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn pool_client_rejects_queued_submit_when_login_is_rejected() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("test listener should bind to loopback");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose local address");
+
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("server should accept client");
+            let mut reader = BufReader::new(
+                socket
+                    .try_clone()
+                    .expect("server socket clone should succeed"),
+            );
+            reader
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            let mut login_line = String::new();
+            reader
+                .read_line(&mut login_line)
+                .expect("server should read login");
+            let login_value: Value =
+                serde_json::from_str(login_line.trim()).expect("login payload should decode");
+            assert_eq!(
+                login_value.get("method").and_then(Value::as_str),
+                Some("login")
+            );
+            thread::sleep(Duration::from_millis(200));
+
+            socket
+                .write_all(br#"{"id":1,"error":"rejected"}"#)
+                .expect("server should write rejection");
+            socket.write_all(b"\n").expect("server should terminate line");
+        });
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let client = PoolClient::connect(
+            &format!("127.0.0.1:{}", addr.port()),
+            "BTestAddress".to_string(),
+            "rig01".to_string(),
+            Arc::clone(&shutdown),
+        )
+        .expect("pool client should connect");
+        let mut saw_connected = false;
+        let connect_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < connect_deadline {
+            if let Some(PoolEvent::Connected) =
+                client.recv_event_timeout(Duration::from_millis(200))
+            {
+                saw_connected = true;
+                break;
+            }
+        }
+        assert!(saw_connected, "expected connected event before submit");
+        client
+            .submit_share("job-queued".to_string(), 7, None)
+            .expect("submit should enqueue");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_rejected_submit = false;
+        while Instant::now() < deadline {
+            if let Some(event) = client.recv_event_timeout(Duration::from_millis(200)) {
+                if let PoolEvent::SubmitAck(ack) = event {
+                    assert!(!ack.accepted, "queued submit should be rejected");
+                    let message = ack.error.unwrap_or_default();
+                    assert!(
+                        message.contains("login rejected")
+                            || message.contains("disconnected"),
+                        "expected login/disconnect rejection reason, got: {message}"
+                    );
+                    saw_rejected_submit = true;
+                    break;
+                }
+            }
+        }
+
+        server.join().expect("server thread should finish");
+        shutdown.store(true, Ordering::Relaxed);
+        assert!(saw_rejected_submit, "expected rejected submit ack event");
     }
 }
