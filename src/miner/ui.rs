@@ -167,16 +167,18 @@ fn log(level: Level, tag: &str, message: &str) {
     });
 
     if let Some(tui_state) = TUI_STATE.get() {
-        if suppress_in_tui(tag, message) {
-            return;
-        }
-        let entry = LogEntry {
-            elapsed_secs,
-            level: level_to_tui(level),
-            tag: tag.to_string(),
-            message: message.to_string(),
-        };
         if let Ok(mut state) = tui_state.lock() {
+            if suppress_in_tui(tag, message)
+                || suppress_dev_fee_related_in_tui(tag, message, state.dev_fee_active)
+            {
+                return;
+            }
+            let entry = LogEntry {
+                elapsed_secs,
+                level: level_to_tui(level),
+                tag: tag.to_string(),
+                message: message.to_string(),
+            };
             state.push_log(entry);
             return;
         }
@@ -239,6 +241,22 @@ fn suppress_in_tui(tag: &str, message: &str) -> bool {
         return true;
     }
     tag == "NETWORK" && message == "blocktemplate fetch recovered"
+}
+
+fn suppress_dev_fee_related_in_tui(tag: &str, message: &str, dev_fee_active: bool) -> bool {
+    if tag == "DEV FEE" {
+        return true;
+    }
+    if tag == "CONN" && message.starts_with("switching pool session:") {
+        return true;
+    }
+    if matches!(tag, "CONN" | "AUTH") && message.contains("dev session") {
+        return true;
+    }
+    if tag == "SHARE" && message.contains("(dev)") {
+        return true;
+    }
+    dev_fee_active && matches!(tag, "CONN" | "AUTH" | "JOB" | "SHARE" | "VARDIFF")
 }
 
 fn frame_top(colors: bool) {
@@ -518,7 +536,7 @@ fn lock<T>(mutex: &'static Mutex<T>) -> MutexGuard<'static, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::suppress_in_tui;
+    use super::{suppress_dev_fee_related_in_tui, suppress_in_tui};
 
     #[test]
     fn suppresses_telemetry_lines_in_tui() {
@@ -543,5 +561,44 @@ mod tests {
         ));
         assert!(suppress_in_tui("NETWORK", "blocktemplate fetch recovered"));
         assert!(!suppress_in_tui("MINER", "connected and mining"));
+    }
+
+    #[test]
+    fn suppresses_dev_fee_related_lines_in_tui() {
+        assert!(suppress_dev_fee_related_in_tui(
+            "DEV FEE",
+            "mining for dev",
+            false
+        ));
+        assert!(suppress_dev_fee_related_in_tui(
+            "CONN",
+            "switching pool session: user -> dev",
+            false
+        ));
+        assert!(suppress_dev_fee_related_in_tui(
+            "AUTH",
+            "dev session login accepted",
+            false
+        ));
+        assert!(suppress_dev_fee_related_in_tui(
+            "SHARE",
+            "accepted (dev)",
+            false
+        ));
+        assert!(suppress_dev_fee_related_in_tui(
+            "JOB",
+            "new job height=3133 difficulty=60",
+            true
+        ));
+        assert!(!suppress_dev_fee_related_in_tui(
+            "JOB",
+            "new job height=3134 difficulty=59",
+            false
+        ));
+        assert!(!suppress_dev_fee_related_in_tui(
+            "MINER",
+            "connected and mining",
+            true
+        ));
     }
 }
