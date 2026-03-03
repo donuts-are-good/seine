@@ -704,18 +704,26 @@ fn draw_config_runtime_panel(frame: &mut ratatui::Frame, area: Rect, state: &Tui
 fn draw_config_wallet_panel(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner) {
     let address_str = compact_wallet_address(&state.wallet_address);
     let inner_width = area.width.saturating_sub(2) as usize;
+    let is_pool_mode = state.mode == "pool";
+    let title = if is_pool_mode {
+        " POOL BALANCE "
+    } else {
+        " WALLET "
+    };
+    let right_label = if is_pool_mode { "Miner" } else { "Address" };
+    let second_label = if is_pool_mode { "Paid" } else { "Unlocked" };
     let wallet_lines = vec![
         wallet_line_with_right(
             "Pending",
             &state.wallet_pending,
-            "Address",
+            right_label,
             &address_str,
             inner_width,
         ),
-        kv_line("Unlocked", &state.wallet_unlocked),
+        kv_line(second_label, &state.wallet_unlocked),
     ];
     let wallet_block = Block::default()
-        .title(Span::styled(" WALLET ", TITLE_STYLE))
+        .title(Span::styled(title, TITLE_STYLE))
         .borders(Borders::ALL)
         .border_style(BORDER_STYLE);
     let wallet = Paragraph::new(wallet_lines).block(wallet_block);

@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use crossbeam_channel::Receiver;
+use reqwest::blocking::Client as HttpClient;
+use serde_json::Value;
 
 use crate::backend::MiningSolution;
 use crate::config::{Config, WorkAllocation};
@@ -18,7 +20,7 @@ use super::mining_tui::{
 };
 use super::runtime::{maybe_print_stats, seed_backend_weights, work_distribution_weights};
 use super::scheduler::NonceReservation;
-use super::stats::Stats;
+use super::stats::{format_hashrate_ui, Stats};
 use super::tui::TuiState;
 use super::ui::{error, info, success, warn};
 use super::{
@@ -30,6 +32,19 @@ const POOL_WAIT_POLL: Duration = Duration::from_millis(200);
 const POOL_EVENT_IDLE_SLEEP: Duration = Duration::from_millis(5);
 const POOL_JOB_STOP_AT_HORIZON: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const POOL_MAX_PENDING_SUBMITS: usize = 1;
+const POOL_TELEMETRY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const POOL_TELEMETRY_TIMEOUT: Duration = Duration::from_millis(750);
+const POOL_API_DEFAULT_PORT: u16 = 24783;
+const ATOMIC_UNITS_PER_BNT: u64 = 100_000_000;
+const BNT_DISPLAY_DECIMALS: usize = 4;
+const BNT_DISPLAY_SCALE_ATOMIC_UNITS: u64 = 10_000;
+
+#[derive(Debug)]
+struct PoolUiTelemetryClient {
+    stats_url: String,
+    miner_url: String,
+    http: HttpClient,
+}
 
 struct ActivePoolJob {
     job: PoolJob,
@@ -128,16 +143,66 @@ pub(super) fn run_pool_mining_loop(
     )?;
     let compact_address = compact_pool_address_for_log(&address);
     info(
-        "POOL",
+        "CONN",
         format!("connecting to {pool_url} as {compact_address}.{worker}"),
     );
+    let pool_ui_telemetry = PoolUiTelemetryClient::new(&pool_url, &address);
+    if pool_ui_telemetry.is_none() {
+        warn(
+            "STATS",
+            "pool telemetry unavailable: could not derive pool API URL",
+        );
+    }
 
     let mut active_job: Option<ActivePoolJob> = None;
     let mut pending_nvidia_logged = false;
+    let mut pool_network_hashrate = "unknown".to_string();
+    let mut next_pool_telemetry_refresh = Instant::now();
+    let mut pool_telemetry_warning_logged = false;
 
     while !shutdown.load(Ordering::Relaxed) {
         if backends.is_empty() {
             bail!("all mining backends are unavailable");
+        }
+
+        if let Some(telemetry) = pool_ui_telemetry.as_ref() {
+            if Instant::now() >= next_pool_telemetry_refresh {
+                let mut errors = Vec::new();
+                match telemetry.fetch_pool_hashrate() {
+                    Ok(hashrate) => {
+                        pool_network_hashrate = hashrate;
+                    }
+                    Err(err) => {
+                        errors.push(format!("global hashrate: {err:#}"));
+                    }
+                }
+                match telemetry.fetch_pool_balances() {
+                    Ok((pending, paid)) => {
+                        set_tui_wallet_overview(&mut tui, &address, &pending, &paid);
+                    }
+                    Err(err) => {
+                        errors.push(format!("balance: {err:#}"));
+                    }
+                }
+
+                if errors.is_empty() {
+                    if pool_telemetry_warning_logged {
+                        info("STATS", "pool telemetry recovered");
+                        pool_telemetry_warning_logged = false;
+                    }
+                } else if !pool_telemetry_warning_logged {
+                    warn(
+                        "STATS",
+                        format!(
+                            "pool telemetry unavailable; continuing without live pool stats ({})",
+                            errors.join("; ")
+                        ),
+                    );
+                    pool_telemetry_warning_logged = true;
+                }
+
+                next_pool_telemetry_refresh = Instant::now() + POOL_TELEMETRY_REFRESH_INTERVAL;
+            }
         }
 
         if let Some(ref deferred) = deferred_rx {
@@ -156,7 +221,7 @@ pub(super) fn run_pool_mining_loop(
                         backend_weights.insert(slot.id, slot.lanes.max(1) as f64);
                         backends.push(slot);
                         if active_job.is_some() {
-                            warn("POOL", "new backend will start on the next pool job update");
+                            warn("JOB", "new backend will start on the next pool job update");
                         }
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -255,7 +320,7 @@ pub(super) fn run_pool_mining_loop(
                                         job,
                                     ) {
                                         warn(
-                                            "POOL",
+                                            "JOB",
                                             format!("failed to continue job after share: {err:#}"),
                                         );
                                     }
@@ -287,7 +352,7 @@ pub(super) fn run_pool_mining_loop(
                         round_backend_hashes: &active_job.round_backend_hashes,
                         round_start: active_job.round_start,
                         height: &active_job.height,
-                        network_hashrate: "---",
+                        network_hashrate: &pool_network_hashrate,
                         epoch: active_job.epoch,
                         state_label: "working",
                     },
@@ -338,11 +403,11 @@ fn handle_pool_event(
 ) -> Result<()> {
     match event {
         PoolEvent::Connected => {
-            success("POOL", "connected");
+            success("CONN", "connected");
             set_tui_state_label(tui, "pool-connected");
         }
         PoolEvent::Disconnected(message) => {
-            warn("POOL", message);
+            warn("CONN", message);
             set_tui_state_label(tui, "pool-disconnected");
             std::thread::sleep(TEMPLATE_RETRY_DELAY);
         }
@@ -353,7 +418,7 @@ fn handle_pool_event(
                 ack.required_capabilities.join(",")
             };
             success(
-                "POOL",
+                "AUTH",
                 format!(
                     "login accepted (protocol v{}, required={required})",
                     ack.protocol_version
@@ -362,7 +427,7 @@ fn handle_pool_event(
             set_tui_state_label(tui, "pool-authenticated");
         }
         PoolEvent::LoginRejected(message) => {
-            error("POOL", format!("login rejected: {message}"));
+            error("AUTH", format!("login rejected: {message}"));
             set_tui_state_label(tui, "pool-login-rejected");
         }
         PoolEvent::SubmitAck(ack) => {
@@ -375,11 +440,11 @@ fn handle_pool_event(
             }
             if ack.accepted {
                 stats.bump_accepted();
-                success("POOL", "share accepted");
+                success("SHARE", "accepted");
             } else {
                 stats.bump_stale_shares();
                 let reason = ack.error.as_deref().unwrap_or("unknown");
-                warn("POOL", format!("share rejected ({reason})"));
+                warn("SHARE", format!("rejected ({reason})"));
             }
             if let Some(difficulty) = ack.difficulty {
                 apply_submit_ack_difficulty(
@@ -439,13 +504,15 @@ fn apply_submit_ack_difficulty(
         return Ok(());
     }
     job.target = new_target;
-    let old_label = old_difficulty
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    info(
-        "POOL",
-        format!("share difficulty adjusted {old_label} -> {difficulty}"),
-    );
+    if let Some(old) = old_difficulty {
+        if difficulty > old {
+            success("VARDIFF", format!("difficulty {old} -> {difficulty}"));
+        } else if difficulty < old {
+            info("VARDIFF", format!("difficulty {old} -> {difficulty}"));
+        }
+    } else {
+        info("VARDIFF", format!("difficulty set to {difficulty}"));
+    }
     assign_pool_continuation(
         cfg,
         work_id_cursor,
@@ -473,21 +540,21 @@ fn assign_pool_job(
 ) -> Result<()> {
     let nonce_count = job.nonce_count();
     if nonce_count == 0 {
-        warn("POOL", "ignoring job with empty nonce range");
+        warn("JOB", "ignoring job with empty nonce range");
         return Ok(());
     }
 
     let header_base = match decode_hex(&job.header_base, "pool.header_base") {
         Ok(value) => Arc::<[u8]>::from(value),
         Err(err) => {
-            warn("POOL", format!("invalid job header_base: {err:#}"));
+            warn("JOB", format!("invalid job header_base: {err:#}"));
             return Ok(());
         }
     };
     let target = match parse_target(&job.target) {
         Ok(target) => target,
         Err(err) => {
-            warn("POOL", format!("invalid job target: {err:#}"));
+            warn("JOB", format!("invalid job target: {err:#}"));
             return Ok(());
         }
     };
@@ -508,7 +575,7 @@ fn assign_pool_job(
     *active_job = Some(ActivePoolJob::new(job, 0, header_base, target));
 
     info(
-        "POOL",
+        "JOB",
         format!("new job height={height} difficulty={difficulty_label}"),
     );
     if let Some(job) = active_job.as_mut() {
@@ -580,7 +647,7 @@ fn assign_pool_continuation(
     )?;
     if additional_span > 0 {
         warn(
-            "POOL",
+            "JOB",
             format!(
                 "pool assignment consumed extra nonce span outside reserved window ({} nonces)",
                 additional_span
@@ -616,20 +683,153 @@ fn submit_pool_solution(
         .is_ok()
     {
         stats.bump_submitted();
-        info("POOL", "share submitted");
+        let difficulty = job
+            .share_difficulty
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        info("SHARE", format!("submitted (diff={difficulty})"));
         job.pending_submit_nonces.insert(solution.nonce);
         job.next_nonce = job.next_nonce.max(solution.nonce.saturating_add(1));
         PoolShareSubmitOutcome::Submitted
     } else {
         job.submitted_nonces.remove(&solution.nonce);
-        warn("POOL", "failed to queue pool submit");
+        warn("SHARE", "failed to queue submit");
         PoolShareSubmitOutcome::QueueFailed
+    }
+}
+
+impl PoolUiTelemetryClient {
+    fn new(pool_url: &str, address: &str) -> Option<Self> {
+        let base_url = pool_api_base_url_from_pool_url(pool_url)?;
+        let http = HttpClient::builder()
+            .timeout(POOL_TELEMETRY_TIMEOUT)
+            .build()
+            .ok()?;
+        Some(Self {
+            stats_url: format!("{base_url}/api/stats"),
+            miner_url: format!("{base_url}/api/miner/{address}"),
+            http,
+        })
+    }
+
+    fn fetch_pool_hashrate(&self) -> Result<String> {
+        let body: Value = self
+            .http
+            .get(&self.stats_url)
+            .send()
+            .and_then(|resp| resp.json())
+            .map_err(|err| anyhow!("GET {} failed: {err}", self.stats_url))?;
+
+        let hashrate = body
+            .pointer("/pool/hashrate")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| anyhow!("missing field pool.hashrate"))?;
+        if !hashrate.is_finite() || hashrate < 0.0 {
+            bail!("invalid pool.hashrate value");
+        }
+        Ok(format_hashrate_ui(hashrate))
+    }
+
+    fn fetch_pool_balances(&self) -> Result<(String, String)> {
+        let body: Value = self
+            .http
+            .get(&self.miner_url)
+            .send()
+            .and_then(|resp| resp.json())
+            .map_err(|err| anyhow!("GET {} failed: {err}", self.miner_url))?;
+
+        let pending = body
+            .pointer("/balance/pending")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("missing field balance.pending"))?;
+        let paid = body
+            .pointer("/balance/paid")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("missing field balance.paid"))?;
+        Ok((
+            format_atomic_units_bnt(pending),
+            format_atomic_units_bnt(paid),
+        ))
     }
 }
 
 fn div_ceil_u64(value: u64, divisor: u64) -> u64 {
     let divisor = divisor.max(1);
     (value.saturating_add(divisor - 1)) / divisor
+}
+
+fn pool_api_base_url_from_pool_url(pool_url: &str) -> Option<String> {
+    let trimmed = pool_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let authority = trimmed
+        .strip_prefix("stratum+tcp://")
+        .unwrap_or(trimmed)
+        .split('/')
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    if authority.is_empty() {
+        return None;
+    }
+
+    let host = if authority.starts_with('[') {
+        let closing = authority.find(']')?;
+        authority[..=closing].to_string()
+    } else {
+        authority
+            .split(':')
+            .next()
+            .unwrap_or(authority)
+            .trim()
+            .to_string()
+    };
+    if host.is_empty() {
+        return None;
+    }
+
+    Some(format!("http://{host}:{POOL_API_DEFAULT_PORT}"))
+}
+
+fn format_atomic_units_bnt(amount_atomic: u64) -> String {
+    let rounded_atomic = amount_atomic.saturating_add(BNT_DISPLAY_SCALE_ATOMIC_UNITS / 2)
+        / BNT_DISPLAY_SCALE_ATOMIC_UNITS
+        * BNT_DISPLAY_SCALE_ATOMIC_UNITS;
+    let whole = rounded_atomic / ATOMIC_UNITS_PER_BNT;
+    let fractional = (rounded_atomic % ATOMIC_UNITS_PER_BNT) / BNT_DISPLAY_SCALE_ATOMIC_UNITS;
+    let whole = format_u64_with_commas(whole);
+    if fractional == 0 {
+        return format!("{whole} BNT");
+    }
+
+    let mut frac = format!("{fractional:0width$}", width = BNT_DISPLAY_DECIMALS);
+    while frac.ends_with('0') {
+        frac.pop();
+    }
+    format!("{whole}.{frac} BNT")
+}
+
+fn format_u64_with_commas(value: u64) -> String {
+    if value < 1_000 {
+        return value.to_string();
+    }
+
+    let mut digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    while digits.len() > 3 {
+        let chunk = digits.split_off(digits.len() - 3);
+        if out.is_empty() {
+            out = chunk;
+        } else {
+            out = format!("{chunk},{out}");
+        }
+    }
+    if out.is_empty() {
+        digits
+    } else {
+        format!("{digits},{out}")
+    }
 }
 
 fn compact_pool_address_for_log(address: &str) -> String {

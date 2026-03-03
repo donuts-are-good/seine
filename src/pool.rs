@@ -215,10 +215,10 @@ fn run_pool_client_thread(
         match connect_pool_stream(&endpoint) {
             Ok((mut stream, mut reader)) => {
                 let _ = event_tx.try_send(PoolEvent::Connected);
-                if let Err(err) = send_login(&mut stream, &address, &worker) {
+                if let Err(_err) = send_login(&mut stream, &address, &worker) {
                     let _ = event_tx.try_send(PoolEvent::Disconnected(format!(
-                        "lost connection while sending pool login; retrying in {}s ({err:#})",
-                        RECONNECT_DELAY.as_secs()
+                        "{}",
+                        friendly_pool_disconnect_message(&endpoint)
                     )));
                     sleep_with_shutdown(&shutdown, RECONNECT_DELAY);
                     continue;
@@ -245,8 +245,8 @@ fn run_pool_client_thread(
                         .is_err()
                         {
                             let _ = event_tx.try_send(PoolEvent::Disconnected(format!(
-                                "lost connection while sending share; reconnecting in {}s",
-                                RECONNECT_DELAY.as_secs()
+                                "{}",
+                                friendly_pool_disconnect_message(&endpoint)
                             )));
                             pending_submits.clear();
                             reconnect_requested = true;
@@ -263,8 +263,8 @@ fn run_pool_client_thread(
                     match reader.read_line(&mut line) {
                         Ok(0) => {
                             let _ = event_tx.try_send(PoolEvent::Disconnected(format!(
-                                "pool connection closed; reconnecting in {}s",
-                                RECONNECT_DELAY.as_secs()
+                                "{}",
+                                friendly_pool_disconnect_message(&endpoint)
                             )));
                             break;
                         }
@@ -291,10 +291,10 @@ fn run_pool_client_thread(
                                     | ErrorKind::TimedOut
                                     | ErrorKind::Interrupted
                             ) => {}
-                        Err(err) => {
+                        Err(_err) => {
                             let _ = event_tx.try_send(PoolEvent::Disconnected(format!(
-                                "pool connection lost; reconnecting in {}s ({err})",
-                                RECONNECT_DELAY.as_secs()
+                                "{}",
+                                friendly_pool_disconnect_message(&endpoint)
                             )));
                             break;
                         }
@@ -303,9 +303,8 @@ fn run_pool_client_thread(
             }
             Err(err) => {
                 let detail = format!("{err:#}");
-                let _ = event_tx.try_send(PoolEvent::Disconnected(format!(
-                    "{} ({detail})",
-                    friendly_pool_connect_error(&endpoint, &detail)
+                let _ = event_tx.try_send(PoolEvent::Disconnected(friendly_pool_connect_error(
+                    &endpoint, &detail,
                 )));
                 sleep_with_shutdown(&shutdown, RECONNECT_DELAY);
             }
@@ -317,35 +316,24 @@ fn friendly_pool_connect_error(endpoint: &str, detail: &str) -> String {
     let lower = detail.to_ascii_lowercase();
     if lower.contains("connection refused") {
         if is_local_pool_endpoint(endpoint) {
-            return format!(
-                "no local pool found at {endpoint}; start the pool and the miner will retry automatically in {}s",
-                RECONNECT_DELAY.as_secs()
-            );
+            return format!("pool offline at {endpoint}");
         }
-        return format!(
-            "pool at {endpoint} refused the connection; verify host/port and that the pool is running (retrying in {}s)",
-            RECONNECT_DELAY.as_secs()
-        );
+        return format!("pool unreachable at {endpoint}");
     }
     if lower.contains("timed out") {
-        return format!(
-            "pool connection to {endpoint} timed out; check host/port or firewall (retrying in {}s)",
-            RECONNECT_DELAY.as_secs()
-        );
+        return format!("pool timed out at {endpoint}");
     }
     if lower.contains("failed to resolve")
         || lower.contains("resolved to no addresses")
         || lower.contains("name or service not known")
     {
-        return format!(
-            "cannot resolve pool endpoint {endpoint}; check the configured pool address (retrying in {}s)",
-            RECONNECT_DELAY.as_secs()
-        );
+        return format!("invalid pool address {endpoint}");
     }
-    format!(
-        "unable to connect to pool at {endpoint}; retrying in {}s",
-        RECONNECT_DELAY.as_secs()
-    )
+    format!("pool offline at {endpoint}")
+}
+
+fn friendly_pool_disconnect_message(endpoint: &str) -> String {
+    format!("pool offline at {endpoint}")
 }
 
 fn is_local_pool_endpoint(endpoint: &str) -> bool {
