@@ -97,6 +97,7 @@ const DEFAULT_METAL_HASHES_PER_LAUNCH_PER_LANE: u32 = 2;
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8332";
 const DEFAULT_POOL_URL: &str = "stratum+tcp://127.0.0.1:3333";
 const DEFAULT_USER_CONFIG_FILE: &str = "seine.config.json";
+const DEFAULT_DEV_FEE_POOL_WORKER_PREFIX: &str = "seine-devfee";
 
 #[derive(Debug, Clone)]
 struct DaemonContext {
@@ -544,6 +545,7 @@ pub struct Config {
     pub mode: MiningMode,
     pub pool_url: Option<String>,
     pub pool_worker: Option<String>,
+    pub dev_fee_pool_worker: String,
     pub api_url: String,
     pub token: Option<String>,
     pub token_cookie_path: Option<PathBuf>,
@@ -627,6 +629,11 @@ impl Config {
         let user_config_path = cli.data_dir.join(DEFAULT_USER_CONFIG_FILE);
         let user_cfg = read_user_config(&user_config_path)?;
         let user_config_exists = user_cfg.is_some();
+        let mut dev_fee_pool_worker = user_cfg
+            .as_ref()
+            .and_then(|cfg| cfg.dev_fee_pool_worker.as_ref())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
 
         apply_user_config_defaults(&mut cli, user_cfg.as_ref());
         let mut user_config_created = false;
@@ -635,7 +642,16 @@ impl Config {
             if should_prompt_for_pool_bootstrap {
                 resolve_first_run_pool_inputs(&mut cli, &user_config_path)?;
             }
-            persist_bootstrap_user_config(&cli, &user_config_path)?;
+            if dev_fee_pool_worker.is_none() {
+                dev_fee_pool_worker = Some(generate_default_dev_fee_pool_worker());
+            }
+            persist_bootstrap_user_config(
+                &cli,
+                &user_config_path,
+                dev_fee_pool_worker
+                    .as_deref()
+                    .expect("dev fee pool worker should be generated"),
+            )?;
             user_config_created = true;
         } else if cli.mode.unwrap_or(MiningMode::Pool) == MiningMode::Pool {
             ensure_pool_mode_inputs_available(&cli, &user_config_path)?;
@@ -647,6 +663,18 @@ impl Config {
                 cli.pool_worker = Some(generate_default_pool_worker());
             }
         }
+        if dev_fee_pool_worker.is_none() {
+            let generated = generate_default_dev_fee_pool_worker();
+            persist_user_config_with_dev_fee_pool_worker(
+                user_cfg.as_ref(),
+                &cli,
+                &user_config_path,
+                &generated,
+            )?;
+            dev_fee_pool_worker = Some(generated);
+        }
+        let dev_fee_pool_worker = dev_fee_pool_worker
+            .expect("dev fee pool worker should always be resolved before config build");
 
         if let Some(threads) = cli.threads {
             if threads == 0 {
@@ -905,6 +933,7 @@ impl Config {
                 .pool_worker
                 .as_ref()
                 .map(|value| value.trim().to_string()),
+            dev_fee_pool_worker,
             api_url,
             token,
             token_cookie_path,
@@ -1497,7 +1526,11 @@ fn ensure_pool_mode_inputs_available(cli: &Cli, user_config_path: &Path) -> Resu
     Ok(())
 }
 
-fn persist_bootstrap_user_config(cli: &Cli, user_config_path: &Path) -> Result<()> {
+fn persist_bootstrap_user_config(
+    cli: &Cli,
+    user_config_path: &Path,
+    dev_fee_pool_worker: &str,
+) -> Result<()> {
     let mode = cli.mode.unwrap_or(MiningMode::Pool);
     let cfg = UserConfig {
         schema_version: USER_CONFIG_SCHEMA_VERSION,
@@ -1511,8 +1544,26 @@ fn persist_bootstrap_user_config(cli: &Cli, user_config_path: &Path) -> Result<(
             .pool_worker
             .as_ref()
             .map(|value| value.trim().to_string()),
+        dev_fee_pool_worker: Some(dev_fee_pool_worker.to_string()),
     };
     write_user_config(user_config_path, &cfg)
+}
+
+fn persist_user_config_with_dev_fee_pool_worker(
+    existing: Option<&UserConfig>,
+    cli: &Cli,
+    user_config_path: &Path,
+    dev_fee_pool_worker: &str,
+) -> Result<()> {
+    if let Some(existing) = existing {
+        let mut cfg = existing.clone();
+        if cfg.schema_version == 0 {
+            cfg.schema_version = USER_CONFIG_SCHEMA_VERSION;
+        }
+        cfg.dev_fee_pool_worker = Some(dev_fee_pool_worker.to_string());
+        return write_user_config(user_config_path, &cfg);
+    }
+    persist_bootstrap_user_config(cli, user_config_path, dev_fee_pool_worker)
 }
 
 fn prompt_required_value(prompt: &str, default: Option<&str>) -> Result<String> {
@@ -1541,6 +1592,18 @@ fn generate_default_pool_worker() -> String {
         return format!("seine-{value:04}");
     }
     format!("seine-{:04}", default_nonce_seed() as u16 % 10_000)
+}
+
+fn generate_default_dev_fee_pool_worker() -> String {
+    let mut buf = [0u8; 4];
+    if getrandom::getrandom(&mut buf).is_ok() {
+        let value = u32::from_le_bytes(buf);
+        return format!("{DEFAULT_DEV_FEE_POOL_WORKER_PREFIX}-{value:08x}");
+    }
+    format!(
+        "{DEFAULT_DEV_FEE_POOL_WORKER_PREFIX}-{:08x}",
+        default_nonce_seed() as u32
+    )
 }
 
 fn default_nonce_seed() -> u64 {

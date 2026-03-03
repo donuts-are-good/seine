@@ -3023,6 +3023,7 @@ mod tests {
             mode: MiningMode::Daemon,
             pool_url: None,
             pool_worker: None,
+            dev_fee_pool_worker: "seine-devfee-test".to_string(),
             api_url: "http://127.0.0.1:8332".to_string(),
             token: Some("test-token".to_string()),
             token_cookie_path: None,

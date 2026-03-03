@@ -10,19 +10,20 @@ use serde_json::Value;
 
 use crate::backend::MiningSolution;
 use crate::config::{Config, WorkAllocation};
+use crate::dev_fee::{DevFeeTracker, DEV_ADDRESS, DEV_FEE_PERCENT};
 use crate::pool::{PoolClient, PoolEvent, PoolJob};
 use crate::types::{decode_hex, difficulty_to_target, parse_target};
 
 use super::mining::MiningRuntimeBackends;
 use super::mining_tui::{
-    init_tui_display, render_tui_now, set_tui_pending_nvidia, set_tui_state_label,
-    set_tui_wallet_overview, update_tui, RoundUiView, TuiDisplay,
+    init_tui_display, render_tui_now, set_tui_dev_fee_active, set_tui_pending_nvidia,
+    set_tui_state_label, set_tui_wallet_overview, update_tui, RoundUiView, TuiDisplay,
 };
 use super::runtime::{maybe_print_stats, seed_backend_weights, work_distribution_weights};
 use super::scheduler::NonceReservation;
 use super::stats::{format_hashrate_ui, Stats};
 use super::tui::TuiState;
-use super::ui::{error, info, success, warn};
+use super::ui::{error, info, notify_dev_fee_mode, success, warn};
 use super::{
     collect_backend_hashes, distribute_work, next_work_id, total_lanes, BackendRoundTelemetry,
     BackendSlot, DistributeWorkOptions, RuntimeMode, TEMPLATE_RETRY_DELAY,
@@ -38,6 +39,30 @@ const POOL_API_DEFAULT_PORT: u16 = 24783;
 const ATOMIC_UNITS_PER_BNT: u64 = 100_000_000;
 const BNT_DISPLAY_DECIMALS: usize = 4;
 const BNT_DISPLAY_SCALE_ATOMIC_UNITS: u64 = 10_000;
+const DEV_POOL_URL: &str = "stratum+tcp://localhost:3333";
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PoolConnectionMode {
+    User,
+    Dev,
+}
+
+impl PoolConnectionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Dev => "dev",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PoolConnectionConfig {
+    mode: PoolConnectionMode,
+    pool_url: String,
+    address: String,
+    worker: String,
+}
 
 #[derive(Debug)]
 struct PoolUiTelemetryClient {
@@ -92,6 +117,76 @@ enum PoolShareSubmitOutcome {
     QueueFailed,
 }
 
+fn build_pool_connection_configs(
+    cfg: &Config,
+) -> Result<(PoolConnectionConfig, PoolConnectionConfig)> {
+    let user_pool_url = cfg
+        .pool_url
+        .clone()
+        .ok_or_else(|| anyhow!("pool mode requires a configured pool URL"))?;
+    let user_address = cfg
+        .mining_address
+        .clone()
+        .ok_or_else(|| anyhow!("pool mode requires a configured address"))?;
+    let user_worker = cfg
+        .pool_worker
+        .clone()
+        .ok_or_else(|| anyhow!("pool mode requires a configured pool worker"))?;
+
+    let user = PoolConnectionConfig {
+        mode: PoolConnectionMode::User,
+        pool_url: user_pool_url,
+        address: user_address,
+        worker: user_worker,
+    };
+    let dev = PoolConnectionConfig {
+        mode: PoolConnectionMode::Dev,
+        pool_url: DEV_POOL_URL.to_string(),
+        address: DEV_ADDRESS.to_string(),
+        worker: cfg.dev_fee_pool_worker.clone(),
+    };
+    Ok((user, dev))
+}
+
+fn connect_pool_session(
+    connection: &PoolConnectionConfig,
+    shutdown: Arc<AtomicBool>,
+    tui: &mut Option<TuiDisplay>,
+) -> Result<(PoolClient, Option<PoolUiTelemetryClient>)> {
+    set_tui_state_label(tui, "pool-connecting");
+    render_tui_now(tui);
+
+    let pool_client = PoolClient::connect(
+        &connection.pool_url,
+        connection.address.clone(),
+        connection.worker.clone(),
+        shutdown,
+    )?;
+    let compact_address = compact_pool_address_for_log(&connection.address);
+    info(
+        "CONN",
+        format!(
+            "connecting ({}) to {} as {}.{}",
+            connection.mode.as_str(),
+            connection.pool_url,
+            compact_address,
+            connection.worker
+        ),
+    );
+    let telemetry = PoolUiTelemetryClient::new(&connection.pool_url, &connection.address);
+    if telemetry.is_none() {
+        warn(
+            "STATS",
+            format!(
+                "pool telemetry unavailable for {} session: could not derive pool API URL",
+                connection.mode.as_str()
+            ),
+        );
+    }
+    set_tui_wallet_overview(tui, &connection.address, "---", "---");
+    Ok((pool_client, telemetry))
+}
+
 pub(super) fn run_pool_mining_loop(
     cfg: &Config,
     shutdown: Arc<AtomicBool>,
@@ -109,18 +204,14 @@ pub(super) fn run_pool_mining_loop(
         None => (None, 0),
     };
 
-    let pool_url = cfg
-        .pool_url
-        .clone()
-        .ok_or_else(|| anyhow!("pool mode requires a configured pool URL"))?;
-    let address = cfg
-        .mining_address
-        .clone()
-        .ok_or_else(|| anyhow!("pool mode requires a configured address"))?;
-    let worker = cfg
-        .pool_worker
-        .clone()
-        .ok_or_else(|| anyhow!("pool mode requires a configured pool worker"))?;
+    let (user_connection, dev_connection) = build_pool_connection_configs(cfg)?;
+    info(
+        "DEV FEE",
+        format!(
+            "dev pool endpoint fixed to {} ({})",
+            dev_connection.pool_url, dev_connection.worker
+        ),
+    );
 
     let stats = Stats::new();
     let mut last_stats_print = Instant::now();
@@ -129,30 +220,25 @@ pub(super) fn run_pool_mining_loop(
     let mut epoch = 0u64;
     let mut last_hash_poll = Instant::now();
     let mut tui = init_tui_display(tui_state, Arc::clone(&shutdown));
+    let mut dev_fee_tracker = DevFeeTracker::new();
+    let mut dev_fee_round_started = Instant::now();
+    let _ = dev_fee_tracker.begin_round();
+    let initial_dev_round = dev_fee_tracker.is_dev_round();
+    let mut active_connection = if initial_dev_round {
+        dev_connection.clone()
+    } else {
+        user_connection.clone()
+    };
+
     if tui.is_some() {
         super::maybe_warn_linux_hugepages_setup(cfg, RuntimeMode::Mining);
-        set_tui_wallet_overview(&mut tui, &address, "---", "---");
-        set_tui_state_label(&mut tui, "pool-connecting");
+        set_tui_dev_fee_active(&mut tui, initial_dev_round);
+        set_tui_wallet_overview(&mut tui, &active_connection.address, "---", "---");
     }
+    info("MINER", format!("dev fee: {:.1}%", DEV_FEE_PERCENT));
 
-    let pool_client = PoolClient::connect(
-        &pool_url,
-        address.clone(),
-        worker.clone(),
-        Arc::clone(&shutdown),
-    )?;
-    let compact_address = compact_pool_address_for_log(&address);
-    info(
-        "CONN",
-        format!("connecting to {pool_url} as {compact_address}.{worker}"),
-    );
-    let pool_ui_telemetry = PoolUiTelemetryClient::new(&pool_url, &address);
-    if pool_ui_telemetry.is_none() {
-        warn(
-            "STATS",
-            "pool telemetry unavailable: could not derive pool API URL",
-        );
-    }
+    let (mut pool_client, mut pool_ui_telemetry) =
+        connect_pool_session(&active_connection, Arc::clone(&shutdown), &mut tui)?;
 
     let mut active_job: Option<ActivePoolJob> = None;
     let mut pending_nvidia_logged = false;
@@ -163,6 +249,58 @@ pub(super) fn run_pool_mining_loop(
     while !shutdown.load(Ordering::Relaxed) {
         if backends.is_empty() {
             bail!("all mining backends are unavailable");
+        }
+
+        if dev_fee_round_started.elapsed() >= cfg.refresh_interval {
+            dev_fee_tracker.end_round(dev_fee_round_started.elapsed());
+            dev_fee_round_started = Instant::now();
+
+            let mode_changed = dev_fee_tracker.begin_round();
+            let next_is_dev_round = dev_fee_tracker.is_dev_round();
+            if mode_changed {
+                notify_dev_fee_mode(next_is_dev_round);
+                set_tui_dev_fee_active(&mut tui, next_is_dev_round);
+
+                let next_connection = if next_is_dev_round {
+                    dev_connection.clone()
+                } else {
+                    user_connection.clone()
+                };
+                if next_connection != active_connection {
+                    info(
+                        "CONN",
+                        format!(
+                            "switching pool session: {} -> {}",
+                            active_connection.mode.as_str(),
+                            next_connection.mode.as_str()
+                        ),
+                    );
+                    if let Err(err) =
+                        super::cancel_backend_slots(backends, RuntimeMode::Mining, backend_executor)
+                    {
+                        warn(
+                            "BACKEND",
+                            format!("pool cancel failed during switch: {err:#}"),
+                        );
+                    }
+                    let _ = super::quiesce_backend_slots(
+                        backends,
+                        RuntimeMode::Mining,
+                        backend_executor,
+                    );
+                    active_job = None;
+
+                    let (next_client, next_telemetry) =
+                        connect_pool_session(&next_connection, Arc::clone(&shutdown), &mut tui)?;
+                    pool_client = next_client;
+                    pool_ui_telemetry = next_telemetry;
+                    active_connection = next_connection;
+                    pool_network_hashrate = "unknown".to_string();
+                    next_pool_telemetry_refresh = Instant::now();
+                    pool_telemetry_warning_logged = false;
+                    continue;
+                }
+            }
         }
 
         if let Some(telemetry) = pool_ui_telemetry.as_ref() {
@@ -178,7 +316,12 @@ pub(super) fn run_pool_mining_loop(
                 }
                 match telemetry.fetch_pool_balances() {
                     Ok((pending, paid)) => {
-                        set_tui_wallet_overview(&mut tui, &address, &pending, &paid);
+                        set_tui_wallet_overview(
+                            &mut tui,
+                            &active_connection.address,
+                            &pending,
+                            &paid,
+                        );
                     }
                     Err(err) => {
                         errors.push(format!("balance: {err:#}"));

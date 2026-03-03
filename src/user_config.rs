@@ -16,6 +16,7 @@ pub struct UserConfig {
     pub address: Option<String>,
     pub pool_url: Option<String>,
     pub pool_worker: Option<String>,
+    pub dev_fee_pool_worker: Option<String>,
 }
 
 pub fn read_user_config(path: &Path) -> Result<Option<UserConfig>> {

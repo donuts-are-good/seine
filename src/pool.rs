@@ -96,6 +96,7 @@ struct PoolSubmit {
 pub struct PoolClient {
     submit_tx: Sender<PoolSubmit>,
     event_rx: Receiver<PoolEvent>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl PoolClient {
@@ -103,22 +104,33 @@ impl PoolClient {
         pool_url: &str,
         address: String,
         worker: String,
-        shutdown: Arc<AtomicBool>,
+        process_shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
         let endpoint = parse_pool_endpoint(pool_url)?;
         let (submit_tx, submit_rx) = bounded::<PoolSubmit>(CHANNEL_CAPACITY);
         let (event_tx, event_rx) = bounded::<PoolEvent>(CHANNEL_CAPACITY);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_for_thread = Arc::clone(&shutdown);
 
         std::thread::Builder::new()
             .name("pool-stratum".to_string())
             .spawn(move || {
-                run_pool_client_thread(endpoint, address, worker, submit_rx, event_tx, shutdown)
+                run_pool_client_thread(
+                    endpoint,
+                    address,
+                    worker,
+                    submit_rx,
+                    event_tx,
+                    process_shutdown,
+                    shutdown_for_thread,
+                )
             })
             .context("failed to spawn pool client thread")?;
 
         Ok(Self {
             submit_tx,
             event_rx,
+            shutdown,
         })
     }
 
@@ -153,6 +165,12 @@ impl PoolClient {
             }
         }
         out
+    }
+}
+
+impl Drop for PoolClient {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
     }
 }
 
@@ -211,29 +229,26 @@ fn run_pool_client_thread(
     worker: String,
     submit_rx: Receiver<PoolSubmit>,
     event_tx: Sender<PoolEvent>,
+    process_shutdown: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut next_request_id = LOGIN_REQUEST_ID + 1;
-    while !shutdown.load(Ordering::Relaxed) {
+    while !should_shutdown(process_shutdown.as_ref(), shutdown.as_ref()) {
         match connect_pool_stream(&endpoint) {
             Ok((mut stream, mut reader)) => {
-                reject_queued_submits(
-                    &event_tx,
-                    &submit_rx,
-                    SUBMIT_REJECT_REASON_DISCONNECTED,
-                );
+                reject_queued_submits(&event_tx, &submit_rx, SUBMIT_REJECT_REASON_DISCONNECTED);
                 let _ = event_tx.try_send(PoolEvent::Connected);
                 if let Err(_err) = send_login(&mut stream, &address, &worker) {
-                    reject_queued_submits(
-                        &event_tx,
-                        &submit_rx,
-                        SUBMIT_REJECT_REASON_DISCONNECTED,
-                    );
+                    reject_queued_submits(&event_tx, &submit_rx, SUBMIT_REJECT_REASON_DISCONNECTED);
                     let _ = event_tx.try_send(PoolEvent::Disconnected(format!(
                         "{}",
                         friendly_pool_disconnect_message(&endpoint)
                     )));
-                    sleep_with_shutdown(&shutdown, RECONNECT_DELAY);
+                    sleep_with_shutdown(
+                        process_shutdown.as_ref(),
+                        shutdown.as_ref(),
+                        RECONNECT_DELAY,
+                    );
                     continue;
                 }
                 let mut pending_submits = HashMap::<u64, PoolSubmit>::new();
@@ -241,7 +256,7 @@ fn run_pool_client_thread(
                 let mut submit_claimed_hash_enabled = true;
 
                 loop {
-                    if shutdown.load(Ordering::Relaxed) {
+                    if should_shutdown(process_shutdown.as_ref(), shutdown.as_ref()) {
                         return;
                     }
 
@@ -259,11 +274,7 @@ fn run_pool_client_thread(
                             )
                             .is_err()
                             {
-                                reject_submit(
-                                    &event_tx,
-                                    submit,
-                                    SUBMIT_REJECT_REASON_SEND_FAILED,
-                                );
+                                reject_submit(&event_tx, submit, SUBMIT_REJECT_REASON_SEND_FAILED);
                                 reject_pending_submits(
                                     &event_tx,
                                     &mut pending_submits,
@@ -285,7 +296,11 @@ fn run_pool_client_thread(
                         }
                     }
                     if reconnect_requested {
-                        sleep_with_shutdown(&shutdown, RECONNECT_DELAY);
+                        sleep_with_shutdown(
+                            process_shutdown.as_ref(),
+                            shutdown.as_ref(),
+                            RECONNECT_DELAY,
+                        );
                         break;
                     }
 
@@ -329,8 +344,7 @@ fn run_pool_client_thread(
                                         }
                                     }
                                 }
-                                let login_rejected =
-                                    matches!(&event, PoolEvent::LoginRejected(_));
+                                let login_rejected = matches!(&event, PoolEvent::LoginRejected(_));
                                 let _ = event_tx.try_send(event);
                                 if login_rejected {
                                     reject_pending_submits(
@@ -347,7 +361,11 @@ fn run_pool_client_thread(
                                         "{}",
                                         friendly_pool_disconnect_message(&endpoint)
                                     )));
-                                    sleep_with_shutdown(&shutdown, RECONNECT_DELAY);
+                                    sleep_with_shutdown(
+                                        process_shutdown.as_ref(),
+                                        shutdown.as_ref(),
+                                        RECONNECT_DELAY,
+                                    );
                                     break;
                                 }
                             }
@@ -380,16 +398,16 @@ fn run_pool_client_thread(
                 }
             }
             Err(err) => {
-                reject_queued_submits(
-                    &event_tx,
-                    &submit_rx,
-                    SUBMIT_REJECT_REASON_DISCONNECTED,
-                );
+                reject_queued_submits(&event_tx, &submit_rx, SUBMIT_REJECT_REASON_DISCONNECTED);
                 let detail = format!("{err:#}");
                 let _ = event_tx.try_send(PoolEvent::Disconnected(friendly_pool_connect_error(
                     &endpoint, &detail,
                 )));
-                sleep_with_shutdown(&shutdown, RECONNECT_DELAY);
+                sleep_with_shutdown(
+                    process_shutdown.as_ref(),
+                    shutdown.as_ref(),
+                    RECONNECT_DELAY,
+                );
             }
         }
     }
@@ -649,10 +667,11 @@ fn should_send_claimed_hash(ack: &PoolLoginAck) -> bool {
 
 fn evaluate_login_ack(ack: &PoolLoginAck) -> std::result::Result<bool, String> {
     for capability in &ack.required_capabilities {
-        if !CLIENT_CAPABILITIES.iter().any(|supported| supported == capability) {
-            return Err(format!(
-                "pool requires unsupported capability {capability}"
-            ));
+        if !CLIENT_CAPABILITIES
+            .iter()
+            .any(|supported| supported == capability)
+        {
+            return Err(format!("pool requires unsupported capability {capability}"));
         }
     }
     Ok(should_send_claimed_hash(ack))
@@ -709,9 +728,13 @@ fn parse_pool_endpoint(pool_url: &str) -> Result<String> {
     Ok(authority.to_string())
 }
 
-fn sleep_with_shutdown(shutdown: &AtomicBool, duration: Duration) {
+fn should_shutdown(process_shutdown: &AtomicBool, shutdown: &AtomicBool) -> bool {
+    process_shutdown.load(Ordering::Relaxed) || shutdown.load(Ordering::Relaxed)
+}
+
+fn sleep_with_shutdown(process_shutdown: &AtomicBool, shutdown: &AtomicBool, duration: Duration) {
     let deadline = std::time::Instant::now() + duration;
-    while !shutdown.load(Ordering::Relaxed) {
+    while !should_shutdown(process_shutdown, shutdown) {
         if std::time::Instant::now() >= deadline {
             break;
         }
@@ -990,7 +1013,10 @@ mod tests {
             .expect("submit response should decode");
         match event {
             PoolEvent::SubmitAck(ack) => {
-                assert!(!ack.accepted, "ambiguous submit ack should be treated as rejected");
+                assert!(
+                    !ack.accepted,
+                    "ambiguous submit ack should be treated as rejected"
+                );
                 assert_eq!(ack.error.as_deref(), Some("pool rejected share"));
             }
             other => panic!("unexpected event: {other:?}"),
@@ -1047,8 +1073,7 @@ mod tests {
                 .expect("set short read timeout");
             let mut pre_login_submit = String::new();
             match reader.read_line(&mut pre_login_submit) {
-                Err(err)
-                    if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
                 Ok(_) => panic!(
                     "submit arrived before login ack: {}",
                     pre_login_submit.trim()
@@ -1165,7 +1190,9 @@ mod tests {
             first
                 .write_all(br#"{"id":1,"error":"bad login"}"#)
                 .expect("server should write login rejection");
-            first.write_all(b"\n").expect("server should terminate line");
+            first
+                .write_all(b"\n")
+                .expect("server should terminate line");
             drop(first);
 
             let mut second = accept_next();
@@ -1191,7 +1218,9 @@ mod tests {
             second
                 .write_all(br#"{"id":1,"status":"ok","result":{"protocol_version":2,"capabilities":["submit_claimed_hash"],"required_capabilities":[]}}"#)
                 .expect("server should write second login ack");
-            second.write_all(b"\n").expect("server should terminate line");
+            second
+                .write_all(b"\n")
+                .expect("server should terminate line");
         });
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1241,7 +1270,9 @@ mod tests {
             socket
                 .write_all(br#"{"id":1,"error":"rejected"}"#)
                 .expect("server should write rejection");
-            socket.write_all(b"\n").expect("server should terminate line");
+            socket
+                .write_all(b"\n")
+                .expect("server should terminate line");
         });
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1275,8 +1306,7 @@ mod tests {
                     assert!(!ack.accepted, "queued submit should be rejected");
                     let message = ack.error.unwrap_or_default();
                     assert!(
-                        message.contains("login rejected")
-                            || message.contains("disconnected"),
+                        message.contains("login rejected") || message.contains("disconnected"),
                         "expected login/disconnect rejection reason, got: {message}"
                     );
                     saw_rejected_submit = true;
