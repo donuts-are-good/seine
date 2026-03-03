@@ -1185,10 +1185,6 @@ pub(super) fn run_mining_loop(
     let mut backend_weights = seed_backend_weights(backends);
     let mut control_plane = MiningControlPlane::new(client, cfg, Arc::clone(&shutdown), tip_signal);
     let mut dev_fee_tracker = DevFeeTracker::new();
-    info(
-        "MINER",
-        format!("dev fee: {:.1}%", crate::dev_fee::DEV_FEE_PERCENT),
-    );
     let mut recent_template_retention = recent_template_retention_for_backends(cfg, backends);
     let mut recent_template_cache_size = recent_template_cache_size_for_backends(cfg, backends);
     let recent_template_cache_max_bytes = recent_template_cache_max_bytes();

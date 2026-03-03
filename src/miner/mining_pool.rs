@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::backend::MiningSolution;
 use crate::config::{Config, WorkAllocation};
-use crate::dev_fee::{DevFeeTracker, DEV_ADDRESS, DEV_FEE_PERCENT};
+use crate::dev_fee::{DevFeeTracker, DEV_ADDRESS};
 use crate::pool::{PoolClient, PoolEvent, PoolJob};
 use crate::types::{decode_hex, difficulty_to_target, parse_target};
 
@@ -53,6 +53,10 @@ impl PoolConnectionMode {
             Self::User => "user",
             Self::Dev => "dev",
         }
+    }
+
+    fn is_user(self) -> bool {
+        matches!(self, Self::User)
     }
 }
 
@@ -173,24 +177,21 @@ fn connect_pool_session(
         connection.worker.clone(),
         shutdown,
     )?;
-    match connection.mode {
-        PoolConnectionMode::Dev => info("CONN", "connecting (dev session)"),
-        PoolConnectionMode::User => {
-            let compact_address = compact_pool_address_for_log(&connection.address);
-            info(
-                "CONN",
-                format!(
-                    "connecting ({}) to {} as {}.{}",
-                    connection.mode.as_str(),
-                    connection.pool_url,
-                    compact_address,
-                    connection.worker
-                ),
-            );
-        }
+    if connection.mode.is_user() {
+        let compact_address = compact_pool_address_for_log(&connection.address);
+        info(
+            "CONN",
+            format!(
+                "connecting ({}) to {} as {}.{}",
+                connection.mode.as_str(),
+                connection.pool_url,
+                compact_address,
+                connection.worker
+            ),
+        );
     }
     let telemetry = PoolUiTelemetryClient::new(&connection.pool_url, &connection.address);
-    if telemetry.is_none() {
+    if telemetry.is_none() && connection.mode.is_user() {
         warn(
             "STATS",
             format!(
@@ -223,7 +224,6 @@ pub(super) fn run_pool_mining_loop(
     };
 
     let (user_connection, dev_connection) = build_pool_connection_configs(cfg)?;
-    info("DEV FEE", "dev fee session configured");
 
     let stats = Stats::new();
     let mut last_stats_print = Instant::now();
@@ -251,8 +251,6 @@ pub(super) fn run_pool_mining_loop(
         };
         set_tui_wallet_overview(&mut tui, active_address, "---", "---");
     }
-    info("MINER", format!("dev fee: {:.1}%", DEV_FEE_PERCENT));
-
     let (user_client, user_telemetry) = connect_pool_session(
         &user_connection,
         Arc::clone(&shutdown),
@@ -328,14 +326,6 @@ pub(super) fn run_pool_mining_loop(
                             );
                         }
                     }
-                    info(
-                        "CONN",
-                        format!(
-                            "switching pool session: {} -> {}",
-                            active_mode.as_str(),
-                            next_mode.as_str()
-                        ),
-                    );
                     if let Err(err) =
                         super::cancel_backend_slots(backends, RuntimeMode::Mining, backend_executor)
                     {
@@ -380,6 +370,7 @@ pub(super) fn run_pool_mining_loop(
                             &user_session.client
                         };
                         assign_pool_job(
+                            active_mode,
                             cfg,
                             active_client,
                             job,
@@ -616,8 +607,13 @@ pub(super) fn run_pool_mining_loop(
                         } else {
                             &user_session.client
                         };
-                        let submit_outcome =
-                            submit_pool_solution(active_client, &mut active_job, &solution, &stats);
+                        let submit_outcome = submit_pool_solution(
+                            active_mode,
+                            active_client,
+                            &mut active_job,
+                            &solution,
+                            &stats,
+                        );
                         if matches!(
                             submit_outcome,
                             PoolShareSubmitOutcome::Submitted
@@ -722,17 +718,13 @@ fn handle_active_pool_event(
     match event {
         PoolEvent::Connected => {
             *connected = true;
-            if mode == PoolConnectionMode::Dev {
-                success("CONN", "dev session connected");
-            } else {
+            if mode.is_user() {
                 success("CONN", "connected");
             }
             set_tui_state_label(tui, "pool-connected");
         }
         PoolEvent::Disconnected(message) => {
-            if mode == PoolConnectionMode::Dev {
-                warn("CONN", "dev session disconnected");
-            } else {
+            if mode.is_user() {
                 warn("CONN", message);
             }
             *latest_job = None;
@@ -754,9 +746,7 @@ fn handle_active_pool_event(
             std::thread::sleep(TEMPLATE_RETRY_DELAY);
         }
         PoolEvent::LoginAccepted(ack) => {
-            if mode == PoolConnectionMode::Dev {
-                success("AUTH", "dev session login accepted");
-            } else {
+            if mode.is_user() {
                 let required = if ack.required_capabilities.is_empty() {
                     "none".to_string()
                 } else {
@@ -773,9 +763,7 @@ fn handle_active_pool_event(
             set_tui_state_label(tui, "pool-authenticated");
         }
         PoolEvent::LoginRejected(message) => {
-            if mode == PoolConnectionMode::Dev {
-                error("AUTH", "dev session login rejected");
-            } else {
+            if mode.is_user() {
                 error("AUTH", format!("login rejected: {message}"));
             }
             *latest_job = None;
@@ -805,17 +793,22 @@ fn handle_active_pool_event(
             }
             if ack.accepted {
                 stats.bump_accepted();
-                success("SHARE", "accepted");
+                if mode.is_user() {
+                    success("SHARE", "accepted");
+                }
                 if let Some(display) = tui.as_mut() {
                     display.mark_block_found();
                 }
             } else {
                 stats.bump_stale_shares();
                 let reason = ack.error.as_deref().unwrap_or("unknown");
-                warn("SHARE", format!("rejected ({reason})"));
+                if mode.is_user() {
+                    warn("SHARE", format!("rejected ({reason})"));
+                }
             }
             if let Some(difficulty) = ack.difficulty {
                 apply_submit_ack_difficulty(
+                    mode,
                     cfg,
                     work_id_cursor,
                     epoch_cursor,
@@ -830,6 +823,7 @@ fn handle_active_pool_event(
         PoolEvent::Job(job) => {
             *latest_job = Some(job.clone());
             assign_pool_job(
+                mode,
                 cfg,
                 pool_client,
                 job,
@@ -857,26 +851,20 @@ fn handle_inactive_pool_event(
 ) {
     match event {
         PoolEvent::Connected => {
-            if !*connected {
+            if !*connected && mode.is_user() {
                 info("CONN", format!("{} session connected", mode.as_str()));
             }
             *connected = true;
         }
         PoolEvent::Disconnected(message) => {
             *latest_job = None;
-            if *connected {
-                if mode == PoolConnectionMode::Dev {
-                    warn("CONN", "dev session disconnected");
-                } else {
-                    warn("CONN", format!("{} session {message}", mode.as_str()));
-                }
+            if *connected && mode.is_user() {
+                warn("CONN", format!("{} session {message}", mode.as_str()));
             }
             *connected = false;
         }
         PoolEvent::LoginAccepted(ack) => {
-            if mode == PoolConnectionMode::Dev {
-                success("AUTH", "dev session login accepted");
-            } else {
+            if mode.is_user() {
                 let required = if ack.required_capabilities.is_empty() {
                     "none".to_string()
                 } else {
@@ -895,9 +883,7 @@ fn handle_inactive_pool_event(
         PoolEvent::LoginRejected(message) => {
             *latest_job = None;
             *connected = false;
-            if mode == PoolConnectionMode::Dev {
-                error("AUTH", "dev session login rejected");
-            } else {
+            if mode.is_user() {
                 error(
                     "AUTH",
                     format!("{} session login rejected: {message}", mode.as_str()),
@@ -907,11 +893,15 @@ fn handle_inactive_pool_event(
         PoolEvent::SubmitAck(ack) => {
             if ack.accepted {
                 stats.bump_accepted();
-                success("SHARE", format!("accepted ({})", mode.as_str()));
+                if mode.is_user() {
+                    success("SHARE", format!("accepted ({})", mode.as_str()));
+                }
             } else {
                 stats.bump_stale_shares();
                 let reason = ack.error.as_deref().unwrap_or("unknown");
-                warn("SHARE", format!("rejected ({reason}) ({})", mode.as_str()));
+                if mode.is_user() {
+                    warn("SHARE", format!("rejected ({reason}) ({})", mode.as_str()));
+                }
             }
         }
         PoolEvent::Job(job) => {
@@ -922,6 +912,7 @@ fn handle_inactive_pool_event(
 
 #[allow(clippy::too_many_arguments)]
 fn apply_submit_ack_difficulty(
+    mode: PoolConnectionMode,
     cfg: &Config,
     work_id_cursor: &mut u64,
     epoch_cursor: &mut u64,
@@ -946,14 +937,16 @@ fn apply_submit_ack_difficulty(
         return Ok(());
     }
     job.target = new_target;
-    if let Some(old) = old_difficulty {
-        if difficulty > old {
-            success("VARDIFF", format!("difficulty {old} -> {difficulty}"));
-        } else if difficulty < old {
-            info("VARDIFF", format!("difficulty {old} -> {difficulty}"));
+    if mode.is_user() {
+        if let Some(old) = old_difficulty {
+            if difficulty > old {
+                success("VARDIFF", format!("difficulty {old} -> {difficulty}"));
+            } else if difficulty < old {
+                info("VARDIFF", format!("difficulty {old} -> {difficulty}"));
+            }
+        } else {
+            info("VARDIFF", format!("difficulty set to {difficulty}"));
         }
-    } else {
-        info("VARDIFF", format!("difficulty set to {difficulty}"));
     }
     assign_pool_continuation(
         cfg,
@@ -968,6 +961,7 @@ fn apply_submit_ack_difficulty(
 
 #[allow(clippy::too_many_arguments)]
 fn assign_pool_job(
+    mode: PoolConnectionMode,
     cfg: &Config,
     _pool_client: &PoolClient,
     job: PoolJob,
@@ -983,21 +977,27 @@ fn assign_pool_job(
 ) -> Result<()> {
     let nonce_count = job.nonce_count();
     if nonce_count == 0 {
-        warn("JOB", "ignoring job with empty nonce range");
+        if mode.is_user() {
+            warn("JOB", "ignoring job with empty nonce range");
+        }
         return Ok(());
     }
 
     let header_base = match decode_hex(&job.header_base, "pool.header_base") {
         Ok(value) => Arc::<[u8]>::from(value),
         Err(err) => {
-            warn("JOB", format!("invalid job header_base: {err:#}"));
+            if mode.is_user() {
+                warn("JOB", format!("invalid job header_base: {err:#}"));
+            }
             return Ok(());
         }
     };
     let target = match parse_target(&job.target) {
         Ok(target) => target,
         Err(err) => {
-            warn("JOB", format!("invalid job target: {err:#}"));
+            if mode.is_user() {
+                warn("JOB", format!("invalid job target: {err:#}"));
+            }
             return Ok(());
         }
     };
@@ -1021,10 +1021,12 @@ fn assign_pool_job(
         .unwrap_or_else(|| "unknown".to_string());
     *active_job = Some(ActivePoolJob::new(job, 0, header_base, target));
 
-    info(
-        "JOB",
-        format!("new job height={height} difficulty={difficulty_label}"),
-    );
+    if mode.is_user() {
+        info(
+            "JOB",
+            format!("new job height={height} difficulty={difficulty_label}"),
+        );
+    }
     if let Some(job) = active_job.as_mut() {
         assign_pool_continuation(
             cfg,
@@ -1106,6 +1108,7 @@ fn assign_pool_continuation(
 }
 
 fn submit_pool_solution(
+    mode: PoolConnectionMode,
     pool_client: &PoolClient,
     active_job: &mut Option<ActivePoolJob>,
     solution: &MiningSolution,
@@ -1130,13 +1133,17 @@ fn submit_pool_solution(
         .is_ok()
     {
         stats.bump_submitted();
-        info("SHARE", "submitted");
+        if mode.is_user() {
+            info("SHARE", "submitted");
+        }
         job.pending_submit_nonces.insert(solution.nonce);
         job.next_nonce = job.next_nonce.max(solution.nonce.saturating_add(1));
         PoolShareSubmitOutcome::Submitted
     } else {
         job.submitted_nonces.remove(&solution.nonce);
-        warn("SHARE", "failed to queue submit");
+        if mode.is_user() {
+            warn("SHARE", "failed to queue submit");
+        }
         PoolShareSubmitOutcome::QueueFailed
     }
 }
