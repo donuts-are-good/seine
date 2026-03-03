@@ -276,7 +276,7 @@ fn draw_dashboard(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner)
     // Pending devices are always 1-per-line (not paired in wide mode)
     let device_rows = active_rows + pending_count;
     let devices_height: u16 = if device_rows > 0 { 2 + device_rows } else { 0 };
-    let config_height: u16 = if wide { 5 } else { 8 };
+    let config_height: u16 = if wide { 4 } else { 8 };
     let header_height: u16 = 4;
 
     let chunks = Layout::default()
@@ -526,9 +526,14 @@ fn draw_stats_wide(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner
     let submitted_str = format_u64(state.submitted);
     let stale_shares_str = format_u64(state.stale_shares);
     let accepted_str = format_u64(state.accepted);
+    let rejected_or_stale_label = if state.mode == "pool" {
+        "Rejected"
+    } else {
+        "Stale"
+    };
     let mining_lines = vec![
         kv_line("Submitted", &submitted_str),
-        kv_line("Stale", &stale_shares_str),
+        kv_line(rejected_or_stale_label, &stale_shares_str),
         kv_line("Accepted", &accepted_str),
     ];
     let mining_block = Block::default()
@@ -581,9 +586,14 @@ fn draw_stats_narrow(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInn
     let submitted_str = format_u64(state.submitted);
     let stale_shares_str = format_u64(state.stale_shares);
     let accepted_str = format_u64(state.accepted);
+    let rejected_or_stale_label = if state.mode == "pool" {
+        "Rejected"
+    } else {
+        "Stale"
+    };
     let mining_lines = vec![
         kv_line("Submitted", &submitted_str),
-        kv_line("Stale", &stale_shares_str),
+        kv_line(rejected_or_stale_label, &stale_shares_str),
         kv_line("Accepted", &accepted_str),
     ];
     let mining_block = Block::default()
@@ -672,7 +682,7 @@ fn draw_config(frame: &mut ratatui::Frame, area: Rect, state: &TuiStateInner) {
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(4)])
+        .constraints([Constraint::Length(4), Constraint::Min(4)])
         .split(area);
     draw_config_runtime_panel(frame, rows[0], state);
     draw_config_wallet_panel(frame, rows[1], state);

@@ -680,11 +680,7 @@ fn submit_pool_solution(
         .is_ok()
     {
         stats.bump_submitted();
-        let difficulty = job
-            .share_difficulty
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        info("SHARE", format!("submitted (diff={difficulty})"));
+        info("SHARE", "submitted");
         job.pending_submit_nonces.insert(solution.nonce);
         job.next_nonce = job.next_nonce.max(solution.nonce.saturating_add(1));
         PoolShareSubmitOutcome::Submitted
