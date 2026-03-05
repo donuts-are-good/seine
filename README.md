@@ -53,6 +53,20 @@ First startup behavior:
 - mining backends (CPU + NVIDIA when available)
 - CPU thread count from available cores and RAM
 
+#### First-run pool setup (visual)
+
+1. Enter your Blocknet payout address when prompted.
+
+![Enter address prompt](enter-address.png)
+
+2. Confirm the address prompt is filled before continuing.
+
+![Address entered](address-entered.png)
+
+3. Enter your pool endpoint and worker, then start mining.
+
+![Pool details entered](pool-entered.png)
+
 These values are cached in:
 - `./seine-data/seine.config.json` by default (`--data-dir` changes the base directory)
 
