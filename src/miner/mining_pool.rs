@@ -70,9 +70,14 @@ struct PoolConnectionConfig {
 
 #[derive(Debug)]
 struct PoolUiTelemetryClient {
+    endpoints: Vec<PoolTelemetryEndpoint>,
+    http: HttpClient,
+}
+
+#[derive(Debug, Clone)]
+struct PoolTelemetryEndpoint {
     stats_url: String,
     miner_url: String,
-    http: HttpClient,
 }
 
 struct PoolSession {
@@ -1095,13 +1100,15 @@ fn assign_pool_continuation(
         backend_executor,
     )?;
     if additional_span > 0 {
-        warn(
-            "JOB",
-            format!(
-                "pool assignment consumed extra nonce span outside reserved window ({} nonces)",
-                additional_span
-            ),
+        let message = format!(
+            "pool assignment consumed extra nonce span outside reserved window ({} nonces)",
+            additional_span
         );
+        if additional_span < lanes {
+            info("JOB", message);
+        } else {
+            warn("JOB", message);
+        }
     }
 
     Ok(())
@@ -1150,57 +1157,94 @@ fn submit_pool_solution(
 
 impl PoolUiTelemetryClient {
     fn new(pool_url: &str, address: &str) -> Option<Self> {
-        let base_url = pool_api_base_url_from_pool_url(pool_url)?;
+        let base_urls = pool_api_base_urls_from_pool_url(pool_url);
+        if base_urls.is_empty() {
+            return None;
+        }
         let http = HttpClient::builder()
             .timeout(POOL_TELEMETRY_TIMEOUT)
             .build()
             .ok()?;
-        Some(Self {
-            stats_url: format!("{base_url}/api/stats"),
-            miner_url: format!("{base_url}/api/miner/{address}"),
-            http,
-        })
+        let endpoints = base_urls
+            .into_iter()
+            .map(|base_url| PoolTelemetryEndpoint {
+                stats_url: format!("{base_url}/api/stats"),
+                miner_url: format!("{base_url}/api/miner/{address}"),
+            })
+            .collect::<Vec<_>>();
+        Some(Self { endpoints, http })
     }
 
     fn fetch_pool_hashrate(&self) -> Result<String> {
-        let body: Value = self
-            .http
-            .get(&self.stats_url)
-            .send()
-            .and_then(|resp| resp.json())
-            .map_err(|err| anyhow!("GET {} failed: {err}", self.stats_url))?;
+        let mut errors = Vec::new();
+        for endpoint in &self.endpoints {
+            let body: Value = match self
+                .http
+                .get(&endpoint.stats_url)
+                .send()
+                .and_then(|resp| resp.json())
+            {
+                Ok(body) => body,
+                Err(err) => {
+                    errors.push(format!("GET {} failed: {err}", endpoint.stats_url));
+                    continue;
+                }
+            };
 
-        let hashrate = body
-            .pointer("/chain/network_hashrate")
-            .and_then(value_as_f64)
-            .or_else(|| body.pointer("/network_hashrate").and_then(value_as_f64))
-            .ok_or_else(|| anyhow!("missing network hashrate field"))?;
-        if !hashrate.is_finite() || hashrate < 0.0 {
-            bail!("invalid network hashrate value");
+            let hashrate = body
+                .pointer("/chain/network_hashrate")
+                .and_then(value_as_f64)
+                .or_else(|| body.pointer("/network_hashrate").and_then(value_as_f64));
+            let Some(hashrate) = hashrate else {
+                errors.push(format!(
+                    "GET {} missing network hashrate field",
+                    endpoint.stats_url
+                ));
+                continue;
+            };
+            if !hashrate.is_finite() || hashrate < 0.0 {
+                errors.push(format!(
+                    "GET {} invalid network hashrate value",
+                    endpoint.stats_url
+                ));
+                continue;
+            }
+
+            return Ok(format_hashrate_ui(hashrate));
         }
-        Ok(format_hashrate_ui(hashrate))
+
+        bail!("pool hashrate telemetry unavailable: {}", errors.join("; "));
     }
 
     fn fetch_pool_balances(&self) -> Result<(String, String)> {
-        let body: Value = self
-            .http
-            .get(&self.miner_url)
-            .send()
-            .and_then(|resp| resp.json())
-            .map_err(|err| anyhow!("GET {} failed: {err}", self.miner_url))?;
+        let mut errors = Vec::new();
+        for endpoint in &self.endpoints {
+            let body: Value = match self
+                .http
+                .get(&endpoint.miner_url)
+                .send()
+                .and_then(|resp| resp.json())
+            {
+                Ok(body) => body,
+                Err(err) => {
+                    errors.push(format!("GET {} failed: {err}", endpoint.miner_url));
+                    continue;
+                }
+            };
 
-        let pending = body
-            .pointer("/balance/pending")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow!("missing field balance.pending"))?;
-        let paid = body
-            .pointer("/balance/paid")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow!("missing field balance.paid"))?;
-        Ok((
-            format_atomic_units_bnt(pending),
-            format_atomic_units_bnt(paid),
-        ))
+            let pending = body.pointer("/balance/pending").and_then(Value::as_u64);
+            let paid = body.pointer("/balance/paid").and_then(Value::as_u64);
+            let (Some(pending), Some(paid)) = (pending, paid) else {
+                errors.push(format!("GET {} missing balance fields", endpoint.miner_url));
+                continue;
+            };
+            return Ok((
+                format_atomic_units_bnt(pending),
+                format_atomic_units_bnt(paid),
+            ));
+        }
+
+        bail!("pool balance telemetry unavailable: {}", errors.join("; "))
     }
 }
 
@@ -1209,24 +1253,33 @@ fn div_ceil_u64(value: u64, divisor: u64) -> u64 {
     (value.saturating_add(divisor - 1)) / divisor
 }
 
-fn pool_api_base_url_from_pool_url(pool_url: &str) -> Option<String> {
+fn pool_api_base_urls_from_pool_url(pool_url: &str) -> Vec<String> {
     let trimmed = pool_url.trim();
     if trimmed.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let authority = trimmed
-        .strip_prefix("stratum+tcp://")
-        .unwrap_or(trimmed)
-        .split('/')
-        .next()
-        .unwrap_or(trimmed)
-        .trim();
+    let (transport, rest) = if let Some(rest) = trimmed.strip_prefix("stratum+tcp://") {
+        ("stratum+tcp", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("stratum+ssl://") {
+        ("stratum+ssl", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("stratum+tls://") {
+        ("stratum+tls", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        ("http", rest)
+    } else {
+        ("unknown", trimmed)
+    };
+    let authority = rest.split('/').next().unwrap_or(rest).trim();
     if authority.is_empty() {
-        return None;
+        return Vec::new();
     }
 
     let host = if authority.starts_with('[') {
-        let closing = authority.find(']')?;
+        let Some(closing) = authority.find(']') else {
+            return Vec::new();
+        };
         authority[..=closing].to_string()
     } else {
         authority
@@ -1237,10 +1290,26 @@ fn pool_api_base_url_from_pool_url(pool_url: &str) -> Option<String> {
             .to_string()
     };
     if host.is_empty() {
-        return None;
+        return Vec::new();
     }
 
-    Some(format!("http://{host}:{POOL_API_DEFAULT_PORT}"))
+    let mut out = Vec::new();
+    push_unique(&mut out, format!("http://{host}:{POOL_API_DEFAULT_PORT}"));
+    match transport {
+        "https" => push_unique(&mut out, format!("https://{authority}")),
+        "http" => push_unique(&mut out, format!("http://{authority}")),
+        _ => {
+            push_unique(&mut out, format!("https://{host}"));
+            push_unique(&mut out, format!("http://{host}"));
+        }
+    }
+    out
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
 }
 
 fn format_atomic_units_bnt(amount_atomic: u64) -> String {
@@ -1301,4 +1370,34 @@ fn compact_pool_address_for_log(address: &str) -> String {
         &trimmed[..KEEP],
         &trimmed[trimmed.len() - KEEP..]
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pool_api_base_urls_from_pool_url;
+
+    #[test]
+    fn telemetry_base_urls_include_fallbacks_for_stratum_endpoint() {
+        let urls = pool_api_base_urls_from_pool_url("stratum+tcp://bntpool.com:3333");
+        assert_eq!(
+            urls,
+            vec![
+                "http://bntpool.com:24783".to_string(),
+                "https://bntpool.com".to_string(),
+                "http://bntpool.com".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn telemetry_base_urls_preserve_http_origin() {
+        let urls = pool_api_base_urls_from_pool_url("https://example.com:8443/path");
+        assert_eq!(
+            urls,
+            vec![
+                "http://example.com:24783".to_string(),
+                "https://example.com:8443".to_string()
+            ]
+        );
+    }
 }

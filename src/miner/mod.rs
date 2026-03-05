@@ -3420,6 +3420,44 @@ mod tests {
     }
 
     #[test]
+    fn distribute_work_caps_preferred_allocation_to_reservation_budget() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let state = Arc::new(MockState::default());
+        let mut backends = vec![slot(
+            42,
+            14,
+            Arc::new(
+                MockBackend::new("nvidia", 14, Arc::clone(&state))
+                    .with_preferred_allocation_iters_per_lane(1 << 21),
+            ),
+        )];
+
+        let additional_span = distribute_work(
+            &mut backends,
+            DistributeWorkOptions {
+                epoch: 1,
+                work_id: 1,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                target: [0xFF; 32],
+                reservation: NonceReservation {
+                    start_nonce: 1_000,
+                    max_iters_per_lane: 10,
+                    reserved_span: 138,
+                },
+                stop_at: Instant::now() + Duration::from_secs(1),
+                backend_weights: None,
+            },
+            &backend_executor,
+        )
+        .expect("distribution should succeed");
+
+        assert!(
+            additional_span <= 13,
+            "expected at most lane-rounding overflow, got {additional_span}"
+        );
+    }
+
+    #[test]
     fn backend_chunk_profiles_uses_effective_worker_queue_depth() {
         let backends = vec![slot(
             77,

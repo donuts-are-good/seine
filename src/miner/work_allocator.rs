@@ -563,10 +563,14 @@ pub(super) fn backend_allocation_iters_per_lane(
     default_iters_per_lane: u64,
 ) -> u64 {
     let default_iters_per_lane = default_iters_per_lane.max(1);
+    // Never exceed the scheduler's per-lane reservation budget. Backends can
+    // prefer smaller chunks, but larger backend defaults must not blow past the
+    // caller's nonce window (notably pool-assigned windows).
     backend_capabilities(slot)
         .preferred_allocation_iters_per_lane
         .unwrap_or(default_iters_per_lane)
         .max(1)
+        .min(default_iters_per_lane)
 }
 
 pub(super) fn backend_dispatch_iters_per_lane(
