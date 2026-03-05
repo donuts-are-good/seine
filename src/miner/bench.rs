@@ -700,6 +700,7 @@ fn run_worker_benchmark_inner(
                 reservation,
                 stop_at,
                 backend_weights: work_distribution_weights(cfg.work_allocation, &backend_weights),
+                strict_reservation: false,
             },
             backend_executor,
         )?;

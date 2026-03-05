@@ -1237,6 +1237,7 @@ fn assign_pool_continuation(
                     work_distribution_weights(cfg.work_allocation, backend_weights)
                 }
             },
+            strict_reservation: true,
         },
         backend_executor,
     )?;

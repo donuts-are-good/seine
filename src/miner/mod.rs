@@ -104,6 +104,8 @@ struct DistributeWorkOptions<'a> {
     reservation: NonceReservation,
     stop_at: Instant,
     backend_weights: Option<&'a BTreeMap<BackendInstanceId, f64>>,
+    // Pool-assigned windows are strict: never dispatch outside nonce_start..nonce_end.
+    strict_reservation: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -3333,6 +3335,7 @@ mod tests {
                 },
                 stop_at: Instant::now() + Duration::from_secs(1),
                 backend_weights: None,
+                strict_reservation: false,
             },
             &backend_executor,
         )
@@ -3394,6 +3397,7 @@ mod tests {
                 },
                 stop_at: Instant::now() + Duration::from_secs(1),
                 backend_weights: None,
+                strict_reservation: false,
             },
             &backend_executor,
         )
@@ -3420,7 +3424,7 @@ mod tests {
     }
 
     #[test]
-    fn distribute_work_caps_preferred_allocation_to_reservation_budget() {
+    fn distribute_work_non_strict_allows_lane_rounding_overflow() {
         let backend_executor = backend_executor::BackendExecutor::new();
         let state = Arc::new(MockState::default());
         let mut backends = vec![slot(
@@ -3446,15 +3450,62 @@ mod tests {
                 },
                 stop_at: Instant::now() + Duration::from_secs(1),
                 backend_weights: None,
+                strict_reservation: false,
             },
             &backend_executor,
         )
         .expect("distribution should succeed");
 
         assert!(
-            additional_span <= 13,
-            "expected at most lane-rounding overflow, got {additional_span}"
+            additional_span > 0 && additional_span <= 13,
+            "expected lane-rounding overflow in non-strict mode, got {additional_span}"
         );
+    }
+
+    #[test]
+    fn distribute_work_strict_reservation_prevents_window_overflow() {
+        let backend_executor = backend_executor::BackendExecutor::new();
+        let state = Arc::new(MockState::default());
+        let mut backends = vec![slot(
+            42,
+            14,
+            Arc::new(
+                MockBackend::new("nvidia", 14, Arc::clone(&state))
+                    .with_preferred_allocation_iters_per_lane(1 << 21),
+            ),
+        )];
+
+        let additional_span = distribute_work(
+            &mut backends,
+            DistributeWorkOptions {
+                epoch: 1,
+                work_id: 1,
+                header_base: Arc::from(vec![7u8; POW_HEADER_BASE_LEN]),
+                target: [0xFF; 32],
+                reservation: NonceReservation {
+                    start_nonce: 1_000,
+                    max_iters_per_lane: 10,
+                    reserved_span: 138,
+                },
+                stop_at: Instant::now() + Duration::from_secs(1),
+                backend_weights: None,
+                strict_reservation: true,
+            },
+            &backend_executor,
+        )
+        .expect("distribution should succeed");
+
+        assert_eq!(
+            additional_span, 0,
+            "strict reservation must not consume nonce span outside the assignment window"
+        );
+        let chunk = state
+            .last_chunk
+            .lock()
+            .expect("chunk lock should not be poisoned")
+            .expect("backend should receive strict-reservation work");
+        assert_eq!(chunk.start_nonce, 1_000);
+        assert_eq!(chunk.nonce_count, 138);
     }
 
     #[test]
@@ -3504,6 +3555,7 @@ mod tests {
                 },
                 stop_at: Instant::now() + Duration::from_secs(1),
                 backend_weights: None,
+                strict_reservation: false,
             },
             &backend_executor,
         )
@@ -3526,6 +3578,7 @@ mod tests {
                 },
                 stop_at: Instant::now() + Duration::from_secs(1),
                 backend_weights: None,
+                strict_reservation: false,
             },
             &backend_executor,
         )
@@ -3566,6 +3619,7 @@ mod tests {
                 },
                 stop_at: Instant::now() + Duration::from_secs(1),
                 backend_weights: None,
+                strict_reservation: false,
             },
             &backend_executor,
         )
@@ -3609,6 +3663,7 @@ mod tests {
                 },
                 stop_at: Instant::now() + Duration::from_secs(1),
                 backend_weights: None,
+                strict_reservation: false,
             },
             &backend_executor,
         )
@@ -3661,6 +3716,7 @@ mod tests {
                 },
                 stop_at: Instant::now() + Duration::from_secs(1),
                 backend_weights: None,
+                strict_reservation: false,
             },
             &backend_executor,
         )

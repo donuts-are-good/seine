@@ -68,20 +68,34 @@ pub(super) fn distribute_work(
             return Ok(additional_span_consumed);
         }
 
-        let nonce_counts = compute_backend_nonce_counts(
+        let mut nonce_counts = compute_backend_nonce_counts(
             backends,
             options.reservation.max_iters_per_lane,
             options.backend_weights,
         );
-        let total_lanes = total_lanes(backends);
-        let attempt_span = nonce_counts.iter().copied().sum::<u64>().max(total_lanes);
+        if options.strict_reservation {
+            cap_nonce_counts_to_budget(&mut nonce_counts, remaining_reserved_span);
+        }
+        let attempt_span = if options.strict_reservation {
+            nonce_counts.iter().copied().sum::<u64>()
+        } else {
+            let total_lanes = total_lanes(backends);
+            nonce_counts.iter().copied().sum::<u64>().max(total_lanes)
+        };
 
         let mut chunk_start = attempt_start_nonce;
         let mut chunk_offset = 0u64;
         let mut dispatch_tasks = Vec::with_capacity(backends.len());
         let mut slots_by_idx = Vec::with_capacity(backends.len());
         for (idx, slot) in backends.drain(..).enumerate() {
-            let nonce_count = *nonce_counts.get(idx).unwrap_or(&slot.lanes.max(1));
+            let nonce_count = nonce_counts
+                .get(idx)
+                .copied()
+                .unwrap_or_else(|| slot.lanes.max(1));
+            if nonce_count == 0 {
+                slots_by_idx.push(Some(slot));
+                continue;
+            }
             let capabilities = backend_capabilities(&slot);
             let dispatch_iters_per_lane =
                 backend_dispatch_iters_per_lane(&slot, options.reservation.max_iters_per_lane);
@@ -111,6 +125,10 @@ pub(super) fn distribute_work(
             });
             slots_by_idx.push(Some(slot));
             chunk_start = chunk_start.wrapping_add(nonce_count);
+        }
+        if dispatch_tasks.is_empty() {
+            *backends = slots_by_idx.into_iter().flatten().collect();
+            return Ok(additional_span_consumed);
         }
 
         let (survivors, failures, attempt_consumed_span) =
@@ -211,6 +229,19 @@ pub(super) fn distribute_work(
                 attempt_span,
             ),
         );
+    }
+}
+
+fn cap_nonce_counts_to_budget(nonce_counts: &mut [u64], budget: u64) {
+    let mut remaining = budget;
+    for count in nonce_counts.iter_mut() {
+        if remaining == 0 {
+            *count = 0;
+            continue;
+        }
+        let capped = (*count).min(remaining);
+        *count = capped;
+        remaining = remaining.saturating_sub(capped);
     }
 }
 

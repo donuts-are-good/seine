@@ -71,6 +71,7 @@ pub(super) fn redistribute_for_topology_change(
             reservation,
             stop_at: options.stop_at,
             backend_weights: distribution_weights,
+            strict_reservation: false,
         },
         options.backend_executor,
     )?;

@@ -853,6 +853,7 @@ fn dispatch_round_assignments(
                 inputs.cfg.work_allocation,
                 inputs.backend_weights,
             ),
+            strict_reservation: false,
         },
         backend_executor,
     )?;
