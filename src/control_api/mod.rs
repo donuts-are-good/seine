@@ -23,7 +23,7 @@ use crate::config::{
     read_token_from_cookie_file, BackendKind, BackendSpec, Config, CpuAffinityMode,
     CpuPerformanceProfile, MiningMode, UiMode, WorkAllocation,
 };
-use crate::dev_fee::{DEV_ADDRESS, DEV_FEE_PERCENT};
+use crate::dev_fee::{effective_pool_dev_fee_percent, DEV_ADDRESS, DEV_FEE_PERCENT};
 use crate::miner::ui::{set_log_sink, UiLogEvent};
 
 const API_EVENT_CHANNEL_CAPACITY: usize = 4096;
@@ -380,6 +380,18 @@ impl MinerSupervisor {
             .state
             .lock()
             .expect("supervisor state lock poisoned during snapshot");
+        let active_cfg = state
+            .effective_config
+            .as_ref()
+            .or(state.staged_config.as_ref());
+        let dev_fee_percent = active_cfg
+            .and_then(|cfg| {
+                if cfg.mode != MiningMode::Pool {
+                    return None;
+                }
+                cfg.pool_url.as_deref().map(effective_pool_dev_fee_percent)
+            })
+            .unwrap_or(DEV_FEE_PERCENT);
 
         RuntimeStateSnapshot {
             lifecycle: state.lifecycle,
@@ -393,7 +405,7 @@ impl MinerSupervisor {
             last_error: state.last_error.clone(),
             pending_wallet_password: state.pending_wallet_password.is_some(),
             pending_nvidia_count: state.pending_nvidia_count,
-            dev_fee_percent: DEV_FEE_PERCENT,
+            dev_fee_percent,
             dev_fee_mode: state.dev_fee_mode.clone(),
             dev_fee_address: DEV_ADDRESS,
             effective_config: state
